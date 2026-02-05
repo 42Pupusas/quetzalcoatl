@@ -83,6 +83,20 @@ impl<T> Clone for Producer<T> {
 }
 
 impl<T> Producer<T> {
+    /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
+    /// keep the hot push loop's instruction footprint small — this code only
+    /// matters under real multi-producer contention.
+    #[inline(never)]
+    fn cas_backoff(failures: &mut u32) {
+        let f = *failures;
+        if f > 1 {
+            for _ in 0..1u32 << f {
+                std::hint::spin_loop();
+            }
+        }
+        *failures = f.saturating_add(1).min(6);
+    }
+
     /// Index can be grown indefinitely, once it overflows, it will
     /// wrap around to 0, so the modulo operation is safe.
     ///
@@ -132,15 +146,8 @@ impl<T> Producer<T> {
                 return Ok(());
             }
 
-            // CAS failed — back off to reduce contention.
-            // Skip spin on first few failures (likely spurious from
-            // compare_exchange_weak), only escalate under real contention.
-            if backoff > 1 {
-                for _ in 0..1u32 << backoff {
-                    std::hint::spin_loop();
-                }
-            }
-            backoff = backoff.saturating_add(1).min(6);
+            // CAS failed — back off (cold path, not inlined)
+            Self::cas_backoff(&mut backoff);
         }
     }
 
