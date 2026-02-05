@@ -169,33 +169,28 @@ impl<T> Consumer<T> {
     ///
     /// Returns None if the queue is empty or if a slot has been claimed
     /// by a producer but not yet written (non-blocking behavior).
+    #[inline]
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
         let head = self.queue.head.load(std::sync::atomic::Ordering::Relaxed);
-        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Acquire);
+        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
 
         if tail == head {
             return None;
         }
 
-        let slot_idx = head & self.queue.mask;
+        let slot = &self.queue.buf[head & self.queue.mask];
 
         // Check if slot is ready (producer may have claimed but not written yet)
-        if !self.queue.buf[slot_idx]
-            .ready
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !slot.ready.load(std::sync::atomic::Ordering::Acquire) {
             return None; // Slot claimed but not written yet
         }
 
-        // Read data
         // SAFETY: We checked that the slot is ready
-        let val = unsafe { (*self.queue.buf[slot_idx].data.get()).assume_init_read() };
+        let val = unsafe { (*slot.data.get()).assume_init_read() };
 
         // Clear ready flag for next lap around the ring
-        self.queue.buf[slot_idx]
-            .ready
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        slot.ready.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Advance head
         self.queue
