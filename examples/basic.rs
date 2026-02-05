@@ -2,11 +2,11 @@
 //!
 //! Demonstrates simple usage of the ring buffer with one producer and one consumer.
 
-use quetzalcoatl::RingBuffer;
+use quetzalcoatl::{Capacity, RingBuffer};
 
 fn main() {
-    // Create a ring buffer with capacity for 10 items
-    let (producer, mut consumer) = RingBuffer::new(10).split();
+    // Create a ring buffer with capacity for 16 items (power of two)
+    let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
 
     println!("=== Basic SPSC Example ===\n");
 
@@ -38,7 +38,7 @@ fn main() {
     }
 
     // Try to push when full
-    println!("\nProducer: Trying to push when buffer is full (capacity=10)");
+    println!("\nProducer: Trying to push when buffer is full (capacity=16)");
     match producer.push(999) {
         Ok(()) => println!("  Pushed: 999"),
         Err(val) => println!("  Failed to push {} (buffer full)", val),

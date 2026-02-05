@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use quetzalcoatl::RingBuffer;
+use quetzalcoatl::{Capacity, RingBuffer};
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,8 @@ fn bench_push_only(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let (producer, _consumer) = RingBuffer::<u64>::new(cap).split();
+                    let (producer, _consumer) =
+                        RingBuffer::<u64>::new(Capacity::exact(cap)).split();
                     let start = std::time::Instant::now();
                     for i in 0..cap as u64 {
                         let _ = producer.push(black_box(i));
@@ -42,7 +43,8 @@ fn bench_pop_only(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let (producer, mut consumer) = RingBuffer::<u64>::new(cap).split();
+                    let (producer, mut consumer) =
+                        RingBuffer::<u64>::new(Capacity::exact(cap)).split();
                     for i in 0..cap as u64 {
                         producer.push(i).unwrap();
                     }
@@ -70,7 +72,8 @@ fn bench_push_pop_alternating(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(64).split();
+                let (producer, mut consumer) =
+                    RingBuffer::<u64>::new(Capacity::exact(64)).split();
                 let start = std::time::Instant::now();
                 for i in 0..ops {
                     let _ = producer.push(black_box(i));
@@ -101,7 +104,7 @@ fn bench_spsc_concurrent(c: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(4096).split();
+                            RingBuffer::<u64>::new(Capacity::exact(4096)).split();
 
                         let start = std::time::Instant::now();
 
@@ -152,7 +155,7 @@ fn bench_mpsc_scaling(c: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(8192).split();
+                            RingBuffer::<u64>::new(Capacity::exact(8192)).split();
 
                         let start = std::time::Instant::now();
 
@@ -211,7 +214,7 @@ fn bench_contention(c: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(cap).split();
+                            RingBuffer::<u64>::new(Capacity::exact(cap)).split();
 
                         let start = std::time::Instant::now();
 
@@ -251,10 +254,10 @@ fn bench_contention(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Buffer capacity impact on throughput (power-of-two vs non-power-of-two)
+// 7. Buffer capacity scaling
 // ---------------------------------------------------------------------------
 
-fn bench_capacity_impact(c: &mut Criterion) {
+fn bench_capacity_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("capacity_impact");
     let ops = 50_000u64;
 
@@ -264,7 +267,8 @@ fn bench_capacity_impact(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
-                    let (producer, mut consumer) = RingBuffer::<u64>::new(cap).split();
+                    let (producer, mut consumer) =
+                        RingBuffer::<u64>::new(Capacity::at_least(cap)).split();
 
                     let start = std::time::Instant::now();
                     for i in 0..ops {
@@ -290,6 +294,6 @@ criterion_group!(
     bench_spsc_concurrent,
     bench_mpsc_scaling,
     bench_contention,
-    bench_capacity_impact,
+    bench_capacity_scaling,
 );
 criterion_main!(benches);
