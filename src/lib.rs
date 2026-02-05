@@ -19,12 +19,17 @@ impl<T> std::ops::Deref for CachePadded<T> {
 
 pub struct Producer<T> {
     queue: std::sync::Arc<RingBuffer<T>>,
+    /// Cached snapshot of `head` to avoid cross-cache-line reads on every push.
+    /// Since `head` only ever increases, a stale value is safe — it just makes
+    /// the buffer appear fuller than it is. We re-fetch only when needed.
+    cached_head: std::cell::Cell<usize>,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         Self {
             queue: std::sync::Arc::clone(&self.queue),
+            cached_head: std::cell::Cell::new(0),
         }
     }
 }
@@ -38,10 +43,16 @@ impl<T> Producer<T> {
     pub fn push(&self, val: T) -> Result<(), T> {
         loop {
             let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
-            let head = self.queue.head.load(std::sync::atomic::Ordering::Acquire);
 
-            if tail - head >= self.queue.cap {
-                return Err(val);
+            // Fast path: check against cached head (avoids cross-cache-line read)
+            if tail - self.cached_head.get() >= self.queue.cap {
+                // Cached head says full — refresh from the real atomic
+                let head = self.queue.head.load(std::sync::atomic::Ordering::Acquire);
+                self.cached_head.set(head);
+
+                if tail - head >= self.queue.cap {
+                    return Err(val);
+                }
             }
 
             // Atomically reserve this slot
@@ -206,7 +217,10 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = std::sync::Arc::new(self);
-        let producer = Producer { queue: arc.clone() };
+        let producer = Producer {
+            queue: arc.clone(),
+            cached_head: std::cell::Cell::new(0),
+        };
         let consumer = Consumer { queue: arc };
         (producer, consumer)
     }
