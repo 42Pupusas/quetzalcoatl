@@ -149,12 +149,16 @@ impl<T> Producer<T> {
         *failures = f.saturating_add(1).min(6);
     }
 
-    /// Index can be grown indefinitely, once it overflows, it will
-    /// wrap around to 0, so the modulo operation is safe.
+    /// Atomically claims the next available slot via CAS loop.
     ///
-    /// Multiple producers can push concurrently. Uses CAS loop to
-    /// atomically reserve slots.
-    pub fn push(&self, val: T) -> Result<(), T> {
+    /// Returns raw pointers to the slot's data and ready flag, or `None`
+    /// if the buffer is full. Used by both `push` and `reserve`.
+    fn claim_slot(
+        &self,
+    ) -> Option<(
+        *mut std::mem::MaybeUninit<T>,
+        *const std::sync::atomic::AtomicBool,
+    )> {
         let mut backoff = 0u32;
         let mut tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
         loop {
@@ -165,7 +169,7 @@ impl<T> Producer<T> {
                 self.cached_head.set(head);
 
                 if tail - head >= self.queue.cap {
-                    return Err(val);
+                    return None;
                 }
             }
 
@@ -178,15 +182,9 @@ impl<T> Producer<T> {
             ) {
                 Ok(_) => {
                     // SAFETY: `tail & mask` is always < cap by construction
-                    let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-
-                    // SAFETY: We atomically claimed this slot via CAS
-                    unsafe { (*slot.data.get()).write(val) };
-
-                    // Mark slot as ready for consumer
-                    slot.ready.store(true, std::sync::atomic::Ordering::Release);
-
-                    return Ok(());
+                    let slot =
+                        unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
+                    return Some((slot.data.get(), &slot.ready));
                 }
                 Err(actual) => {
                     // Use the actual tail returned by CAS instead of reloading
@@ -195,6 +193,44 @@ impl<T> Producer<T> {
                 }
             }
         }
+    }
+
+    /// Pushes a value into the ring buffer.
+    ///
+    /// Multiple producers can push concurrently. Uses CAS loop to
+    /// atomically reserve slots.
+    pub fn push(&self, val: T) -> Result<(), T> {
+        match self.claim_slot() {
+            Some((data_ptr, ready_ptr)) => {
+                // SAFETY: We atomically claimed this slot via CAS
+                unsafe { (*data_ptr).write(val) };
+                // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc
+                unsafe {
+                    (*ready_ptr).store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(())
+            }
+            None => Err(val),
+        }
+    }
+
+    /// Reserves a slot for zero-copy writing.
+    ///
+    /// Returns `None` if the buffer is full. On success, returns a
+    /// [`SlotWriter`] that provides direct mutable access to the slot.
+    ///
+    /// # Contract
+    ///
+    /// You **must** call [`SlotWriter::commit`] after writing data.
+    /// Dropping a `SlotWriter` without committing aborts the process.
+    #[must_use]
+    pub fn reserve(&self) -> Option<SlotWriter<T>> {
+        self.claim_slot().map(|(data_ptr, ready_ptr)| SlotWriter {
+            slot_data: data_ptr,
+            slot_ready: ready_ptr,
+            _ring: std::sync::Arc::clone(&self.queue),
+            committed: false,
+        })
     }
 
     #[must_use]
@@ -210,6 +246,78 @@ impl<T> Producer<T> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.queue.is_full()
+    }
+}
+
+/// A write-reservation into a ring buffer slot.
+///
+/// Obtained via [`Producer::reserve`]. Provides direct mutable access
+/// to the slot's memory, enabling zero-copy writes for large types.
+///
+/// # Contract
+///
+/// You **must** call [`commit`](SlotWriter::commit) after writing data.
+/// Dropping a `SlotWriter` without committing will **abort the process**
+/// because the slot cannot be reclaimed (the tail has already advanced).
+pub struct SlotWriter<T> {
+    slot_data: *mut std::mem::MaybeUninit<T>,
+    slot_ready: *const std::sync::atomic::AtomicBool,
+    _ring: std::sync::Arc<RingBuffer<T>>,
+    committed: bool,
+}
+
+// SAFETY: SlotWriter holds exclusive access to the slot (claimed via CAS).
+// The raw pointers point into the Arc<RingBuffer<T>> which is kept alive.
+unsafe impl<T: Send> Send for SlotWriter<T> {}
+
+impl<T> SlotWriter<T> {
+    /// Returns a mutable reference to the uninitialized slot memory.
+    ///
+    /// Use this for fine-grained control over initialization.
+    #[must_use]
+    pub fn slot_mut(&mut self) -> &mut std::mem::MaybeUninit<T> {
+        // SAFETY: We have exclusive access via CAS claim. The pointer
+        // is valid because _ring keeps the RingBuffer alive.
+        unsafe { &mut *self.slot_data }
+    }
+
+    /// Writes a value into the reserved slot and returns a mutable
+    /// reference to the now-initialized data.
+    pub fn write(&mut self, val: T) -> &mut T {
+        // SAFETY: Same as slot_mut — exclusive access, valid pointer.
+        unsafe { (*self.slot_data).write(val) }
+    }
+
+    /// Commits the write, making the slot visible to the consumer.
+    ///
+    /// Sets the slot's ready flag with `Release` ordering and consumes
+    /// the `SlotWriter`.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must have initialized the slot data (via [`write`] or
+    /// [`slot_mut`] + `MaybeUninit::write`) before calling `commit`.
+    /// Committing without initializing causes the consumer to read
+    /// uninitialized memory (undefined behavior).
+    pub fn commit(mut self) {
+        // SAFETY: slot_ready points into the RingBuffer kept alive by _ring.
+        unsafe {
+            (*self.slot_ready).store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.committed = true;
+    }
+}
+
+impl<T> Drop for SlotWriter<T> {
+    fn drop(&mut self) {
+        if !self.committed {
+            eprintln!(
+                "FATAL: SlotWriter<{}> dropped without commit. \
+                 The ring buffer slot is permanently stuck. Aborting.",
+                std::any::type_name::<T>()
+            );
+            std::process::abort();
+        }
     }
 }
 
@@ -254,6 +362,44 @@ impl<T> Consumer<T> {
         Some(val)
     }
 
+    /// Returns a zero-copy read reference to the next item in the buffer.
+    ///
+    /// Unlike [`pop`], this does not copy the data out. Instead, it returns
+    /// a [`SlotReader`] that dereferences to `&T`. The slot is released
+    /// when the `SlotReader` is dropped.
+    ///
+    /// Returns `None` if the queue is empty or the next slot is not yet
+    /// committed (same semantics as `pop`).
+    #[must_use]
+    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
+        let head = self.queue.head.load(std::sync::atomic::Ordering::Relaxed);
+        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
+
+        if tail == head {
+            return None;
+        }
+
+        // SAFETY: `head & mask` is always < cap by construction
+        let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+
+        if !slot.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+
+        // SAFETY: ready=true guarantees the slot has been initialized.
+        // We store raw pointers to avoid the borrow conflict between
+        // borrowing slot data and holding &mut self.
+        let data_ptr = slot.data.get() as *const std::mem::MaybeUninit<T>;
+        let ready_ptr = &slot.ready as *const std::sync::atomic::AtomicBool;
+
+        Some(SlotReader {
+            data_ptr,
+            ready_ptr,
+            consumer: self,
+            head,
+        })
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -272,6 +418,50 @@ impl<T> Consumer<T> {
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
+    }
+}
+
+/// A zero-copy read reference to an item in the ring buffer.
+///
+/// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
+/// direct reads from the slot without copying.
+///
+/// When dropped, drops the `T` value, clears the slot's ready flag,
+/// and advances the head pointer.
+pub struct SlotReader<'a, T> {
+    data_ptr: *const std::mem::MaybeUninit<T>,
+    ready_ptr: *const std::sync::atomic::AtomicBool,
+    consumer: &'a mut Consumer<T>,
+    head: usize,
+}
+
+impl<T> std::ops::Deref for SlotReader<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: The slot was checked ready=true (Acquire) in pop_ref.
+        // The data is initialized and we have exclusive access via &mut Consumer.
+        unsafe { (*self.data_ptr).assume_init_ref() }
+    }
+}
+
+impl<T> Drop for SlotReader<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: The value is initialized (ready=true was checked in pop_ref).
+        // Exclusive access guaranteed by &mut Consumer.
+        unsafe {
+            std::ptr::drop_in_place((*self.data_ptr).as_ptr() as *mut T);
+        }
+
+        // SAFETY: ready_ptr points into the RingBuffer kept alive by
+        // consumer's Arc.
+        unsafe {
+            (*self.ready_ptr).store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        self.consumer
+            .queue
+            .head
+            .store(self.head + 1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -748,5 +938,171 @@ mod tests {
         }
         // 8 DropCounters created inside AlignedBuf, all should be dropped
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero-copy API tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reserve_write_commit_pop_ref_cycle() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        let mut writer = producer.reserve().unwrap();
+        writer.write(42);
+        writer.commit();
+
+        let reader = consumer.pop_ref().unwrap();
+        assert_eq!(*reader, 42);
+        drop(reader);
+
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn reserve_slot_mut_commit() {
+        let (producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
+
+        let mut writer = producer.reserve().unwrap();
+        writer.slot_mut().write([0xAB; 64]);
+        writer.commit();
+
+        let reader = consumer.pop_ref().unwrap();
+        assert_eq!(reader[0], 0xAB);
+        assert_eq!(reader[63], 0xAB);
+    }
+
+    #[test]
+    fn reserve_returns_none_when_full() {
+        let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+
+        let w1 = producer.reserve().unwrap();
+        let w2 = producer.reserve().unwrap();
+        assert!(producer.reserve().is_none());
+
+        // Must commit to avoid abort
+        let mut w1 = w1;
+        let mut w2 = w2;
+        w1.write(1);
+        w1.commit();
+        w2.write(2);
+        w2.commit();
+    }
+
+    #[test]
+    fn pop_ref_returns_none_when_empty() {
+        let (_producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        assert!(consumer.pop_ref().is_none());
+    }
+
+    #[test]
+    fn pop_ref_returns_none_when_not_ready() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        // Reserve but don't commit — slot is claimed but not ready
+        let mut writer = producer.reserve().unwrap();
+        assert!(consumer.pop_ref().is_none());
+
+        // Now commit and it should be readable
+        writer.write(99);
+        writer.commit();
+        let reader = consumer.pop_ref().unwrap();
+        assert_eq!(*reader, 99);
+    }
+
+    #[test]
+    fn mixed_push_reserve_pop_pop_ref() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+
+        // Mix of push and reserve
+        producer.push(1).unwrap();
+        let mut w = producer.reserve().unwrap();
+        w.write(2);
+        w.commit();
+        producer.push(3).unwrap();
+
+        // Mix of pop and pop_ref
+        assert_eq!(consumer.pop(), Some(1));
+        let r = consumer.pop_ref().unwrap();
+        assert_eq!(*r, 2);
+        drop(r);
+        assert_eq!(consumer.pop(), Some(3));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn slot_reader_drops_value() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+
+        producer
+            .push(DropCounter {
+                counter: counter.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        {
+            let reader = consumer.pop_ref().unwrap();
+            // Value is alive while reader exists
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+            drop(reader);
+        }
+
+        // Value should be dropped when SlotReader is dropped
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reserve_pop_ref_wraparound() {
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        // 3 full laps via reserve/pop_ref
+        for lap in 0..3u32 {
+            for i in 0..4 {
+                let mut w = producer.reserve().unwrap();
+                w.write(lap * 4 + i);
+                w.commit();
+            }
+            for i in 0..4 {
+                let r = consumer.pop_ref().unwrap();
+                assert_eq!(*r, lap * 4 + i);
+                drop(r);
+            }
+        }
+        assert!(consumer.pop_ref().is_none());
+    }
+
+    #[test]
+    fn concurrent_reserve_pop_ref() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let n = 16u64;
+
+        let handle = std::thread::spawn(move || {
+            for i in 0..n {
+                loop {
+                    if let Some(mut w) = producer.reserve() {
+                        w.write(i);
+                        w.commit();
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut received = 0u64;
+        while received < n {
+            if let Some(reader) = consumer.pop_ref() {
+                assert_eq!(*reader, received);
+                drop(reader);
+                received += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        handle.join().unwrap();
     }
 }
