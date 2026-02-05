@@ -1,27 +1,58 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::perf)]
 #![allow(clippy::missing_errors_doc)]
 
+struct Slot<T> {
+    data: std::cell::UnsafeCell<std::mem::MaybeUninit<T>>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
 pub struct Producer<T> {
     queue: std::sync::Arc<RingBuffer<T>>,
 }
 impl<T> Producer<T> {
     /// Index can be grown indefinitely, once it overflows, it will
     /// wrap around to 0, so the modulo operation is safe.
-    pub fn push(&mut self, val: T) -> Result<(), T> {
-        let head = self.queue.head.load(std::sync::atomic::Ordering::Relaxed);
-        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
-        if tail - head == self.queue.cap {
-            return Err(val);
-        }
-        // SAFETY: We are the only ones that can access the buffer
-        unsafe {
-            (*self.queue.buf[tail % self.queue.cap].get()).write(val);
-        };
-        self.queue
-            .tail
-            .store(tail + 1, std::sync::atomic::Ordering::Release);
+    ///
+    /// Multiple producers can push concurrently. Uses CAS loop to
+    /// atomically reserve slots.
+    pub fn push(&self, val: T) -> Result<(), T> {
+        loop {
+            let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
+            let head = self.queue.head.load(std::sync::atomic::Ordering::Acquire);
 
-        Ok(())
+            if tail - head >= self.queue.cap {
+                return Err(val);
+            }
+
+            // Atomically reserve this slot
+            if self
+                .queue
+                .tail
+                .compare_exchange_weak(
+                    tail,
+                    tail + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                let slot_idx = tail % self.queue.cap;
+
+                // Write data to claimed slot
+                // SAFETY: We atomically claimed this slot via CAS
+                unsafe {
+                    (*self.queue.buf[slot_idx].data.get()).write(val);
+                }
+
+                // Mark slot as ready for consumer
+                self.queue.buf[slot_idx]
+                    .ready
+                    .store(true, std::sync::atomic::Ordering::Release);
+
+                return Ok(());
+            }
+            // CAS failed, retry
+        }
     }
 
     #[must_use]
@@ -46,19 +77,42 @@ pub struct Consumer<T> {
 impl<T> Consumer<T> {
     /// Index can be grown indefinitely, once it overflows, it will
     /// wrap around to 0, so the modulo operation is safe.
+    ///
+    /// Returns None if the queue is empty or if a slot has been claimed
+    /// by a producer but not yet written (non-blocking behavior).
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
-        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Acquire);
         let head = self.queue.head.load(std::sync::atomic::Ordering::Relaxed);
+        let tail = self.queue.tail.load(std::sync::atomic::Ordering::Acquire);
 
         if tail == head {
             return None;
         }
 
-        let val = unsafe { (*self.queue.buf[head % self.queue.cap].get()).assume_init_read() };
+        let slot_idx = head % self.queue.cap;
+
+        // Check if slot is ready (producer may have claimed but not written yet)
+        if !self.queue.buf[slot_idx]
+            .ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None; // Slot claimed but not written yet
+        }
+
+        // Read data
+        // SAFETY: We checked that the slot is ready
+        let val = unsafe { (*self.queue.buf[slot_idx].data.get()).assume_init_read() };
+
+        // Clear ready flag for next lap around the ring
+        self.queue.buf[slot_idx]
+            .ready
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Advance head
         self.queue
             .head
-            .store(head + 1, std::sync::atomic::Ordering::Relaxed);
+            .store(head + 1, std::sync::atomic::Ordering::Release);
+
         Some(val)
     }
 
@@ -84,27 +138,27 @@ impl<T> Drop for Consumer<T> {
 }
 
 pub struct RingBuffer<T> {
-    buf: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<T>>]>,
+    buf: Box<[Slot<T>]>,
     cap: usize,
     head: std::sync::atomic::AtomicUsize,
     tail: std::sync::atomic::AtomicUsize,
 }
-// Safety: single producer touches tail, single consumer touches head
+// Safety: Multiple producers use CAS to atomically claim tail slots.
+// Single consumer touches head. Ready flags ensure proper synchronization.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 impl<T> RingBuffer<T> {
     #[must_use]
     pub fn new(cap: usize) -> Self {
-        let mut buf = Vec::<std::mem::MaybeUninit<T>>::with_capacity(cap);
-        // SAFETY: We just set the length of the buffer to the capacity
-        // so we know it's initialized.
-        unsafe { buf.set_len(cap) };
+        let buf: Box<[Slot<T>]> = (0..cap)
+            .map(|_| Slot {
+                data: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+                ready: std::sync::atomic::AtomicBool::new(false),
+            })
+            .collect();
+
         Self {
-            buf: buf
-                .into_iter()
-                .map(|_| std::mem::MaybeUninit::uninit())
-                .map(std::cell::UnsafeCell::new)
-                .collect(),
+            buf,
             head: std::sync::atomic::AtomicUsize::new(0),
             tail: std::sync::atomic::AtomicUsize::new(0),
             cap,
@@ -144,7 +198,7 @@ mod tests {
     use super::*;
 
     fn exercise(cap: usize) -> Vec<i32> {
-        let (mut producer, mut consumer) = RingBuffer::<i32>::new(cap).split();
+        let (producer, mut consumer) = RingBuffer::<i32>::new(cap).split();
         for i in 0..1000 {
             producer.push(i).unwrap();
             if i % 3 == 0 {
@@ -170,7 +224,7 @@ mod tests {
 
     #[test]
     fn capacity_one() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(1).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(1).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -180,7 +234,7 @@ mod tests {
 
     #[test]
     fn zero_sized_types() {
-        let (mut producer, mut consumer) = RingBuffer::<()>::new(3).split();
+        let (producer, mut consumer) = RingBuffer::<()>::new(3).split();
 
         producer.push(()).unwrap();
         assert_eq!(consumer.pop(), Some(()));
@@ -191,7 +245,7 @@ mod tests {
     #[test]
     fn stress_push_pop() {
         let instant = std::time::Instant::now();
-        let (mut producer, _consumer) = RingBuffer::<u64>::new(100_000_000).split();
+        let (producer, _consumer) = RingBuffer::<u64>::new(100_000_000).split();
 
         for i in 0..100_000_000 {
             producer
@@ -203,7 +257,7 @@ mod tests {
 
     #[test]
     fn pop_empty_is_idempotent() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(1).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(1).split();
         assert_eq!(consumer.pop(), None);
         assert!(consumer.is_empty());
         assert_eq!(consumer.len(), 0);
@@ -218,7 +272,7 @@ mod tests {
 
     #[test]
     fn length_invariants() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(2).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(2).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -234,7 +288,7 @@ mod tests {
 
     #[test]
     fn overwrite_oldest_element() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(3).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(3).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -251,7 +305,7 @@ mod tests {
 
     #[test]
     fn wraparound_behavior() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(3).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(3).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         assert_eq!(consumer.pop(), Some(1));
@@ -265,7 +319,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(10).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(10).split();
 
         for i in 0..10 {
             producer.push(i).unwrap();
@@ -291,7 +345,7 @@ mod tests {
     }
     #[test]
     fn push_to_buffer() {
-        let (mut producer, mut consumer) = RingBuffer::<u8>::new(10).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(10).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -299,5 +353,97 @@ mod tests {
         assert_eq!(consumer.pop(), Some(2));
         assert_eq!(consumer.pop(), Some(3));
         assert_eq!(consumer.pop(), None);
+    }
+
+    // MPSC-specific tests
+    #[test]
+    fn multiple_producers_concurrent() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(1000).split();
+        let producer = std::sync::Arc::new(producer);
+
+        let handles: Vec<_> = (0..10)
+            .map(|thread_id| {
+                let p = std::sync::Arc::clone(&producer);
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        p.push(thread_id * 100 + i).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut received = Vec::new();
+        while let Some(v) = consumer.pop() {
+            received.push(v);
+        }
+
+        assert_eq!(received.len(), 1000);
+        // Verify all values are present (order may vary due to concurrency)
+        received.sort_unstable();
+        let expected: Vec<u64> = (0..1000).collect();
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn dynamic_producer_creation() {
+        let (producer, mut consumer) = RingBuffer::<usize>::new(100).split();
+        let producer = std::sync::Arc::new(producer);
+
+        // Simulate dynamic producer creation (e.g., new connections)
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let p = std::sync::Arc::clone(&producer);
+            let handle = std::thread::spawn(move || {
+                p.push(i).unwrap();
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut received = Vec::new();
+        while let Some(v) = consumer.pop() {
+            received.push(v);
+        }
+
+        assert_eq!(received.len(), 5);
+        received.sort_unstable();
+        assert_eq!(received, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn mpsc_stress_test() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(10000).split();
+        let producer = std::sync::Arc::new(producer);
+
+        let handles: Vec<_> = (0..4)
+            .map(|thread_id| {
+                let p = std::sync::Arc::clone(&producer);
+                std::thread::spawn(move || {
+                    for i in 0..1000 {
+                        while p.push(thread_id * 1000 + i).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut received = Vec::new();
+        while let Some(v) = consumer.pop() {
+            received.push(v);
+        }
+
+        assert_eq!(received.len(), 4000);
     }
 }
