@@ -89,6 +89,7 @@ impl<T> Producer<T> {
     /// Multiple producers can push concurrently. Uses CAS loop to
     /// atomically reserve slots.
     pub fn push(&self, val: T) -> Result<(), T> {
+        let mut backoff = 0u32;
         loop {
             let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -130,7 +131,16 @@ impl<T> Producer<T> {
 
                 return Ok(());
             }
-            // CAS failed, retry
+
+            // CAS failed — back off to reduce contention.
+            // Skip spin on first few failures (likely spurious from
+            // compare_exchange_weak), only escalate under real contention.
+            if backoff > 1 {
+                for _ in 0..1u32 << backoff {
+                    std::hint::spin_loop();
+                }
+            }
+            backoff = backoff.saturating_add(1).min(6);
         }
     }
 
