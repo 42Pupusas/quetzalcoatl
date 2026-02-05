@@ -6,6 +6,17 @@ struct Slot<T> {
     ready: std::sync::atomic::AtomicBool,
 }
 
+/// Cache-line-sized padding to prevent false sharing between atomics.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub struct Producer<T> {
     queue: std::sync::Arc<RingBuffer<T>>,
 }
@@ -146,11 +157,12 @@ impl<T> Drop for Consumer<T> {
     }
 }
 
+#[repr(C)]
 pub struct RingBuffer<T> {
     buf: Box<[Slot<T>]>,
     cap: usize,
-    head: std::sync::atomic::AtomicUsize,
-    tail: std::sync::atomic::AtomicUsize,
+    head: CachePadded<std::sync::atomic::AtomicUsize>,
+    tail: CachePadded<std::sync::atomic::AtomicUsize>,
 }
 // Safety: Multiple producers use CAS to atomically claim tail slots.
 // Single consumer touches head. Ready flags ensure proper synchronization.
@@ -168,8 +180,8 @@ impl<T> RingBuffer<T> {
 
         Self {
             buf,
-            head: std::sync::atomic::AtomicUsize::new(0),
-            tail: std::sync::atomic::AtomicUsize::new(0),
+            head: CachePadded(std::sync::atomic::AtomicUsize::new(0)),
+            tail: CachePadded(std::sync::atomic::AtomicUsize::new(0)),
             cap,
         }
     }

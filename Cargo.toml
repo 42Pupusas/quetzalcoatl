@@ -10,4 +10,9 @@ keywords = ["lock-free", "mpsc", "ring-buffer", "concurrent", "queue"]
 categories = ["concurrency", "data-structures", "no-std"]
 readme = "README.md"
 
-[dependencies]
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ringbuffer"
+harness = false
