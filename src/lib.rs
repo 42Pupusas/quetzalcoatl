@@ -104,9 +104,8 @@ impl<T> Producer<T> {
     /// atomically reserve slots.
     pub fn push(&self, val: T) -> Result<(), T> {
         let mut backoff = 0u32;
+        let mut tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
         loop {
-            let tail = self.queue.tail.load(std::sync::atomic::Ordering::Relaxed);
-
             // Fast path: check against cached head (avoids cross-cache-line read)
             if tail - self.cached_head.get() >= self.queue.cap {
                 // Cached head says full — refresh from the real atomic
@@ -119,35 +118,29 @@ impl<T> Producer<T> {
             }
 
             // Atomically reserve this slot
-            if self
-                .queue
-                .tail
-                .compare_exchange_weak(
-                    tail,
-                    tail + 1,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                let slot_idx = tail & self.queue.mask;
+            match self.queue.tail.compare_exchange_weak(
+                tail,
+                tail + 1,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let slot = &self.queue.buf[tail & self.queue.mask];
 
-                // Write data to claimed slot
-                // SAFETY: We atomically claimed this slot via CAS
-                unsafe {
-                    (*self.queue.buf[slot_idx].data.get()).write(val);
+                    // SAFETY: We atomically claimed this slot via CAS
+                    unsafe { (*slot.data.get()).write(val) };
+
+                    // Mark slot as ready for consumer
+                    slot.ready.store(true, std::sync::atomic::Ordering::Release);
+
+                    return Ok(());
                 }
-
-                // Mark slot as ready for consumer
-                self.queue.buf[slot_idx]
-                    .ready
-                    .store(true, std::sync::atomic::Ordering::Release);
-
-                return Ok(());
+                Err(actual) => {
+                    // Use the actual tail returned by CAS instead of reloading
+                    tail = actual;
+                    Self::cas_backoff(&mut backoff);
+                }
             }
-
-            // CAS failed — back off (cold path, not inlined)
-            Self::cas_backoff(&mut backoff);
         }
     }
 
