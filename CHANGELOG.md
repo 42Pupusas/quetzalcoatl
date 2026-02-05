@@ -36,5 +36,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/yourusername/quetzalcoatl/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/yourusername/quetzalcoatl/releases/tag/v0.1.0
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/42Pupusas/quetzalcoatl/releases/tag/v0.1.0
