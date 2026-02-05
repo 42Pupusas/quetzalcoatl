@@ -9,6 +9,15 @@ struct Slot<T> {
 pub struct Producer<T> {
     queue: std::sync::Arc<RingBuffer<T>>,
 }
+
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: std::sync::Arc::clone(&self.queue),
+        }
+    }
+}
+
 impl<T> Producer<T> {
     /// Index can be grown indefinitely, once it overflows, it will
     /// wrap around to 0, so the modulo operation is safe.
@@ -185,9 +194,7 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = std::sync::Arc::new(self);
-        let producer = Producer {
-            queue: arc.clone(),
-        };
+        let producer = Producer { queue: arc.clone() };
         let consumer = Consumer { queue: arc };
         (producer, consumer)
     }
@@ -250,7 +257,7 @@ mod tests {
         for i in 0..100_000_000 {
             producer
                 .push(i)
-                .unwrap_or_else(|_| panic!("Failed to push {}", i));
+                .unwrap_or_else(|_| panic!("Failed to push {i}",));
         }
         println!("Took {}ms", instant.elapsed().as_millis());
     }
@@ -359,11 +366,10 @@ mod tests {
     #[test]
     fn multiple_producers_concurrent() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(1000).split();
-        let producer = std::sync::Arc::new(producer);
 
         let handles: Vec<_> = (0..10)
             .map(|thread_id| {
-                let p = std::sync::Arc::clone(&producer);
+                let p = producer.clone();
                 std::thread::spawn(move || {
                     for i in 0..100 {
                         p.push(thread_id * 100 + i).unwrap();
@@ -391,12 +397,11 @@ mod tests {
     #[test]
     fn dynamic_producer_creation() {
         let (producer, mut consumer) = RingBuffer::<usize>::new(100).split();
-        let producer = std::sync::Arc::new(producer);
 
         // Simulate dynamic producer creation (e.g., new connections)
         let mut handles = Vec::new();
         for i in 0..5 {
-            let p = std::sync::Arc::clone(&producer);
+            let p = producer.clone();
             let handle = std::thread::spawn(move || {
                 p.push(i).unwrap();
             });
@@ -420,11 +425,10 @@ mod tests {
     #[test]
     fn mpsc_stress_test() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(10000).split();
-        let producer = std::sync::Arc::new(producer);
 
         let handles: Vec<_> = (0..4)
             .map(|thread_id| {
-                let p = std::sync::Arc::clone(&producer);
+                let p = producer.clone();
                 std::thread::spawn(move || {
                     for i in 0..1000 {
                         while p.push(thread_id * 1000 + i).is_err() {

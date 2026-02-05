@@ -1,6 +1,13 @@
 [package]
 name = "quetzalcoatl"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["quetzalcoatl contributors"]
+description = "Lock-free multi-producer, single-consumer (MPSC) ring buffer for high-performance concurrent communication"
+license = "MIT"
+repository = "https://github.com/yourusername/quetzalcoatl"
+keywords = ["lock-free", "mpsc", "ring-buffer", "concurrent", "queue"]
+categories = ["concurrency", "data-structures", "no-std"]
+readme = "README.md"
 
 [dependencies]
