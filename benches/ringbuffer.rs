@@ -291,6 +291,7 @@ fn bench_capacity_scaling(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct LargeStruct {
     data: [u8; 2048],
 }

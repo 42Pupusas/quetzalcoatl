@@ -74,7 +74,7 @@ impl<T> AlignedBuf<T> {
         assert!(len > 0);
         let layout = Self::layout(len);
         // SAFETY: layout has non-zero size (len > 0 asserted above)
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut T };
+        let ptr = unsafe { std::alloc::alloc(layout).cast::<T>() };
         let ptr = std::ptr::NonNull::new(ptr).expect("allocation failed");
         for i in 0..len {
             unsafe { ptr.as_ptr().add(i).write(init()) };
@@ -96,7 +96,7 @@ impl<T> Drop for AlignedBuf<T> {
             for i in 0..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
             }
-            std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, Self::layout(self.len));
+            std::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), Self::layout(self.len));
         }
     }
 }
@@ -184,7 +184,7 @@ impl<T> Producer<T> {
                     // SAFETY: `tail & mask` is always < cap by construction
                     let slot =
                         unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-                    return Some((slot.data.get(), &slot.ready));
+                    return Some((slot.data.get(), &raw const slot.ready));
                 }
                 Err(actual) => {
                     // Use the actual tail returned by CAS instead of reloading
@@ -389,8 +389,8 @@ impl<T> Consumer<T> {
         // SAFETY: ready=true guarantees the slot has been initialized.
         // We store raw pointers to avoid the borrow conflict between
         // borrowing slot data and holding &mut self.
-        let data_ptr = slot.data.get() as *const std::mem::MaybeUninit<T>;
-        let ready_ptr = &slot.ready as *const std::sync::atomic::AtomicBool;
+        let data_ptr = slot.data.get().cast_const();
+        let ready_ptr = &raw const slot.ready;
 
         Some(SlotReader {
             data_ptr,
@@ -449,7 +449,7 @@ impl<T> Drop for SlotReader<'_, T> {
         // SAFETY: The value is initialized (ready=true was checked in pop_ref).
         // Exclusive access guaranteed by &mut Consumer.
         unsafe {
-            std::ptr::drop_in_place((*self.data_ptr).as_ptr() as *mut T);
+            std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
 
         // SAFETY: ready_ptr points into the RingBuffer kept alive by
@@ -535,13 +535,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "capacity must be a non-zero power of two")]
     fn capacity_exact_rejects_non_power_of_two() {
         let _ = Capacity::exact(3);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "capacity must be a non-zero power of two")]
     fn capacity_exact_rejects_zero() {
         let _ = Capacity::exact(0);
     }
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "capacity must be non-zero")]
     fn capacity_at_least_rejects_zero() {
         let _ = Capacity::at_least(0);
     }
@@ -586,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "too slow for Miri"]
     fn stress_push_pop() {
         let cap = Capacity::exact(128 * 1024 * 1024);
         let n = cap.get() as u64;
@@ -707,7 +707,7 @@ mod tests {
 
     // MPSC-specific tests
     #[test]
-    #[ignore]
+    #[ignore = "too slow for Miri"]
     fn multiple_producers_concurrent() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
 
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "too slow for Miri"]
     fn dynamic_producer_creation() {
         let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
 
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "too slow for Miri"]
     fn mpsc_stress_test() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
 
@@ -838,10 +838,10 @@ mod tests {
         }
 
         // Pop 2 — should drop when they go out of scope
-        let _a = consumer.pop().unwrap();
-        let _b = consumer.pop().unwrap();
-        drop(_a);
-        drop(_b);
+        let a = consumer.pop().unwrap();
+        let b = consumer.pop().unwrap();
+        drop(a);
+        drop(b);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
 
         // Remaining 1 dropped when consumer is dropped
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
-    /// Exercise get_unchecked on every index by wrapping around multiple times.
+    /// Exercise `get_unchecked` on every index by wrapping around multiple times.
     #[test]
     fn wraparound_exercises_all_slots() {
         let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(received, n * 2);
     }
 
-    /// AlignedBuf deallocation correctness — drop types with drop glue.
+    /// `AlignedBuf` deallocation correctness — drop types with drop glue.
     #[test]
     fn aligned_buf_drop_correctness() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
