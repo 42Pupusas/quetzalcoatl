@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer; // TODO: swap to spsc::RingBuffer once implemented
+use quetzalcoatl::spsc::RingBuffer;
 use std::thread;
 
 // ---------------------------------------------------------------------------

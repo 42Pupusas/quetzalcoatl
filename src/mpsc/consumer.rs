@@ -18,18 +18,17 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
         let head = self.queue.head.load(Ordering::Relaxed);
-        let tail = self.queue.tail.load(Ordering::Relaxed);
-
-        if tail == head {
-            return None;
-        }
 
         // SAFETY: `head & mask` is always < cap by construction
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-        // Check if slot is ready (producer may have claimed but not written yet)
+        // The ready flag is the sole synchronization point. It subsumes the
+        // tail check: ready=true means a producer has both claimed AND written
+        // the slot. ready=false means either empty or claimed-but-not-written —
+        // both cases require returning None. This avoids loading the contended
+        // tail cache line, which producers are hammering with CAS.
         if !slot.ready.load(Ordering::Acquire) {
-            return None; // Slot claimed but not written yet
+            return None;
         }
 
         // SAFETY: We checked that the slot is ready
@@ -57,15 +56,11 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let head = self.queue.head.load(Ordering::Relaxed);
-        let tail = self.queue.tail.load(Ordering::Relaxed);
-
-        if tail == head {
-            return None;
-        }
 
         // SAFETY: `head & mask` is always < cap by construction
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
+        // Same as pop(): ready flag is the sole synchronization point.
         if !slot.ready.load(Ordering::Acquire) {
             return None;
         }
