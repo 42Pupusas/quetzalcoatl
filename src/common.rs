@@ -25,11 +25,20 @@ impl<T> AlignedBuf<T> {
 
     pub fn new_with(len: usize, mut init: impl FnMut() -> T) -> Self {
         assert!(len > 0);
-        let layout = Self::layout(len);
-        // SAFETY: layout has non-zero size (len > 0 asserted above)
-        let ptr = unsafe { std::alloc::alloc(layout).cast::<T>() };
-        let ptr = std::ptr::NonNull::new(ptr).expect("allocation failed");
+
+        let ptr = if std::mem::size_of::<T>() == 0 {
+            // ZSTs need no allocation — use a well-aligned dangling pointer.
+            std::ptr::NonNull::dangling()
+        } else {
+            let layout = Self::layout(len);
+            // SAFETY: layout has non-zero size (size_of::<T>() > 0 checked above)
+            let raw = unsafe { std::alloc::alloc(layout).cast::<T>() };
+            std::ptr::NonNull::new(raw).expect("allocation failed")
+        };
+
         for i in 0..len {
+            // SAFETY: For ZSTs, pointer arithmetic is a no-op (size 0 strides).
+            // For non-ZSTs, ptr points to a valid allocation of len elements.
             unsafe { ptr.as_ptr().add(i).write(init()) };
         }
         Self { ptr, len }
@@ -49,7 +58,9 @@ impl<T> Drop for AlignedBuf<T> {
             for i in 0..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
             }
-            std::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), Self::layout(self.len));
+            if std::mem::size_of::<T>() > 0 {
+                std::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), Self::layout(self.len));
+            }
         }
     }
 }
