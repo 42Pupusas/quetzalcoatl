@@ -1,13 +1,13 @@
 [package]
 name = "quetzalcoatl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["quetzalcoatl contributors"]
 description = "Lock-free multi-producer, single-consumer (MPSC) ring buffer for high-performance concurrent communication"
 license = "MIT"
 repository = "https://github.com/42Pupusas/quetzalcoatl"
 keywords = ["lock-free", "mpsc", "ring-buffer", "concurrent", "queue"]
-categories = ["concurrency", "data-structures", "no-std"]
+categories = ["concurrency", "data-structures"]
 readme = "README.md"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
