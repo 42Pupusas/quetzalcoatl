@@ -4,6 +4,12 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 
+/// The consumer side of an SPSC ring buffer.
+///
+/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Not
+/// cloneable — only one consumer exists per buffer.
+///
+/// Drains remaining items when dropped.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Cached snapshot of `tail` to avoid cross-cache-line reads on every pop.
@@ -59,7 +65,7 @@ impl<T> Consumer<T> {
 
     /// Returns a zero-copy read reference to the next item in the buffer.
     ///
-    /// Unlike [`pop`], this does not copy the data out. Instead, it returns
+    /// Unlike [`pop`](Self::pop), this does not copy the data out. Instead, it returns
     /// a [`SlotReader`] that dereferences to `&T`. The slot is released
     /// when the `SlotReader` is dropped.
     ///
@@ -86,16 +92,19 @@ impl<T> Consumer<T> {
         })
     }
 
+    /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.queue.is_full()

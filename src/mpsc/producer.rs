@@ -4,6 +4,11 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 
+/// The producer side of an MPSC ring buffer.
+///
+/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
+/// — each clone shares the same underlying buffer and competes for slots
+/// via atomic CAS.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Cached snapshot of `head` to avoid cross-cache-line reads on every push.
@@ -117,16 +122,19 @@ impl<T> Producer<T> {
         })
     }
 
+    /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.queue.is_full()
@@ -180,7 +188,7 @@ impl<T> SlotWriter<T> {
     /// # Safety contract
     ///
     /// The caller must have initialized the slot data (via [`write`] or
-    /// [`slot_mut`] + `MaybeUninit::write`) before calling `commit`.
+    /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {

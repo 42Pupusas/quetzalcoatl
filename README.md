@@ -1,70 +1,74 @@
 # Quetzalcoatl
 
-A high-performance, lock-free **multi-producer, single-consumer (MPSC)** ring buffer for Rust.
+High-performance, lock-free ring buffers for Rust.
+
+Three variants cover every producer/consumer topology:
+
+| Module | Producers | Consumers | Use case |
+|---|---|---|---|
+| `mpsc` | Multiple | Single | Fan-in from worker threads |
+| `spsc` | Single | Single | Pipelines, audio, networking |
+| `broadcast` | Multiple | Multiple | Pub/sub, event distribution |
 
 ## Features
 
-- 🚀 **Lock-free**: No mutexes, uses atomic CAS operations for maximum throughput
-- 🔄 **Multi-producer**: Multiple threads can push concurrently via simple `.clone()`
-- 📦 **Zero dependencies**: Pure stdlib implementation
-- 🛡️ **Memory safe**: Careful use of atomics and proper memory ordering
-- ⚡ **Non-blocking**: Consumer returns immediately if data not ready
-- 🎯 **Simple API**: Clean, idiomatic Rust interface
+- **Lock-free** — no mutexes, only atomic CAS / Acquire-Release
+- **Zero dependencies** — pure `std` implementation
+- **Zero-copy API** — `reserve()` + `commit()` on the producer side, `pop_ref()` on the consumer side
+- **Miri-tested** — validated under Miri for undefined-behavior and data-race detection
+- **Power-of-two capacity** — fast bitwise-AND indexing, no modulo
 
 ## Installation
 
-Add this to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-quetzalcoatl = "0.1"
+quetzalcoatl = "0.2"
 ```
 
-## Usage
+## Quick start
 
-### Basic SPSC (Single Producer, Single Consumer)
+### SPSC (single producer, single consumer)
 
 ```rust
-use quetzalcoatl::RingBuffer;
+use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
 
-let (producer, mut consumer) = RingBuffer::new(100).split();
+let (producer, mut consumer) = RingBuffer::new(Capacity::exact(64)).split();
 
-// Producer pushes items
-producer.push(42).unwrap();
+producer.push(42u64).unwrap();
 producer.push(43).unwrap();
 
-// Consumer pops items
 assert_eq!(consumer.pop(), Some(42));
 assert_eq!(consumer.pop(), Some(43));
-assert_eq!(consumer.pop(), None); // Empty
+assert_eq!(consumer.pop(), None);
 ```
 
-### MPSC (Multi-Producer, Single Consumer)
+### MPSC (multiple producers, single consumer)
 
 ```rust
-use quetzalcoatl::RingBuffer;
+use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
-let (producer, mut consumer) = RingBuffer::new(1000).split();
+let (producer, mut consumer) = RingBuffer::new(Capacity::at_least(1000)).split();
 
-// Spawn multiple producer threads
 let handles: Vec<_> = (0..4)
     .map(|id| {
-        let p = producer.clone(); // Clone producer for each thread
+        let p = producer.clone();
         thread::spawn(move || {
             for i in 0..100 {
-                p.push(id * 100 + i).unwrap();
+                while p.push(id * 100 + i).is_err() {
+                    thread::yield_now();
+                }
             }
         })
     })
     .collect();
 
-// Wait for all producers
 for h in handles {
     h.join().unwrap();
 }
 
-// Consumer receives all items (order may vary)
 let mut items = Vec::new();
 while let Some(item) = consumer.pop() {
     items.push(item);
@@ -72,115 +76,109 @@ while let Some(item) = consumer.pop() {
 assert_eq!(items.len(), 400);
 ```
 
-### Dynamic Producer Creation
+### Broadcast (multiple producers, multiple consumers)
 
-Perfect for network servers or event-driven systems:
+Every consumer sees every item published after it subscribes.
 
 ```rust
-use quetzalcoatl::RingBuffer;
-use std::sync::Arc;
-use std::thread;
+use quetzalcoatl::broadcast::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
 
-let (producer, mut consumer) = RingBuffer::new(1000).split();
+// Second argument is the maximum number of concurrent consumers.
+let (producer, mut c1) = RingBuffer::new(Capacity::exact(64), 4).split();
+let mut c2 = c1.clone(); // starts reading from current position
 
-// Simulate new connections arriving dynamically
-for connection_id in 0..10 {
-    let p = producer.clone();
-    thread::spawn(move || {
-        // Each connection gets its own producer clone
-        p.push(connection_id).unwrap();
-    });
-}
+producer.push(10u64).unwrap();
+producer.push(20).unwrap();
+
+assert_eq!(c1.pop(), Some(10));
+assert_eq!(c1.pop(), Some(20));
+assert_eq!(c2.pop(), Some(10));
+assert_eq!(c2.pop(), Some(20));
 ```
 
-## How It Works
-
-### Lock-Free Algorithm
-
-- **Slot Reservation**: Producers use atomic compare-and-swap (CAS) to reserve slots
-- **Ready Flags**: Each slot has an atomic ready flag to signal completion
-- **Non-Blocking Consumer**: Returns `None` if slot claimed but not yet written
-- **Memory Ordering**: Careful use of Acquire/Release semantics ensures proper synchronization
-
-### Performance Characteristics
-
-- **Time Complexity**: O(1) push and pop operations (with CAS retry on contention)
-- **Space Complexity**: O(capacity) fixed-size buffer
-- **Throughput**: Scales well with multiple producers (no lock contention)
-- **Latency**: Low latency, fully non-blocking design
-
-### When Consumer Returns None
-
-The consumer may return `None` in two cases:
-
-1. **Queue is empty**: No items available
-2. **Slot not ready**: A producer claimed a slot but hasn't finished writing yet
-
-This is expected behavior for a lock-free queue. The consumer can simply retry:
+For large types with many consumers, `broadcast::arc::ArcRingBuffer` wraps
+values in `Arc<T>` so each consumer pop is an O(1) refcount bump instead of
+a full clone:
 
 ```rust
-// Retry logic
-loop {
-    if let Some(item) = consumer.pop() {
-        process(item);
-        break;
-    }
-    // Optionally yield or continue with other work
-}
+use quetzalcoatl::broadcast::arc::ArcRingBuffer;
+use quetzalcoatl::capacity::Capacity;
+
+let (producer, mut c1) = ArcRingBuffer::<[u8; 4096]>::new(Capacity::exact(64), 4).split();
+let mut c2 = c1.clone();
+
+producer.push([0xAB; 4096]).unwrap();
+
+let arc1 = c1.pop().unwrap(); // Arc<[u8; 4096]> — cheap clone
+let arc2 = c2.pop().unwrap();
+assert_eq!(arc1[0], 0xAB);
+assert_eq!(arc2[0], 0xAB);
+```
+
+## Zero-copy API
+
+All three variants support a zero-copy path for large types:
+
+```rust
+use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
+
+let (producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
+
+// Producer: write directly into the slot
+let mut writer = producer.reserve().unwrap();
+writer.write([0xAB; 4096]);
+writer.commit(); // makes the slot visible to the consumer
+
+// Consumer: read without copying
+let reader = consumer.pop_ref().unwrap();
+assert_eq!(reader[0], 0xAB);
+// slot is released when `reader` drops
+```
+
+## How it works
+
+- **Slot reservation**: Producers use atomic compare-and-swap (CAS) to claim slots (MPSC/broadcast) or a simple local counter (SPSC).
+- **Publication signaling**: Per-slot `AtomicBool` ready flags (MPSC), tail advancement (SPSC), or per-slot `AtomicUsize` sequence numbers (broadcast).
+- **Memory ordering**: Careful `Acquire`/`Release` pairs ensure data visibility without fences or mutexes.
+- **Cache-line padding**: Head and tail counters are padded to avoid false sharing.
+
+## Performance
+
+- O(1) push and pop (with CAS retry under contention for MPSC/broadcast)
+- Fixed-size buffer — no allocations on the hot path
+- Scales well with multiple producers (exponential CAS backoff)
+
+Run benchmarks:
+
+```bash
+cargo bench
 ```
 
 ## Safety
 
-All unsafe code is carefully documented with `SAFETY` comments. The implementation:
-
-- Uses `UnsafeCell<MaybeUninit<T>>` for uninitialized storage
-- Employs atomic operations with proper memory ordering
-- Ensures no data races through type system (`Send` + `Sync` bounds)
-- Validates correctness with extensive testing
-
-Run with Miri for additional validation:
+All `unsafe` code is documented with `SAFETY` comments. Run Miri for additional validation:
 
 ```bash
 cargo +nightly miri test
 ```
 
-## API Documentation
+## API documentation
 
-Full API documentation is available at [docs.rs/quetzalcoatl](https://docs.rs/quetzalcoatl).
+Full API docs: [docs.rs/quetzalcoatl](https://docs.rs/quetzalcoatl)
 
 ## Examples
 
-See the [`examples/`](examples/) directory for complete working examples:
-
-- `basic.rs` - Simple SPSC usage
-- `mpsc.rs` - Multi-producer concurrent example
-- `dynamic.rs` - Dynamic producer creation pattern
-
-Run examples with:
+See the [`examples/`](examples/) directory:
 
 ```bash
-cargo run --example basic
-cargo run --example mpsc
+cargo run --example basic       # SPSC basics
+cargo run --example mpsc        # Multi-producer concurrent example
+cargo run --example dynamic     # Dynamic producer creation pattern
+cargo run --example broadcast   # Broadcast pub/sub
 ```
-
-## Limitations
-
-- **Single consumer only**: Only one thread can call `pop()`
-- **Fixed capacity**: Buffer size set at creation time
-- **No blocking**: Consumer doesn't wait for data (use channels if you need blocking)
 
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please ensure:
-
-- All tests pass: `cargo test`
-- Clippy is clean: `cargo clippy -- -D warnings`
-- Code is formatted: `cargo fmt`
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+MIT — see [LICENSE](LICENSE) for details.

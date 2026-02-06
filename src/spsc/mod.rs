@@ -1,3 +1,29 @@
+//! Single-producer, single-consumer (SPSC) lock-free ring buffer.
+//!
+//! The fastest variant — no CAS loops, no per-slot flags. The producer
+//! writes sequentially and advances `tail`; the consumer reads and
+//! advances `head`. Synchronization uses only `Acquire`/`Release` on
+//! the shared cursors.
+//!
+//! Neither [`Producer`] nor [`Consumer`] is [`Clone`]; this enforces the
+//! single-producer, single-consumer invariant at compile time.
+//!
+//! # Example
+//!
+//! ```
+//! use quetzalcoatl::spsc::RingBuffer;
+//! use quetzalcoatl::capacity::Capacity;
+//!
+//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
+//!
+//! producer.push(42u64).unwrap();
+//! producer.push(43).unwrap();
+//!
+//! assert_eq!(consumer.pop(), Some(42));
+//! assert_eq!(consumer.pop(), Some(43));
+//! assert_eq!(consumer.pop(), None);
+//! ```
+
 mod producer;
 mod consumer;
 
@@ -12,6 +38,11 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// A lock-free SPSC ring buffer.
+///
+/// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
+/// a [`Producer`] / [`Consumer`] pair. Neither handle is [`Clone`],
+/// enforcing the single-producer, single-consumer invariant.
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
@@ -27,6 +58,7 @@ unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
+    /// Creates a new SPSC ring buffer with the given capacity.
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
@@ -41,6 +73,7 @@ impl<T> RingBuffer<T> {
         }
     }
 
+    /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
@@ -48,17 +81,19 @@ impl<T> RingBuffer<T> {
         tail - head
     }
 
+    /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.len() == self.cap
     }
 
-    /// Split the ring buffer into a producer and consumer pair.
+    /// Splits the ring buffer into a [`Producer`] and [`Consumer`] pair.
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);

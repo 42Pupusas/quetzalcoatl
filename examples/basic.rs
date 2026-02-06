@@ -1,9 +1,10 @@
 //! Basic SPSC (Single Producer, Single Consumer) example
 //!
-//! Demonstrates simple usage of the ring buffer with one producer and one consumer.
+//! Demonstrates simple usage of the SPSC ring buffer with one producer
+//! and one consumer thread.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::spsc::RingBuffer;
 
 fn main() {
     // Create a ring buffer with capacity for 16 items (power of two)
@@ -38,26 +39,12 @@ fn main() {
         producer.push(i).unwrap();
     }
 
-    // Try to push when full
-    println!("\nProducer: Trying to push when buffer is full (capacity=16)");
-    match producer.push(999) {
-        Ok(()) => println!("  Pushed: 999"),
-        Err(val) => println!("  Failed to push {} (buffer full)", val),
-    }
-
     // Pop a few to make space
-    println!("\nConsumer: Popping 3 items to make space");
+    println!("\nConsumer: Popping 3 items");
     for _ in 0..3 {
         if let Some(item) = consumer.pop() {
             println!("  Popped: {}", item);
         }
-    }
-
-    // Now we can push again
-    println!("\nProducer: Now we can push again");
-    match producer.push(999) {
-        Ok(()) => println!("  Successfully pushed: 999"),
-        Err(val) => println!("  Failed to push {}", val),
     }
 
     println!("\nConsumer: Popping all remaining items");

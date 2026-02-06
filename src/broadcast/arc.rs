@@ -84,16 +84,19 @@ impl<T: Send + Sync> ArcProducer<T> {
         })
     }
 
+    /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.0.is_full()
@@ -156,16 +159,19 @@ impl<T: Send + Sync> ArcConsumer<T> {
         self.0.pop_ref().map(|r| ArcSlotReader(r))
     }
 
+    /// Returns the number of items this consumer has yet to read.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns `true` if this consumer has no items to read.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Returns `true` if this consumer's backlog has reached capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.0.is_full()

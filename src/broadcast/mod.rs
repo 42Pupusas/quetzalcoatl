@@ -1,3 +1,31 @@
+//! Multi-producer, multi-consumer (MPMC) broadcast ring buffer.
+//!
+//! Every consumer sees every item published after it subscribes. Multiple
+//! producers push via CAS; consumers are dynamically created by cloning
+//! an existing [`Consumer`].
+//!
+//! Items require `T: Clone` for [`Consumer::pop`], or use
+//! [`Consumer::pop_ref`] for zero-copy reads. For large types with many
+//! consumers, see the [`arc`] sub-module which wraps values in `Arc<T>`.
+//!
+//! # Example
+//!
+//! ```
+//! use quetzalcoatl::broadcast::RingBuffer;
+//! use quetzalcoatl::capacity::Capacity;
+//!
+//! let (producer, mut c1) = RingBuffer::new(Capacity::exact(16), 4).split();
+//! let mut c2 = c1.clone();
+//!
+//! producer.push(10u32).unwrap();
+//! producer.push(20).unwrap();
+//!
+//! assert_eq!(c1.pop(), Some(10));
+//! assert_eq!(c1.pop(), Some(20));
+//! assert_eq!(c2.pop(), Some(10));
+//! assert_eq!(c2.pop(), Some(20));
+//! ```
+
 mod producer;
 mod consumer;
 pub mod arc;
@@ -48,7 +76,7 @@ impl<T> RingBuffer<T> {
     /// Creates a new broadcast ring buffer.
     ///
     /// `max_consumers` sets the maximum number of concurrent consumers.
-    /// The first consumer is created by [`split`]. Additional consumers
+    /// The first consumer is created by [`split`](Self::split). Additional consumers
     /// are created by cloning an existing consumer.
     ///
     /// # Panics
@@ -77,7 +105,8 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Splits the ring buffer into a producer and the first consumer.
+    /// Splits the ring buffer into a [`Producer`] and the first [`Consumer`].
+    #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
 
@@ -118,6 +147,7 @@ impl<T> RingBuffer<T> {
         }
     }
 
+    /// Returns the number of items between the slowest consumer and the tail.
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
@@ -125,11 +155,13 @@ impl<T> RingBuffer<T> {
         tail.wrapping_sub(min_head)
     }
 
+    /// Returns `true` if no items are pending for any consumer.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns `true` if the slowest consumer's backlog has reached capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.len() >= self.cap

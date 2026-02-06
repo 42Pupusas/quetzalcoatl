@@ -4,6 +4,18 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 
+/// The consumer side of a broadcast ring buffer.
+///
+/// Obtained via [`RingBuffer::split`](super::RingBuffer::split) or by
+/// cloning an existing consumer. Each clone starts reading from the
+/// current tail (only future items).
+///
+/// Deactivates its consumer slot on drop but does **not** drain items —
+/// data is shared with other consumers.
+///
+/// # Panics
+///
+/// Cloning panics if the maximum consumer count is exceeded.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Index into `consumer_slots` — identifies this consumer's head.
@@ -99,7 +111,7 @@ impl<T> Consumer<T> {
 
     /// Returns a zero-copy read reference to the next item.
     ///
-    /// Unlike [`pop`], this does not clone the data. Instead, it returns
+    /// Unlike [`pop`](Self::pop), this does not clone the data. Instead, it returns
     /// a [`SlotReader`] that dereferences to `&T`. The consumer's head
     /// is advanced when the `SlotReader` is dropped.
     ///
@@ -132,7 +144,7 @@ impl<T> Consumer<T> {
         })
     }
 
-    /// Number of items this consumer has yet to read.
+    /// Returns the number of items this consumer has yet to read.
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.queue.tail.load(Ordering::Relaxed);
@@ -142,11 +154,13 @@ impl<T> Consumer<T> {
         tail.wrapping_sub(head)
     }
 
+    /// Returns `true` if this consumer has no items to read.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns `true` if this consumer's backlog has reached capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.len() >= self.queue.cap
