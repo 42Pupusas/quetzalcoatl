@@ -1,4 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use quetzalcoatl::broadcast::arc::ArcRingBuffer;
 use quetzalcoatl::broadcast::RingBuffer;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
@@ -243,10 +244,127 @@ fn bench_large_struct_clone_vs_ref(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// 4. Arc wrapper: large struct with multiple consumers
+// ---------------------------------------------------------------------------
+
+fn bench_arc_large_struct(c: &mut Criterion) {
+    let mut group = c.benchmark_group("broadcast_arc_large_struct");
+    let total_items = 10_000u64;
+    let num_consumers = 4usize;
+
+    group.throughput(Throughput::Elements(total_items));
+
+    // Clone-based (regular broadcast)
+    group.bench_function("2kb_clone_4consumers", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), num_consumers + 1)
+                        .split();
+                let mut consumers: Vec<_> =
+                    (0..num_consumers - 1).map(|_| consumer.clone()).collect();
+                consumers.push(consumer);
+
+                let start = std::time::Instant::now();
+
+                let producer_handle = thread::spawn(move || {
+                    for i in 0..total_items {
+                        while producer
+                            .push(black_box(LargeStruct::new(i as u8)))
+                            .is_err()
+                        {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+
+                let handles: Vec<_> = consumers
+                    .into_iter()
+                    .map(|mut c| {
+                        thread::spawn(move || {
+                            let mut received = 0u64;
+                            while received < total_items {
+                                if c.pop().is_some() {
+                                    received += 1;
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                producer_handle.join().unwrap();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    // Arc-based (cheap refcount clone)
+    group.bench_function("2kb_arc_4consumers", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) =
+                    ArcRingBuffer::<LargeStruct>::new(Capacity::exact(256), num_consumers + 1)
+                        .split();
+                let mut consumers: Vec<_> =
+                    (0..num_consumers - 1).map(|_| consumer.clone()).collect();
+                consumers.push(consumer);
+
+                let start = std::time::Instant::now();
+
+                let producer_handle = thread::spawn(move || {
+                    for i in 0..total_items {
+                        while producer
+                            .push(black_box(LargeStruct::new(i as u8)))
+                            .is_err()
+                        {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+
+                let handles: Vec<_> = consumers
+                    .into_iter()
+                    .map(|mut c| {
+                        thread::spawn(move || {
+                            let mut received = 0u64;
+                            while received < total_items {
+                                if c.pop().is_some() {
+                                    received += 1;
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                producer_handle.join().unwrap();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_consumer_scaling,
     bench_producer_scaling,
     bench_large_struct_clone_vs_ref,
+    bench_arc_large_struct,
 );
 criterion_main!(benches);
