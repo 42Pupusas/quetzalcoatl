@@ -3,7 +3,8 @@
 //! Demonstrates creating producers dynamically as needed, simulating
 //! scenarios like network servers where connections arrive over time.
 
-use quetzalcoatl::{Capacity, RingBuffer};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::RingBuffer;
 use std::thread;
 use std::time::Duration;
 

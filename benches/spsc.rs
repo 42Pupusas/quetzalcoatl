@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use quetzalcoatl::{Capacity, RingBuffer};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::RingBuffer; // TODO: swap to spsc::RingBuffer once implemented
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -137,124 +138,7 @@ fn bench_spsc_concurrent(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. MPSC – scale producers from 1 to 8
-// ---------------------------------------------------------------------------
-
-fn bench_mpsc_scaling(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mpsc_scaling");
-    let items_per_producer = 50_000u64;
-
-    for num_producers in [1, 2, 4, 8] {
-        let total_items = items_per_producer * num_producers as u64;
-        group.throughput(Throughput::Elements(total_items));
-        group.bench_with_input(
-            BenchmarkId::new("producers", num_producers),
-            &num_producers,
-            |b, &num_producers| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(Capacity::exact(8192)).split();
-
-                        let start = std::time::Instant::now();
-
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|_| {
-                                let p = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..items_per_producer {
-                                        while p.push(black_box(i)).is_err() {
-                                            std::hint::spin_loop();
-                                        }
-                                    }
-                                })
-                            })
-                            .collect();
-
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if consumer.pop().is_some() {
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// 6. Contention – many producers on a small buffer (high CAS retry rate)
-// ---------------------------------------------------------------------------
-
-fn bench_contention(c: &mut Criterion) {
-    let mut group = c.benchmark_group("contention");
-    let items_per_producer = 10_000u64;
-    let num_producers = 8u64;
-    let total_items = items_per_producer * num_producers;
-
-    for cap in [64, 256, 1024] {
-        group.throughput(Throughput::Elements(total_items));
-        group.bench_with_input(
-            BenchmarkId::new("cap", cap),
-            &cap,
-            |b, &cap| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(Capacity::exact(cap)).split();
-
-                        let start = std::time::Instant::now();
-
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|_| {
-                                let p = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..items_per_producer {
-                                        while p.push(black_box(i)).is_err() {
-                                            std::hint::spin_loop();
-                                        }
-                                    }
-                                })
-                            })
-                            .collect();
-
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if consumer.pop().is_some() {
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// 7. Buffer capacity scaling
+// 5. Buffer capacity scaling
 // ---------------------------------------------------------------------------
 
 fn bench_capacity_scaling(c: &mut Criterion) {
@@ -287,7 +171,7 @@ fn bench_capacity_scaling(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Large struct benchmarks (~2KB per element)
+// 6. Large struct benchmarks (~2KB per element)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -344,65 +228,8 @@ fn bench_large_struct_spsc(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_large_struct_mpsc(c: &mut Criterion) {
-    let mut group = c.benchmark_group("large_struct_mpsc");
-    let items_per_producer = 2_500u64;
-
-    for num_producers in [1, 2, 4] {
-        let total_items = items_per_producer * num_producers as u64;
-        group.throughput(Throughput::Elements(total_items));
-        group.bench_with_input(
-            BenchmarkId::new("producers", num_producers),
-            &num_producers,
-            |b, &num_producers| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-
-                        let start = std::time::Instant::now();
-
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|p| {
-                                let prod = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..items_per_producer {
-                                        while prod
-                                            .push(black_box(LargeStruct::new((p as u64 * 100 + i) as u8)))
-                                            .is_err()
-                                        {
-                                            std::hint::spin_loop();
-                                        }
-                                    }
-                                })
-                            })
-                            .collect();
-
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if consumer.pop().is_some() {
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
 // ---------------------------------------------------------------------------
-// 9. Large struct zero-copy benchmarks (reserve/pop_ref)
+// 7. Large struct zero-copy SPSC (reserve/pop_ref)
 // ---------------------------------------------------------------------------
 
 fn bench_large_struct_spsc_zero_copy(c: &mut Criterion) {
@@ -451,80 +278,14 @@ fn bench_large_struct_spsc_zero_copy(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_large_struct_mpsc_zero_copy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("large_struct_mpsc_zero_copy");
-    let items_per_producer = 2_500u64;
-
-    for num_producers in [1, 2, 4] {
-        let total_items = items_per_producer * num_producers as u64;
-        group.throughput(Throughput::Elements(total_items));
-        group.bench_with_input(
-            BenchmarkId::new("producers", num_producers),
-            &num_producers,
-            |b, &num_producers| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-
-                        let start = std::time::Instant::now();
-
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|p| {
-                                let prod = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..items_per_producer {
-                                        loop {
-                                            if let Some(mut w) = prod.reserve() {
-                                                w.write(black_box(LargeStruct::new(
-                                                    (p as u64 * 100 + i) as u8,
-                                                )));
-                                                w.commit();
-                                                break;
-                                            }
-                                            std::hint::spin_loop();
-                                        }
-                                    }
-                                })
-                            })
-                            .collect();
-
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if let Some(_reader) = consumer.pop_ref() {
-                                black_box(&*_reader);
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
-                    }
-                    total
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_push_only,
     bench_pop_only,
     bench_push_pop_alternating,
     bench_spsc_concurrent,
-    bench_mpsc_scaling,
-    bench_contention,
     bench_capacity_scaling,
     bench_large_struct_spsc,
-    bench_large_struct_mpsc,
     bench_large_struct_spsc_zero_copy,
-    bench_large_struct_mpsc_zero_copy,
 );
 criterion_main!(benches);

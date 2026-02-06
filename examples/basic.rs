@@ -2,7 +2,8 @@
 //!
 //! Demonstrates simple usage of the ring buffer with one producer and one consumer.
 
-use quetzalcoatl::{Capacity, RingBuffer};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::RingBuffer;
 
 fn main() {
     // Create a ring buffer with capacity for 16 items (power of two)

@@ -14,5 +14,9 @@ readme = "README.md"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "ringbuffer"
+name = "mpsc"
+harness = false
+
+[[bench]]
+name = "spsc"
 harness = false

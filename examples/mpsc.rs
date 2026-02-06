@@ -2,7 +2,8 @@
 //!
 //! Demonstrates concurrent producers pushing to the same ring buffer.
 
-use quetzalcoatl::{Capacity, RingBuffer};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::RingBuffer;
 use std::thread;
 use std::time::Duration;
 
