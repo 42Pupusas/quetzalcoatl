@@ -1,25 +1,29 @@
-//! Multi-producer, single-consumer (MPSC) lock-free ring buffer.
+//! Single-producer, multiple-consumer (SPMC) lock-free ring buffer.
 //!
-//! Multiple producers push concurrently via atomic CAS; a single consumer
-//! pops items in FIFO order. The producer handle is [`Clone`], so new
-//! producers can be created at any time.
+//! One producer pushes items; multiple consumers compete to pop them.
+//! Each item is consumed by exactly one consumer, making this ideal
+//! for work-distribution patterns.
+//!
+//! The consumer handle is [`Clone`], so new consumers can join at any
+//! time. The producer is **not** cloneable — single-producer is enforced
+//! at compile time.
 //!
 //! # Example
 //!
 //! ```
-//! use quetzalcoatl::mpsc::RingBuffer;
+//! use quetzalcoatl::spmc::RingBuffer;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
-//! let p2 = producer.clone();
+//! let (producer, consumer) = RingBuffer::new(Capacity::exact(16)).split();
+//! let c2 = consumer.clone();
 //!
 //! producer.push(1u32).unwrap();
-//! p2.push(2).unwrap();
+//! producer.push(2).unwrap();
 //!
-//! // Order depends on scheduling; both values arrive
-//! let mut v = vec![consumer.pop().unwrap(), consumer.pop().unwrap()];
-//! v.sort();
-//! assert_eq!(v, [1, 2]);
+//! // Each item goes to exactly one consumer
+//! let a = consumer.pop();
+//! let b = c2.pop();
+//! assert!(a.is_some() || b.is_some());
 //! ```
 
 mod producer;
@@ -36,11 +40,11 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// A lock-free MPSC ring buffer.
+/// A lock-free SPMC ring buffer.
 ///
 /// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
-/// a [`Producer`] / [`Consumer`] pair. The `Producer` is [`Clone`]; the
-/// `Consumer` is not (single-consumer).
+/// a [`Producer`] / [`Consumer`] pair. The `Consumer` is [`Clone`]; the
+/// `Producer` is not (single-producer).
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<Slot<T>>,
@@ -50,13 +54,14 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
 }
 
-// Safety: Multiple producers use CAS to atomically claim tail slots.
-// Single consumer touches head. Ready flags ensure proper synchronization.
+// Safety: Single producer advances tail and writes to slots guarded by ready
+// flags. Multiple consumers use CAS on head to claim slots. Ready flags
+// ensure proper synchronization between producer and consumers.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
-    /// Creates a new MPSC ring buffer with the given capacity.
+    /// Creates a new SPMC ring buffer with the given capacity.
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
@@ -100,6 +105,7 @@ impl<T> RingBuffer<T> {
         let arc = Arc::new(self);
         let producer = Producer {
             queue: arc.clone(),
+            write_pos: std::cell::Cell::new(0),
             cached_head: std::cell::Cell::new(0),
         };
         let consumer = Consumer { queue: arc };
@@ -114,7 +120,7 @@ mod tests {
 
     #[test]
     fn capacity_one() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -124,7 +130,7 @@ mod tests {
 
     #[test]
     fn zero_sized_types() {
-        let (producer, mut consumer) = RingBuffer::<()>::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::<()>::new(Capacity::exact(4)).split();
 
         producer.push(()).unwrap();
         assert_eq!(consumer.pop(), Some(()));
@@ -150,7 +156,7 @@ mod tests {
 
     #[test]
     fn pop_empty_is_idempotent() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(consumer.pop(), None);
         assert!(consumer.is_empty());
         assert_eq!(consumer.len(), 0);
@@ -165,7 +171,7 @@ mod tests {
 
     #[test]
     fn length_invariants() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(2)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(2)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -181,7 +187,7 @@ mod tests {
 
     #[test]
     fn overwrite_oldest_element() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -200,7 +206,7 @@ mod tests {
 
     #[test]
     fn wraparound_behavior() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         assert_eq!(consumer.pop(), Some(1));
@@ -216,7 +222,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
+        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
 
         for i in 0..16 {
             producer.push(i).unwrap();
@@ -233,119 +239,183 @@ mod tests {
         assert!(!consumer.is_full());
     }
 
-    #[test]
-    fn pop_empty_buffer() {
-        let (_, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
-        assert_eq!(consumer.pop(), None);
-        assert!(consumer.is_empty());
-        assert_eq!(consumer.len(), 0);
-    }
-
-    #[test]
-    fn push_to_buffer() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
-        producer.push(1).unwrap();
-        producer.push(2).unwrap();
-        producer.push(3).unwrap();
-        assert_eq!(consumer.pop(), Some(1));
-        assert_eq!(consumer.pop(), Some(2));
-        assert_eq!(consumer.pop(), Some(3));
-        assert_eq!(consumer.pop(), None);
-    }
-
     // -----------------------------------------------------------------------
-    // MPSC-specific tests
+    // SPMC-specific tests
     // -----------------------------------------------------------------------
 
     #[test]
     #[ignore = "too slow for Miri"]
-    fn multiple_producers_concurrent() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+    fn multiple_consumers_concurrent() {
+        let total = 1000usize;
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total));
 
         let handles: Vec<_> = (0..10)
-            .map(|thread_id| {
-                let p = producer.clone();
+            .map(|_| {
+                let c = consumer.clone();
+                let rem = remaining.clone();
                 std::thread::spawn(move || {
-                    for i in 0..100 {
-                        p.push(thread_id * 100 + i).unwrap();
+                    let mut received = Vec::new();
+                    while rem.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        if let Some(v) = c.pop() {
+                            rem.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            received.push(v);
+                        } else {
+                            std::thread::yield_now();
+                        }
                     }
+                    received
                 })
             })
             .collect();
 
+        for i in 0..total as u64 {
+            while producer.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+
+        // Wait for consumers and collect all received values
+        let mut all_received: Vec<u64> = Vec::new();
         for h in handles {
-            h.join().unwrap();
+            all_received.extend(h.join().unwrap());
         }
 
-        let mut received = Vec::new();
-        while let Some(v) = consumer.pop() {
-            received.push(v);
-        }
+        all_received.sort_unstable();
+        all_received.dedup();
 
-        assert_eq!(received.len(), 1000);
-        // Verify all values are present (order may vary due to concurrency)
-        received.sort_unstable();
-        let expected: Vec<u64> = (0..1000).collect();
-        assert_eq!(received, expected);
+        // Each item consumed exactly once — dedup should not change the count
+        // (no duplicates), and we should have all 1000 values.
+        assert_eq!(all_received.len(), total);
+        let expected: Vec<u64> = (0..total as u64).collect();
+        assert_eq!(all_received, expected);
     }
 
     #[test]
     #[ignore = "too slow for Miri"]
-    fn dynamic_producer_creation() {
-        let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
+    fn dynamic_consumer_creation() {
+        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
 
-        // Simulate dynamic producer creation (e.g., new connections)
-        let mut handles = Vec::new();
+        // Push items first
         for i in 0..5 {
-            let p = producer.clone();
+            producer.push(i).unwrap();
+        }
+
+        // Create consumers dynamically and let them compete
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let c = consumer.clone();
             let handle = std::thread::spawn(move || {
-                p.push(i).unwrap();
+                let mut received = Vec::new();
+                while let Some(v) = c.pop() {
+                    received.push(v);
+                }
+                received
             });
             handles.push(handle);
         }
 
+        let mut all_received: Vec<usize> = Vec::new();
         for h in handles {
-            h.join().unwrap();
+            all_received.extend(h.join().unwrap());
         }
 
-        let mut received = Vec::new();
-        while let Some(v) = consumer.pop() {
-            received.push(v);
-        }
-
-        assert_eq!(received.len(), 5);
-        received.sort_unstable();
-        assert_eq!(received, vec![0, 1, 2, 3, 4]);
+        all_received.sort_unstable();
+        assert_eq!(all_received, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     #[ignore = "too slow for Miri"]
-    fn mpsc_stress_test() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
+    fn spmc_stress_test() {
+        let total_items = 4000usize;
+        let num_consumers = 4;
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total_items));
 
-        let handles: Vec<_> = (0..4)
-            .map(|thread_id| {
-                let p = producer.clone();
+        let consumer_handles: Vec<_> = (0..num_consumers)
+            .map(|_| {
+                let c = consumer.clone();
+                let rem = remaining.clone();
                 std::thread::spawn(move || {
-                    for i in 0..1000 {
-                        while p.push(thread_id * 1000 + i).is_err() {
+                    let mut received = Vec::new();
+                    while rem.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        if let Some(v) = c.pop() {
+                            rem.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            received.push(v);
+                        } else {
                             std::thread::yield_now();
                         }
                     }
+                    received
                 })
             })
             .collect();
 
-        for h in handles {
-            h.join().unwrap();
+        for i in 0..total_items as u64 {
+            while producer.push(i).is_err() {
+                std::thread::yield_now();
+            }
         }
 
-        let mut received = Vec::new();
-        while let Some(v) = consumer.pop() {
-            received.push(v);
+        let mut all_received: Vec<u64> = Vec::new();
+        for h in consumer_handles {
+            all_received.extend(h.join().unwrap());
         }
 
-        assert_eq!(received.len(), 4000);
+        all_received.sort_unstable();
+        all_received.dedup();
+        assert_eq!(all_received.len(), total_items);
+    }
+
+    #[test]
+    #[ignore = "too slow for Miri"]
+    fn clone_consumer_competes() {
+        let n = 100usize;
+        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(64)).split();
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(n));
+
+        let c2 = consumer.clone();
+        let rem1 = remaining.clone();
+        let h1 = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            while rem1.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if let Some(v) = consumer.pop() {
+                    rem1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    received.push(v);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            received
+        });
+        let rem2 = remaining;
+        let h2 = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            while rem2.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if let Some(v) = c2.pop() {
+                    rem2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    received.push(v);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            received
+        });
+
+        for i in 0..n {
+            while producer.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+
+        let mut all: Vec<usize> = Vec::new();
+        all.extend(h1.join().unwrap());
+        all.extend(h2.join().unwrap());
+        all.sort_unstable();
+        all.dedup();
+
+        // All items consumed, no duplicates
+        assert_eq!(all.len(), n);
     }
 
     // -----------------------------------------------------------------------
@@ -382,7 +452,7 @@ mod tests {
     #[test]
     fn drop_items_on_pop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
         for _ in 0..3 {
             producer.push(DropCounter { counter: counter.clone() }).unwrap();
@@ -403,7 +473,7 @@ mod tests {
     /// Exercise `get_unchecked` on every index by wrapping around multiple times.
     #[test]
     fn wraparound_exercises_all_slots() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps = 12 push/pops, covering slot indices 0-3 three times
         for lap in 0..3u32 {
@@ -420,7 +490,7 @@ mod tests {
     /// Concurrent push/pop with a tiny buffer — Miri checks for data races.
     #[test]
     fn concurrent_data_race_check() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {
@@ -444,40 +514,45 @@ mod tests {
         assert_eq!(received, n);
     }
 
-    /// Two producers, tiny buffer — checks CAS + ready flag synchronization.
+    /// Two consumers, tiny buffer — checks CAS + ready flag synchronization.
     #[test]
-    fn concurrent_mpsc_data_race_check() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
-        let n = 2u64;
+    fn concurrent_spmc_data_race_check() {
+        let total = 16usize;
+        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(4)).split();
 
-        let p2 = producer.clone();
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let c2 = consumer.clone();
+        let r1 = received.clone();
         let h1 = std::thread::spawn(move || {
-            for i in 0..n {
-                while producer.push(i).is_err() {
+            while r1.load(std::sync::atomic::Ordering::Relaxed) < total {
+                if consumer.pop().is_some() {
+                    r1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
                     std::thread::yield_now();
                 }
             }
         });
+        let r2 = received.clone();
         let h2 = std::thread::spawn(move || {
-            for i in 0..n {
-                while p2.push(100 + i).is_err() {
+            while r2.load(std::sync::atomic::Ordering::Relaxed) < total {
+                if c2.pop().is_some() {
+                    r2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
                     std::thread::yield_now();
                 }
             }
         });
 
-        let mut received = 0u64;
-        while received < n * 2 {
-            if consumer.pop().is_some() {
-                received += 1;
-            } else {
+        for i in 0..total {
+            while producer.push(i).is_err() {
                 std::thread::yield_now();
             }
         }
 
         h1.join().unwrap();
         h2.join().unwrap();
-        assert_eq!(received, n * 2);
+        assert_eq!(received.load(std::sync::atomic::Ordering::Relaxed), total);
     }
 
     // -----------------------------------------------------------------------
@@ -533,21 +608,6 @@ mod tests {
     fn pop_ref_returns_none_when_empty() {
         let (_producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         assert!(consumer.pop_ref().is_none());
-    }
-
-    #[test]
-    fn pop_ref_returns_none_when_not_ready() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
-
-        // Reserve but don't commit — slot is claimed but not ready
-        let mut writer = producer.reserve().unwrap();
-        assert!(consumer.pop_ref().is_none());
-
-        // Now commit and it should be readable
-        writer.write(99);
-        writer.commit();
-        let reader = consumer.pop_ref().unwrap();
-        assert_eq!(*reader, 99);
     }
 
     #[test]

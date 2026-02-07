@@ -7,6 +7,7 @@
 //! |---|---|---|---|
 //! | [`mpsc`] | Multiple | Single | Fan-in from worker threads |
 //! | [`spsc`] | Single | Single | Pipelines, audio, networking |
+//! | [`spmc`] | Single | Multiple | Work distribution / fan-out |
 //! | [`broadcast`] | Multiple | Multiple | Pub/sub, event distribution |
 //!
 //! All variants are fully **lock-free** (no mutexes), use fixed-size
@@ -49,6 +50,25 @@
 //!
 //! producer.push(42u64).unwrap();
 //! assert_eq!(consumer.pop(), Some(42));
+//! ```
+//!
+//! ## SPMC (single-producer, multiple-consumer)
+//!
+//! ```
+//! use quetzalcoatl::spmc::RingBuffer;
+//! use quetzalcoatl::capacity::Capacity;
+//!
+//! let (producer, consumer) = RingBuffer::new(Capacity::exact(64)).split();
+//!
+//! // Clone the consumer for multiple threads
+//! let c2 = consumer.clone();
+//! std::thread::spawn(move || { assert!(c2.pop().is_some()); });
+//!
+//! producer.push(1u64).unwrap();
+//! producer.push(2).unwrap();
+//! # std::thread::sleep(std::time::Duration::from_millis(50));
+//!
+//! // Each item is consumed by exactly one consumer
 //! ```
 //!
 //! ## Broadcast (multi-producer, multi-consumer)
@@ -101,6 +121,10 @@
 //!   Single consumer pops lock-free. Use for fan-in patterns (many
 //!   writers, one reader).
 //!
+//! - **[`spmc`]**: Single producer writes lock-free. Multiple consumers
+//!   share a CAS loop to claim items. Each item goes to exactly one
+//!   consumer. Use for work-distribution / fan-out patterns.
+//!
 //! - **[`broadcast`]**: Multiple producers (CAS) and multiple consumers.
 //!   Each consumer maintains its own read cursor. Items require
 //!   `T: Clone` for `pop()`, or use `pop_ref()` for zero-copy reads.
@@ -115,4 +139,5 @@ pub mod capacity;
 pub(crate) mod common;
 pub mod mpsc;
 pub mod spsc;
+pub mod spmc;
 pub mod broadcast;

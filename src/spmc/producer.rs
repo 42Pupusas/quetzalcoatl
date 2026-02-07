@@ -4,109 +4,89 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 
-/// The producer side of an MPSC ring buffer.
+/// The producer side of an SPMC ring buffer.
 ///
-/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
-/// — each clone shares the same underlying buffer and competes for slots
-/// via atomic CAS.
+/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Not
+/// cloneable — only one producer exists per buffer.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
+    /// Local write cursor. Because there is only one producer, no atomic
+    /// operations are needed — we simply increment after each claim.
+    pub(super) write_pos: std::cell::Cell<usize>,
     /// Cached snapshot of `head` to avoid cross-cache-line reads on every push.
     /// Since `head` only ever increases, a stale value is safe — it just makes
     /// the buffer appear fuller than it is. We re-fetch only when needed.
     pub(super) cached_head: std::cell::Cell<usize>,
 }
 
-impl<T> Clone for Producer<T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: Arc::clone(&self.queue),
-            cached_head: std::cell::Cell::new(0),
-        }
-    }
-}
-
 impl<T> Producer<T> {
-    /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
-    /// keep the hot push loop's instruction footprint small — this code only
-    /// matters under real multi-producer contention.
-    #[inline(never)]
-    fn cas_backoff(failures: &mut u32) {
-        // Under Miri, spin_loop() is an interleaving point. Exponential
-        // spin counts explode the state space, so we just yield instead.
-        #[cfg(miri)]
-        {
-            let _ = failures;
-            std::thread::yield_now();
-        }
-        #[cfg(not(miri))]
-        {
-            let f = *failures;
-            if f > 1 {
-                for _ in 0..1u32 << f {
-                    std::hint::spin_loop();
-                }
-            }
-            *failures = f.saturating_add(1).min(6);
-        }
-    }
-
-    /// Atomically claims the next available slot via CAS loop.
+    /// Checks whether the next slot is available for writing.
     ///
-    /// Returns raw pointers to the slot's data and ready flag, or `None`
-    /// if the buffer is full. Used by both `push` and `reserve`.
-    fn claim_slot(
-        &self,
-    ) -> Option<(*mut MaybeUninit<T>, *const AtomicBool)> {
-        let mut backoff = 0u32;
-        let mut tail = self.queue.tail.load(Ordering::Relaxed);
-        loop {
-            // Fast path: check against cached head (avoids cross-cache-line read)
-            if tail - self.cached_head.get() >= self.queue.cap {
-                // Cached head says full — refresh from the real atomic
-                let head = self.queue.head.load(Ordering::Acquire);
-                self.cached_head.set(head);
+    /// Two conditions must hold before the producer may write to a slot:
+    ///
+    /// 1. **Distance check** (`write_pos - head < cap`): prevents the
+    ///    producer from wrapping past its own outstanding reservations.
+    ///
+    /// 2. **Ready flag check** (`ready == false`): the authoritative signal
+    ///    that a consumer has finished reading and released the slot.
+    ///    Because consumers CAS `head` *before* reading data, `head`
+    ///    advancing does NOT mean the slot is free — only `ready = false`
+    ///    does.
+    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicBool)> {
+        let pos = self.write_pos.get();
 
-                if tail - head >= self.queue.cap {
-                    return None;
-                }
-            }
+        // Fast path: check against cached head (avoids cross-cache-line read)
+        if pos - self.cached_head.get() >= self.queue.cap {
+            // Cached head says full — refresh from the real atomic
+            let head = self.queue.head.load(Ordering::Acquire);
+            self.cached_head.set(head);
 
-            // Atomically reserve this slot
-            match self.queue.tail.compare_exchange_weak(
-                tail,
-                tail + 1,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // SAFETY: `tail & mask` is always < cap by construction
-                    let slot =
-                        unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-                    return Some((slot.data.get(), &raw const slot.ready));
-                }
-                Err(actual) => {
-                    // Use the actual tail returned by CAS instead of reloading
-                    tail = actual;
-                    Self::cas_backoff(&mut backoff);
-                }
+            if pos - head >= self.queue.cap {
+                return None;
             }
         }
+
+        // SAFETY: `pos & mask` is always < cap by construction
+        let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
+
+        // The ready flag is the authoritative "slot is free" signal.
+        // A consumer CAS-es head before reading, so head advancing does
+        // NOT mean the data has been read. Only ready=false (set by the
+        // consumer after reading) guarantees the slot is safe to overwrite.
+        if slot.ready.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // Advance write_pos — this is our local claim.
+        self.write_pos.set(pos + 1);
+
+        Some((slot.data.get(), &raw const slot.ready))
     }
 
     /// Pushes a value into the ring buffer.
     ///
-    /// Multiple producers can push concurrently. Uses CAS loop to
-    /// atomically reserve slots.
+    /// Returns `Err(val)` if the buffer is full. Only one producer may
+    /// exist, so no CAS is needed.
     pub fn push(&self, val: T) -> Result<(), T> {
-        match self.claim_slot() {
+        match self.try_claim() {
             Some((data_ptr, ready_ptr)) => {
-                // SAFETY: We atomically claimed this slot via CAS
+                // SAFETY: We are the sole producer and the slot is free
+                // (ready=false verified in try_claim).
                 unsafe { (*data_ptr).write(val) };
-                // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc
+
+                // Publish the data: set ready flag so consumers know data
+                // is valid.
+                // SAFETY: ready_ptr points into the RingBuffer kept alive
+                // by Arc.
                 unsafe {
                     (*ready_ptr).store(true, Ordering::Release);
                 }
+
+                // Update tail for len()/is_empty()/is_full() queries.
+                self.queue
+                    .tail
+                    .store(self.write_pos.get(), Ordering::Release);
+
                 Ok(())
             }
             None => Err(val),
@@ -124,9 +104,11 @@ impl<T> Producer<T> {
     /// Dropping a `SlotWriter` without committing aborts the process.
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<T>> {
-        self.claim_slot().map(|(data_ptr, ready_ptr)| SlotWriter {
+        self.try_claim().map(|(data_ptr, ready_ptr)| SlotWriter {
             slot_data: data_ptr,
             slot_ready: ready_ptr,
+            tail: &raw const *self.queue.tail,
+            write_pos: self.write_pos.get(),
             _ring: Arc::clone(&self.queue),
             committed: false,
         })
@@ -160,15 +142,18 @@ impl<T> Producer<T> {
 ///
 /// You **must** call [`commit`](SlotWriter::commit) after writing data.
 /// Dropping a `SlotWriter` without committing will **abort the process**
-/// because the slot cannot be reclaimed (the tail has already advanced).
+/// because the slot cannot be reclaimed (the write position has already
+/// advanced).
 pub struct SlotWriter<T> {
     slot_data: *mut MaybeUninit<T>,
     slot_ready: *const AtomicBool,
+    tail: *const std::sync::atomic::AtomicUsize,
+    write_pos: usize,
     _ring: Arc<RingBuffer<T>>,
     committed: bool,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (claimed via CAS).
+// SAFETY: SlotWriter holds exclusive access to the slot (single producer).
 // The raw pointers point into the Arc<RingBuffer<T>> which is kept alive.
 unsafe impl<T: Send> Send for SlotWriter<T> {}
 
@@ -178,7 +163,7 @@ impl<T> SlotWriter<T> {
     /// Use this for fine-grained control over initialization.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: We have exclusive access via CAS claim. The pointer
+        // SAFETY: We have exclusive access as the sole producer. The pointer
         // is valid because _ring keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
@@ -190,7 +175,7 @@ impl<T> SlotWriter<T> {
         unsafe { (*self.slot_data).write(val) }
     }
 
-    /// Commits the write, making the slot visible to the consumer.
+    /// Commits the write, making the slot visible to consumers.
     ///
     /// Sets the slot's ready flag with `Release` ordering and consumes
     /// the `SlotWriter`.
@@ -198,13 +183,18 @@ impl<T> SlotWriter<T> {
     /// # Safety contract
     ///
     /// The caller must have initialized the slot data (via [`write`] or
-    /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
-    /// Committing without initializing causes the consumer to read
-    /// uninitialized memory (undefined behavior).
+    /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before
+    /// calling `commit`. Committing without initializing causes a
+    /// consumer to read uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
         // SAFETY: slot_ready points into the RingBuffer kept alive by _ring.
         unsafe {
             (*self.slot_ready).store(true, Ordering::Release);
+        }
+        // Update tail for len()/is_empty()/is_full() queries.
+        // SAFETY: tail points into the RingBuffer kept alive by _ring.
+        unsafe {
+            (*self.tail).store(self.write_pos, Ordering::Release);
         }
         self.committed = true;
     }
