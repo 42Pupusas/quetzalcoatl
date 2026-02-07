@@ -1,12 +1,12 @@
 [package]
 name = "quetzalcoatl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["quetzalcoatl contributors"]
-description = "Lock-free ring buffers (MPSC, SPSC, and broadcast) for high-performance concurrent communication"
+description = "Lock-free ring buffers (SPSC, MPSC, SPMC, and broadcast) for high-performance concurrent communication"
 license = "MIT"
 repository = "https://github.com/42Pupusas/quetzalcoatl"
-keywords = ["lock-free", "mpsc", "spsc", "ring-buffer", "broadcast"]
+keywords = ["lock-free", "mpsc", "spmc", "ring-buffer", "broadcast"]
 categories = ["concurrency", "data-structures"]
 readme = "README.md"
 
