@@ -2,12 +2,13 @@
 
 High-performance, lock-free ring buffers for Rust.
 
-Three variants cover every producer/consumer topology:
+Four variants cover every producer/consumer topology:
 
 | Module | Producers | Consumers | Use case |
 |---|---|---|---|
 | `mpsc` | Multiple | Single | Fan-in from worker threads |
 | `spsc` | Single | Single | Pipelines, audio, networking |
+| `spmc` | Single | Multiple | Work distribution, fan-out |
 | `broadcast` | Multiple | Multiple | Pub/sub, event distribution |
 
 ## Features
@@ -22,7 +23,7 @@ Three variants cover every producer/consumer topology:
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.2"
+quetzalcoatl = "0.4"
 ```
 
 ## Quick start
@@ -76,6 +77,42 @@ while let Some(item) = consumer.pop() {
 assert_eq!(items.len(), 400);
 ```
 
+### SPMC (single producer, multiple consumers)
+
+One producer pushes items; multiple consumers compete to pop them.
+Each item is consumed by exactly one consumer — ideal for work distribution.
+
+```rust
+use quetzalcoatl::spmc::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
+use std::thread;
+
+let (producer, consumer) = RingBuffer::new(Capacity::exact(64)).split();
+
+let handles: Vec<_> = (0..4)
+    .map(|_| {
+        let c = consumer.clone();
+        thread::spawn(move || {
+            let mut count = 0;
+            while let Some(_item) = c.pop() {
+                count += 1;
+            }
+            count
+        })
+    })
+    .collect();
+
+for i in 0..100u64 {
+    while producer.push(i).is_err() {
+        thread::yield_now();
+    }
+}
+drop(producer); // signal no more items
+
+let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+assert_eq!(total, 100);
+```
+
 ### Broadcast (multiple producers, multiple consumers)
 
 Every consumer sees every item published after it subscribes.
@@ -118,7 +155,7 @@ assert_eq!(arc2[0], 0xAB);
 
 ## Zero-copy API
 
-All three variants support a zero-copy path for large types:
+All four variants support a zero-copy path for large types:
 
 ```rust
 use quetzalcoatl::spsc::RingBuffer;
@@ -139,8 +176,8 @@ assert_eq!(reader[0], 0xAB);
 
 ## How it works
 
-- **Slot reservation**: Producers use atomic compare-and-swap (CAS) to claim slots (MPSC/broadcast) or a simple local counter (SPSC).
-- **Publication signaling**: Per-slot `AtomicBool` ready flags (MPSC), tail advancement (SPSC), or per-slot `AtomicUsize` sequence numbers (broadcast).
+- **Slot reservation**: Producers use atomic compare-and-swap (CAS) to claim slots (MPSC/broadcast) or a simple local counter (SPSC/SPMC). Consumers use CAS on the head counter to claim items (SPMC).
+- **Publication signaling**: Per-slot `AtomicBool` ready flags (MPSC/SPMC), tail advancement (SPSC), or per-slot `AtomicUsize` sequence numbers (broadcast).
 - **Memory ordering**: Careful `Acquire`/`Release` pairs ensure data visibility without fences or mutexes.
 - **Cache-line padding**: Head and tail counters are padded to avoid false sharing.
 
@@ -177,6 +214,7 @@ cargo run --example basic       # SPSC basics
 cargo run --example mpsc        # Multi-producer concurrent example
 cargo run --example dynamic     # Dynamic producer creation pattern
 cargo run --example broadcast   # Broadcast pub/sub
+cargo run --example debug_spmc  # SPMC work distribution
 ```
 
 ## License
