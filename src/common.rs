@@ -1,10 +1,16 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 
-pub struct Slot<T> {
+/// Per-slot state using a sequence number instead of a ready flag.
+///
+/// The sequence encodes both readiness and ownership using a 2x encoding
+/// that works correctly for all capacities (including `cap == 1`):
+/// - `seq == pos * 2`:     slot is free for the producer to write at position `pos`
+/// - `seq == pos * 2 + 1`: slot contains data ready for a consumer at position `pos`
+pub struct SeqSlot<T> {
     pub data: UnsafeCell<MaybeUninit<T>>,
-    pub ready: AtomicBool,
+    pub sequence: AtomicUsize,
 }
 
 /// Buffer with cache-line-aligned allocation.

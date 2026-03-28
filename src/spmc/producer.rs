@@ -27,10 +27,10 @@ impl<T> Producer<T> {
         let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
 
         // The sequence number is the authoritative "slot is free" signal.
-        // seq == pos means the consumer has finished reading and released
+        // seq == pos * 2 means the consumer has finished reading and released
         // this slot (or it was never written to yet, for the initial fill).
         let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != pos {
+        if seq != pos * 2 {
             return None;
         }
 
@@ -51,12 +51,12 @@ impl<T> Producer<T> {
                 // (seq == pos verified in try_claim).
                 unsafe { (*data_ptr).write(val) };
 
-                // Publish the data: set sequence to pos + 1 so consumers
+                // Publish the data: set sequence to pos * 2 + 1 so consumers
                 // know data is valid.
                 // SAFETY: seq_ptr points into the RingBuffer kept alive
                 // by Arc.
                 unsafe {
-                    (*seq_ptr).store(pos + 1, Ordering::Release);
+                    (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
                 }
 
                 // Update tail for len()/is_empty()/is_full() queries.
@@ -168,7 +168,7 @@ impl<T> SlotWriter<T> {
     pub fn commit(mut self) {
         // SAFETY: slot_seq points into the RingBuffer kept alive by _ring.
         unsafe {
-            (*self.slot_seq).store(self.pos + 1, Ordering::Release);
+            (*self.slot_seq).store(self.pos * 2 + 1, Ordering::Release);
         }
         // Update tail for len()/is_empty()/is_full() queries.
         // SAFETY: tail points into the RingBuffer kept alive by _ring.

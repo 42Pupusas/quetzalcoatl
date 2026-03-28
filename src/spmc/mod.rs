@@ -33,22 +33,12 @@ pub use producer::{Producer, SlotWriter};
 pub use consumer::{Consumer, SlotReader};
 
 use crate::capacity::Capacity;
-use crate::common::{AlignedBuf, CachePadded};
+use crate::common::{AlignedBuf, CachePadded, SeqSlot};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// Per-slot state using a sequence number instead of a ready flag.
-///
-/// The sequence encodes both readiness and ownership:
-/// - `seq == pos`: slot is free for the producer to write at position `pos`
-/// - `seq == pos + 1`: slot contains data ready for a consumer at position `pos`
-pub(crate) struct SeqSlot<T> {
-    pub data: UnsafeCell<MaybeUninit<T>>,
-    pub sequence: AtomicUsize,
-}
 
 /// A lock-free SPMC ring buffer.
 ///
@@ -80,7 +70,7 @@ impl<T> RingBuffer<T> {
         let buf = AlignedBuf::new_with(cap, || {
             let slot = SeqSlot {
                 data: UnsafeCell::new(MaybeUninit::uninit()),
-                sequence: AtomicUsize::new(idx),
+                sequence: AtomicUsize::new(idx * 2),
             };
             idx += 1;
             slot

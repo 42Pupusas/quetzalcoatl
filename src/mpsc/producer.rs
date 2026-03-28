@@ -1,5 +1,5 @@
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
@@ -53,11 +53,13 @@ impl<T> Producer<T> {
 
     /// Atomically claims the next available slot via CAS loop.
     ///
-    /// Returns raw pointers to the slot's data and ready flag, or `None`
-    /// if the buffer is full. Used by both `push` and `reserve`.
+    /// Uses a cached head for the distance check (thread-local, zero
+    /// contention), then CAS on tail to claim the position. The distance
+    /// check guarantees the slot is free — no per-slot atomic load needed
+    /// on the producer side.
     fn claim_slot(
         &self,
-    ) -> Option<(*mut MaybeUninit<T>, *const AtomicBool)> {
+    ) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let mut backoff = 0u32;
         let mut tail = self.queue.tail.load(Ordering::Relaxed);
         loop {
@@ -76,14 +78,20 @@ impl<T> Producer<T> {
             match self.queue.tail.compare_exchange_weak(
                 tail,
                 tail + 1,
-                Ordering::Release,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // SAFETY: `tail & mask` is always < cap by construction
+                    // SAFETY: `tail & mask` is always < cap by construction.
+                    // The distance check guarantees this slot has been fully
+                    // consumed — no sequence check needed on the producer side.
                     let slot =
                         unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-                    return Some((slot.data.get(), &raw const slot.ready));
+                    return Some((
+                        slot.data.get(),
+                        &raw const slot.sequence,
+                        tail,
+                    ));
                 }
                 Err(actual) => {
                     // Use the actual tail returned by CAS instead of reloading
@@ -100,12 +108,13 @@ impl<T> Producer<T> {
     /// atomically reserve slots.
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
-            Some((data_ptr, ready_ptr)) => {
+            Some((data_ptr, seq_ptr, pos)) => {
                 // SAFETY: We atomically claimed this slot via CAS
                 unsafe { (*data_ptr).write(val) };
-                // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc
+                // Publish: set sequence = pos * 2 + 1 so consumer sees data.
+                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc
                 unsafe {
-                    (*ready_ptr).store(true, Ordering::Release);
+                    (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
                 }
                 Ok(())
             }
@@ -124,9 +133,10 @@ impl<T> Producer<T> {
     /// Dropping a `SlotWriter` without committing aborts the process.
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<T>> {
-        self.claim_slot().map(|(data_ptr, ready_ptr)| SlotWriter {
+        self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
             slot_data: data_ptr,
-            slot_ready: ready_ptr,
+            slot_seq: seq_ptr,
+            pos,
             _ring: Arc::clone(&self.queue),
             committed: false,
         })
@@ -163,7 +173,8 @@ impl<T> Producer<T> {
 /// because the slot cannot be reclaimed (the tail has already advanced).
 pub struct SlotWriter<T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_ready: *const AtomicBool,
+    slot_seq: *const AtomicUsize,
+    pos: usize,
     _ring: Arc<RingBuffer<T>>,
     committed: bool,
 }
@@ -192,8 +203,8 @@ impl<T> SlotWriter<T> {
 
     /// Commits the write, making the slot visible to the consumer.
     ///
-    /// Sets the slot's ready flag with `Release` ordering and consumes
-    /// the `SlotWriter`.
+    /// Sets the slot's sequence to `pos * 2 + 1` with `Release` ordering
+    /// and consumes the `SlotWriter`.
     ///
     /// # Safety contract
     ///
@@ -202,9 +213,9 @@ impl<T> SlotWriter<T> {
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        // SAFETY: slot_ready points into the RingBuffer kept alive by _ring.
+        // SAFETY: slot_seq points into the RingBuffer kept alive by _ring.
         unsafe {
-            (*self.slot_ready).store(true, Ordering::Release);
+            (*self.slot_seq).store(self.pos * 2 + 1, Ordering::Release);
         }
         self.committed = true;
     }

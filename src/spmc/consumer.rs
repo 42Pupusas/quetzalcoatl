@@ -85,7 +85,7 @@ impl<T> Consumer<T> {
             // The sequence number is the authoritative signal. It guarantees
             // the producer has finished writing data to this slot.
             let seq = slot.sequence.load(Ordering::Acquire);
-            if seq != head + 1 {
+            if seq != head * 2 + 1 {
                 return None;
             }
 
@@ -126,11 +126,11 @@ impl<T> Consumer<T> {
         // set seq == head + 1 after writing data.
         let val = unsafe { data_ptr.cast::<T>().read() };
 
-        // Release the slot: set sequence to head + cap so the producer
+        // Release the slot: set sequence to (head + cap) * 2 so the producer
         // knows this slot is free for reuse at position head + cap.
         // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
         unsafe {
-            (*seq_ptr).store(head + self.queue.cap, Ordering::Release);
+            (*seq_ptr).store((head + self.queue.cap) * 2, Ordering::Release);
         }
 
         Some(val)
@@ -221,7 +221,7 @@ impl<T> Drop for SlotReader<'_, T> {
         // SAFETY: seq_ptr points into the RingBuffer kept alive by
         // consumer's Arc.
         unsafe {
-            (*self.seq_ptr).store(self.head + self.cap, Ordering::Release);
+            (*self.seq_ptr).store((self.head + self.cap) * 2, Ordering::Release);
         }
     }
 }
