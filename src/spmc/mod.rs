@@ -33,12 +33,22 @@ pub use producer::{Producer, SlotWriter};
 pub use consumer::{Consumer, SlotReader};
 
 use crate::capacity::Capacity;
-use crate::common::{AlignedBuf, CachePadded, Slot};
+use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Per-slot state using a sequence number instead of a ready flag.
+///
+/// The sequence encodes both readiness and ownership:
+/// - `seq == pos`: slot is free for the producer to write at position `pos`
+/// - `seq == pos + 1`: slot contains data ready for a consumer at position `pos`
+pub(crate) struct SeqSlot<T> {
+    pub data: UnsafeCell<MaybeUninit<T>>,
+    pub sequence: AtomicUsize,
+}
 
 /// A lock-free SPMC ring buffer.
 ///
@@ -47,16 +57,17 @@ use std::sync::Arc;
 /// `Producer` is not (single-producer).
 #[repr(C)]
 pub struct RingBuffer<T> {
-    pub(crate) buf: AlignedBuf<Slot<T>>,
+    pub(crate) buf: AlignedBuf<SeqSlot<T>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
 }
 
-// Safety: Single producer advances tail and writes to slots guarded by ready
-// flags. Multiple consumers use CAS on head to claim slots. Ready flags
-// ensure proper synchronization between producer and consumers.
+// Safety: Single producer advances tail and writes to slots guarded by
+// sequence numbers. Multiple consumers use CAS on head to claim slots.
+// Sequence numbers ensure proper synchronization between producer and
+// consumers.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
@@ -65,9 +76,14 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
-        let buf = AlignedBuf::new_with(cap, || Slot {
-            data: UnsafeCell::new(MaybeUninit::uninit()),
-            ready: AtomicBool::new(false),
+        let mut idx = 0usize;
+        let buf = AlignedBuf::new_with(cap, || {
+            let slot = SeqSlot {
+                data: UnsafeCell::new(MaybeUninit::uninit()),
+                sequence: AtomicUsize::new(idx),
+            };
+            idx += 1;
+            slot
         });
 
         Self {
@@ -106,10 +122,26 @@ impl<T> RingBuffer<T> {
         let producer = Producer {
             queue: arc.clone(),
             write_pos: std::cell::Cell::new(0),
-            cached_head: std::cell::Cell::new(0),
         };
-        let consumer = Consumer { queue: arc };
+        let consumer = Consumer {
+            queue: arc,
+            cached_tail: std::cell::Cell::new(0),
+        };
         (producer, consumer)
+    }
+}
+
+impl<T> Drop for RingBuffer<T> {
+    fn drop(&mut self) {
+        let head = *self.head.0.get_mut();
+        let tail = *self.tail.0.get_mut();
+        for pos in head..tail {
+            let slot = &self.buf[pos & self.mask];
+            // SAFETY: slots between head and tail contain initialized data.
+            unsafe {
+                slot.data.get().cast::<T>().drop_in_place();
+            }
+        }
     }
 }
 
@@ -514,7 +546,7 @@ mod tests {
         assert_eq!(received, n);
     }
 
-    /// Two consumers, tiny buffer — checks CAS + ready flag synchronization.
+    /// Two consumers, tiny buffer — checks CAS + sequence synchronization.
     #[test]
     fn concurrent_spmc_data_race_check() {
         let total = 16usize;

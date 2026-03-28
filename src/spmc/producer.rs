@@ -1,5 +1,5 @@
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
@@ -13,54 +13,31 @@ pub struct Producer<T> {
     /// Local write cursor. Because there is only one producer, no atomic
     /// operations are needed — we simply increment after each claim.
     pub(super) write_pos: std::cell::Cell<usize>,
-    /// Cached snapshot of `head` to avoid cross-cache-line reads on every push.
-    /// Since `head` only ever increases, a stale value is safe — it just makes
-    /// the buffer appear fuller than it is. We re-fetch only when needed.
-    pub(super) cached_head: std::cell::Cell<usize>,
 }
 
 impl<T> Producer<T> {
     /// Checks whether the next slot is available for writing.
     ///
-    /// Two conditions must hold before the producer may write to a slot:
-    ///
-    /// 1. **Distance check** (`write_pos - head < cap`): prevents the
-    ///    producer from wrapping past its own outstanding reservations.
-    ///
-    /// 2. **Ready flag check** (`ready == false`): the authoritative signal
-    ///    that a consumer has finished reading and released the slot.
-    ///    Because consumers CAS `head` *before* reading data, `head`
-    ///    advancing does NOT mean the slot is free — only `ready = false`
-    ///    does.
-    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicBool)> {
+    /// Uses the slot's sequence number as the sole check:
+    /// `seq == pos` means the slot is free for the producer at this position.
+    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let pos = self.write_pos.get();
-
-        // Fast path: check against cached head (avoids cross-cache-line read)
-        if pos - self.cached_head.get() >= self.queue.cap {
-            // Cached head says full — refresh from the real atomic
-            let head = self.queue.head.load(Ordering::Acquire);
-            self.cached_head.set(head);
-
-            if pos - head >= self.queue.cap {
-                return None;
-            }
-        }
 
         // SAFETY: `pos & mask` is always < cap by construction
         let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
 
-        // The ready flag is the authoritative "slot is free" signal.
-        // A consumer CAS-es head before reading, so head advancing does
-        // NOT mean the data has been read. Only ready=false (set by the
-        // consumer after reading) guarantees the slot is safe to overwrite.
-        if slot.ready.load(Ordering::Acquire) {
+        // The sequence number is the authoritative "slot is free" signal.
+        // seq == pos means the consumer has finished reading and released
+        // this slot (or it was never written to yet, for the initial fill).
+        let seq = slot.sequence.load(Ordering::Acquire);
+        if seq != pos {
             return None;
         }
 
         // Advance write_pos — this is our local claim.
         self.write_pos.set(pos + 1);
 
-        Some((slot.data.get(), &raw const slot.ready))
+        Some((slot.data.get(), &raw const slot.sequence, pos))
     }
 
     /// Pushes a value into the ring buffer.
@@ -69,17 +46,17 @@ impl<T> Producer<T> {
     /// exist, so no CAS is needed.
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.try_claim() {
-            Some((data_ptr, ready_ptr)) => {
+            Some((data_ptr, seq_ptr, pos)) => {
                 // SAFETY: We are the sole producer and the slot is free
-                // (ready=false verified in try_claim).
+                // (seq == pos verified in try_claim).
                 unsafe { (*data_ptr).write(val) };
 
-                // Publish the data: set ready flag so consumers know data
-                // is valid.
-                // SAFETY: ready_ptr points into the RingBuffer kept alive
+                // Publish the data: set sequence to pos + 1 so consumers
+                // know data is valid.
+                // SAFETY: seq_ptr points into the RingBuffer kept alive
                 // by Arc.
                 unsafe {
-                    (*ready_ptr).store(true, Ordering::Release);
+                    (*seq_ptr).store(pos + 1, Ordering::Release);
                 }
 
                 // Update tail for len()/is_empty()/is_full() queries.
@@ -104,11 +81,12 @@ impl<T> Producer<T> {
     /// Dropping a `SlotWriter` without committing aborts the process.
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<T>> {
-        self.try_claim().map(|(data_ptr, ready_ptr)| SlotWriter {
+        self.try_claim().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
             slot_data: data_ptr,
-            slot_ready: ready_ptr,
+            slot_seq: seq_ptr,
             tail: &raw const *self.queue.tail,
             write_pos: self.write_pos.get(),
+            pos,
             _ring: Arc::clone(&self.queue),
             committed: false,
         })
@@ -146,9 +124,10 @@ impl<T> Producer<T> {
 /// advanced).
 pub struct SlotWriter<T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_ready: *const AtomicBool,
-    tail: *const std::sync::atomic::AtomicUsize,
+    slot_seq: *const AtomicUsize,
+    tail: *const AtomicUsize,
     write_pos: usize,
+    pos: usize,
     _ring: Arc<RingBuffer<T>>,
     committed: bool,
 }
@@ -177,8 +156,8 @@ impl<T> SlotWriter<T> {
 
     /// Commits the write, making the slot visible to consumers.
     ///
-    /// Sets the slot's ready flag with `Release` ordering and consumes
-    /// the `SlotWriter`.
+    /// Sets the slot's sequence to `pos + 1` with `Release` ordering
+    /// and consumes the `SlotWriter`.
     ///
     /// # Safety contract
     ///
@@ -187,9 +166,9 @@ impl<T> SlotWriter<T> {
     /// calling `commit`. Committing without initializing causes a
     /// consumer to read uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        // SAFETY: slot_ready points into the RingBuffer kept alive by _ring.
+        // SAFETY: slot_seq points into the RingBuffer kept alive by _ring.
         unsafe {
-            (*self.slot_ready).store(true, Ordering::Release);
+            (*self.slot_seq).store(self.pos + 1, Ordering::Release);
         }
         // Update tail for len()/is_empty()/is_full() queries.
         // SAFETY: tail points into the RingBuffer kept alive by _ring.

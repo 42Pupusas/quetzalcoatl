@@ -76,15 +76,21 @@ impl<T> Producer<T> {
                         unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
 
                     // Drop old value if this slot was previously written.
-                    // swap(0, Acquire) atomically reads old sequence and clears it,
-                    // synchronizing with the previous producer's Release store.
-                    let old_seq = slot.sequence.swap(0, Ordering::Acquire);
-                    if old_seq > 0 {
-                        // SAFETY: old_seq > 0 means data was initialized by a prior write.
-                        // All consumers have advanced past this slot (min_head check passed).
-                        unsafe {
-                            slot.data.get().cast::<T>().drop_in_place();
+                    if std::mem::needs_drop::<T>() {
+                        // swap(0, Acquire) atomically reads old sequence and clears it,
+                        // synchronizing with the previous producer's Release store.
+                        let old_seq = slot.sequence.swap(0, Ordering::Acquire);
+                        if old_seq > 0 {
+                            // SAFETY: old_seq > 0 means data was initialized by a prior write.
+                            // All consumers have advanced past this slot (min_head check passed).
+                            unsafe {
+                                slot.data.get().cast::<T>().drop_in_place();
+                            }
                         }
+                    } else {
+                        // No destructor needed — just clear the sequence.
+                        // A simple store is cheaper than an atomic swap.
+                        slot.sequence.store(0, Ordering::Relaxed);
                     }
 
                     return Some((slot.data.get(), &raw const slot.sequence, tail));

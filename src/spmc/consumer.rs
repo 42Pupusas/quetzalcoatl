@@ -1,5 +1,5 @@
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
@@ -13,12 +13,17 @@ use super::RingBuffer;
 /// Drains remaining items when dropped.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
+    /// Cached snapshot of `tail` to avoid cross-cache-line reads when the
+    /// buffer is empty. Since `tail` only ever increases, a stale value is
+    /// safe — it just makes the buffer appear emptier than it is.
+    pub(super) cached_tail: std::cell::Cell<usize>,
 }
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         Self {
             queue: Arc::clone(&self.queue),
+            cached_tail: std::cell::Cell::new(self.cached_tail.get()),
         }
     }
 }
@@ -50,27 +55,37 @@ impl<T> Consumer<T> {
 
     /// Atomically claims the next available slot via CAS loop.
     ///
-    /// The ready flag is the sole synchronization point. It subsumes the
-    /// tail check: `ready=true` means the producer has both claimed AND
-    /// written the slot. `ready=false` means either empty or reserved-
-    /// but-not-committed — both cases require returning `None`.
+    /// Uses the slot's sequence number as the synchronization point:
+    /// `seq == head + 1` means the producer has written data at this position.
     ///
-    /// Returns raw pointers to the slot's data and ready flag, or `None`
-    /// if the buffer is empty.
+    /// Returns raw pointers to the slot's data and sequence, plus the
+    /// claimed head position, or `None` if the buffer is empty.
     fn claim_slot(
         &self,
-    ) -> Option<(*const MaybeUninit<T>, *const AtomicBool)> {
+    ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
         let mut backoff = 0u32;
         loop {
             let head = self.queue.head.load(Ordering::Relaxed);
+
+            // Fast path: check cached tail before touching any slot's
+            // cache line. This avoids unnecessary Acquire loads when the
+            // buffer is empty or the consumer is faster than the producer.
+            if head >= self.cached_tail.get() {
+                let tail = self.queue.tail.load(Ordering::Acquire);
+                self.cached_tail.set(tail);
+                if head >= tail {
+                    return None;
+                }
+            }
 
             // SAFETY: `head & mask` is always < cap by construction
             let slot =
                 unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-            // The ready flag is the authoritative signal. It guarantees the
-            // producer has finished writing data to this slot.
-            if !slot.ready.load(Ordering::Acquire) {
+            // The sequence number is the authoritative signal. It guarantees
+            // the producer has finished writing data to this slot.
+            let seq = slot.sequence.load(Ordering::Acquire);
+            if seq != head + 1 {
                 return None;
             }
 
@@ -78,13 +93,14 @@ impl<T> Consumer<T> {
             match self.queue.head.compare_exchange_weak(
                 head,
                 head + 1,
-                Ordering::Acquire,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     return Some((
                         slot.data.get().cast_const(),
-                        &raw const slot.ready,
+                        &raw const slot.sequence,
+                        head,
                     ));
                 }
                 Err(_) => {
@@ -104,16 +120,17 @@ impl<T> Consumer<T> {
     /// Returns `None` if the buffer is empty.
     #[must_use]
     pub fn pop(&self) -> Option<T> {
-        let (data_ptr, ready_ptr) = self.claim_slot()?;
+        let (data_ptr, seq_ptr, head) = self.claim_slot()?;
 
         // SAFETY: We atomically claimed this slot via CAS. The producer
-        // set ready=true after writing data.
+        // set seq == head + 1 after writing data.
         let val = unsafe { data_ptr.cast::<T>().read() };
 
-        // Clear the ready flag so the producer knows this slot is free.
-        // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc.
+        // Release the slot: set sequence to head + cap so the producer
+        // knows this slot is free for reuse at position head + cap.
+        // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
         unsafe {
-            (*ready_ptr).store(false, Ordering::Release);
+            (*seq_ptr).store(head + self.queue.cap, Ordering::Release);
         }
 
         Some(val)
@@ -131,11 +148,13 @@ impl<T> Consumer<T> {
     /// consumer clone at a time.
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
-        let (data_ptr, ready_ptr) = self.claim_slot()?;
+        let (data_ptr, seq_ptr, head) = self.claim_slot()?;
 
         Some(SlotReader {
             data_ptr,
-            ready_ptr,
+            seq_ptr,
+            head,
+            cap: self.queue.cap,
             _consumer: self,
         })
     }
@@ -170,18 +189,20 @@ impl<T> Drop for Consumer<T> {
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without copying.
 ///
-/// When dropped, drops the `T` value and clears the slot's ready flag
-/// so the producer can reuse the slot.
+/// When dropped, drops the `T` value and releases the slot by updating
+/// the sequence number so the producer can reuse the slot.
 pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
-    ready_ptr: *const AtomicBool,
+    seq_ptr: *const AtomicUsize,
+    head: usize,
+    cap: usize,
     _consumer: &'a mut Consumer<T>,
 }
 
 impl<T> std::ops::Deref for SlotReader<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: The slot was claimed via CAS after verifying ready=true.
+        // SAFETY: The slot was claimed via CAS after verifying seq == head + 1.
         // The data is initialized and we have exclusive access via CAS
         // claim + &mut Consumer.
         unsafe { (*self.data_ptr).assume_init_ref() }
@@ -190,17 +211,17 @@ impl<T> std::ops::Deref for SlotReader<'_, T> {
 
 impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
-        // SAFETY: The value is initialized (ready=true was verified before CAS).
+        // SAFETY: The value is initialized (seq == head + 1 was verified before CAS).
         // Exclusive access guaranteed by CAS + &mut Consumer.
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
 
-        // Clear the ready flag so the producer can reuse this slot.
-        // SAFETY: ready_ptr points into the RingBuffer kept alive by
+        // Release the slot so the producer can reuse it.
+        // SAFETY: seq_ptr points into the RingBuffer kept alive by
         // consumer's Arc.
         unsafe {
-            (*self.ready_ptr).store(false, Ordering::Release);
+            (*self.seq_ptr).store(self.head + self.cap, Ordering::Release);
         }
     }
 }
