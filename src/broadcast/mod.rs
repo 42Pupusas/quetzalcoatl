@@ -121,7 +121,6 @@ impl<T> RingBuffer<T> {
         let consumer = Consumer {
             queue: arc,
             slot_index: 0,
-            cached_tail: std::cell::Cell::new(0),
         };
         (producer, consumer)
     }

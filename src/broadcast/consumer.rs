@@ -20,8 +20,6 @@ pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Index into `consumer_slots` — identifies this consumer's head.
     pub(super) slot_index: usize,
-    /// Cached snapshot of `tail` to avoid cross-cache-line reads on every pop.
-    pub(super) cached_tail: std::cell::Cell<usize>,
 }
 
 impl<T> Clone for Consumer<T> {
@@ -39,7 +37,6 @@ impl<T> Clone for Consumer<T> {
         Self {
             queue: Arc::clone(&self.queue),
             slot_index: idx,
-            cached_tail: std::cell::Cell::new(tail),
         }
     }
 }
@@ -56,23 +53,13 @@ impl<T> Drop for Consumer<T> {
 }
 
 impl<T> Consumer<T> {
-    /// Returns true if data is available at the given head position.
-    /// Uses `cached_tail` as a fast path to avoid cross-cache-line reads.
-    #[inline]
-    fn tail_available(&self, head: usize) -> bool {
-        if head == self.cached_tail.get() {
-            let tail = self.queue.tail.load(Ordering::Acquire);
-            self.cached_tail.set(tail);
-            head != tail
-        } else {
-            true
-        }
-    }
-
     /// Pops the next item, returning a clone.
     ///
     /// Returns `None` if the buffer is empty or the next slot hasn't
     /// been committed yet.
+    ///
+    /// Uses the per-slot sequence number as the sole synchronization point,
+    /// avoiding a load of the contended `tail` cache line entirely.
     #[inline]
     #[must_use]
     pub fn pop(&mut self) -> Option<T>
@@ -83,14 +70,14 @@ impl<T> Consumer<T> {
             .head
             .load(Ordering::Relaxed);
 
-        if !self.tail_available(head) {
-            return None;
-        }
-
         // SAFETY: `head & mask` is always < cap by construction
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-        // Check sequence: must be exactly `head + 1` for this position's data.
+        // The sequence number is the sole synchronization point.
+        // seq == head + 1 means the producer has written data at this position.
+        // The Acquire ordering synchronizes with the producer's Release store
+        // on the sequence, ensuring the data write is visible.
+        // Any other value means either empty or not-yet-committed.
         let seq = slot.sequence.load(Ordering::Acquire);
         if seq != head + 1 {
             return None;
@@ -122,10 +109,6 @@ impl<T> Consumer<T> {
         let head = self.queue.consumer_slots[self.slot_index]
             .head
             .load(Ordering::Relaxed);
-
-        if !self.tail_available(head) {
-            return None;
-        }
 
         // SAFETY: `head & mask` is always < cap by construction
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
