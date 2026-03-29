@@ -67,6 +67,10 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     pub(crate) consumer_slots: Box<[ConsumerSlot]>,
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// Shared L2 cache of `min_head()`. Updated by any producer after a full
+    /// scan; read by all producers to avoid redundant O(N) scans.
+    /// Always ≤ actual min_head (conservative), so a stale value is safe.
+    pub(crate) min_head_cache: CachePadded<AtomicUsize>,
 }
 
 // SAFETY: RingBuffer is shared via Arc between producers and consumers on
@@ -104,6 +108,7 @@ impl<T> RingBuffer<T> {
             cap,
             mask: capacity.mask,
             tail: CachePadded(AtomicUsize::new(0)),
+            min_head_cache: CachePadded(AtomicUsize::new(0)),
             consumer_slots: consumer_slots.into_boxed_slice(),
         }
     }

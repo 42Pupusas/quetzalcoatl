@@ -41,13 +41,32 @@ impl<T> Producer<T> {
         let mut backoff = 0u32;
         let mut tail = self.queue.tail.load(Ordering::Relaxed);
         loop {
-            // Fast path: check against cached min_head
+            // Two-level min_head cache:
+            // L1 = per-producer Cell (zero-cost, no atomic)
+            // L2 = shared AtomicUsize (one Acquire load, benefits all producers)
+            // L3 = full O(N) scan of consumer heads
             if tail.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
-                let min_head = self.queue.min_head();
-                self.cached_min_head.set(min_head);
+                // L1 miss — try L2 shared cache.
+                // Acquire syncs with the Release in fetch_max below,
+                // transitively carrying consumer-head Release → min_head()
+                // Acquire → fetch_max Release to this producer.
+                let shared = self.queue.min_head_cache.load(Ordering::Acquire);
+                self.cached_min_head.set(shared);
 
-                if tail.wrapping_sub(min_head) >= self.queue.cap {
-                    return None;
+                if tail.wrapping_sub(shared) >= self.queue.cap {
+                    // L2 miss — full scan (min_head loads heads with Acquire)
+                    let min_head = self.queue.min_head();
+                    // Release carries the Acquire from min_head() so other
+                    // producers loading with Acquire see the consumer data.
+                    // fetch_max ensures the cache never goes backward.
+                    self.queue
+                        .min_head_cache
+                        .fetch_max(min_head, Ordering::Release);
+                    self.cached_min_head.set(min_head);
+
+                    if tail.wrapping_sub(min_head) >= self.queue.cap {
+                        return None;
+                    }
                 }
             }
 
@@ -202,6 +221,7 @@ impl<T> SlotWriter<'_, T> {
     /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
     /// Committing without initializing causes consumers to read
     /// uninitialized memory (undefined behavior).
+    #[inline]
     pub fn commit(mut self) {
         self.slot_sequence.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;

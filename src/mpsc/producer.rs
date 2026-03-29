@@ -190,6 +190,7 @@ impl<T> SlotWriter<'_, T> {
     /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
+    #[inline]
     pub fn commit(mut self) {
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;

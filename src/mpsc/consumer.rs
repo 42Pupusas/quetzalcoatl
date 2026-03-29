@@ -60,6 +60,7 @@ impl<T> Consumer<T> {
     ///
     /// Returns `None` if the queue is empty or the next slot is not yet
     /// committed (same semantics as `pop`).
+    #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let head = self.queue.head.load(Ordering::Relaxed);

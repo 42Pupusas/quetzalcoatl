@@ -141,16 +141,30 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn stress_push_pop() {
-        let cap = Capacity::exact(128 * 1024 * 1024);
-        let n = cap.get() as u64;
+        let cap = Capacity::exact(1024);
+        let n = 128 * 1024 * 1024_u64;
         let instant = std::time::Instant::now();
-        let (producer, _consumer) = RingBuffer::<u64>::new(cap).split();
+        let (producer, mut consumer) = RingBuffer::<u64>::new(cap).split();
+
+        let handle = std::thread::spawn(move || {
+            let mut received = 0u64;
+            while received < n {
+                if let Some(val) = consumer.pop() {
+                    assert_eq!(val, received);
+                    received += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        });
 
         for i in 0..n {
-            producer
-                .push(i)
-                .unwrap_or_else(|_| panic!("Failed to push {i}",));
+            while producer.push(i).is_err() {
+                std::hint::spin_loop();
+            }
         }
+
+        handle.join().unwrap();
         println!("Took {}ms", instant.elapsed().as_millis());
     }
 

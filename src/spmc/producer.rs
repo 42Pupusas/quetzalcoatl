@@ -44,6 +44,7 @@ impl<T> Producer<T> {
     ///
     /// Returns `Err(val)` if the buffer is full. Only one producer may
     /// exist, so no CAS is needed.
+    #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.try_claim() {
             Some((data_ptr, seq_ptr, pos)) => {
@@ -79,6 +80,7 @@ impl<T> Producer<T> {
     ///
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
+    #[inline]
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         self.try_claim().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
@@ -164,6 +166,7 @@ impl<T> SlotWriter<'_, T> {
     /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before
     /// calling `commit`. Committing without initializing causes a
     /// consumer to read uninitialized memory (undefined behavior).
+    #[inline]
     pub fn commit(mut self) {
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.tail.store(self.write_pos, Ordering::Release);

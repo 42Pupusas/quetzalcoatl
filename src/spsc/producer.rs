@@ -103,6 +103,7 @@ impl<T> Producer<T> {
     ///
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
+    #[inline]
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         let pos = self.try_claim()?;
@@ -196,6 +197,7 @@ impl<T> SlotWriter<'_, T> {
     /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
+    #[inline]
     pub fn commit(mut self) {
         let pending = self.pending_reserves.get() - 1;
         self.pending_reserves.set(pending);

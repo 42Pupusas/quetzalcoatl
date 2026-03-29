@@ -70,6 +70,7 @@ impl<T> Consumer<T> {
     /// when the `SlotReader` is dropped.
     ///
     /// Returns `None` if the buffer is empty.
+    #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let head = self.queue.head.load(Ordering::Relaxed);

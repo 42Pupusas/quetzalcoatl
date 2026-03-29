@@ -120,6 +120,7 @@ impl<T> ArcSlotWriter<'_, T> {
     }
 
     /// Commits the write, making the slot visible to all consumers.
+    #[inline]
     pub fn commit(self) {
         self.inner.commit();
     }
