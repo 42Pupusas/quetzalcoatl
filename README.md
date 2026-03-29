@@ -6,8 +6,8 @@ Four variants cover every producer/consumer topology:
 
 | Module | Producers | Consumers | Use case |
 |---|---|---|---|
-| `mpsc` | Multiple | Single | Fan-in from worker threads |
 | `spsc` | Single | Single | Pipelines, audio, networking |
+| `mpsc` | Multiple | Single | Fan-in from worker threads |
 | `spmc` | Single | Multiple | Work distribution, fan-out |
 | `broadcast` | Multiple | Multiple | Pub/sub, event distribution |
 
@@ -15,7 +15,8 @@ Four variants cover every producer/consumer topology:
 
 - **Lock-free** — no mutexes, only atomic CAS / Acquire-Release
 - **Zero dependencies** — pure `std` implementation
-- **Zero-copy API** — `reserve()` + `commit()` on the producer side, `pop_ref()` on the consumer side
+- **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side
+- **Sound by construction** — `commit()` is only available on `WrittenSlot` (after `write()`), so safe code cannot cause UB
 - **Miri-tested** — validated under Miri for undefined-behavior and data-race detection
 - **Power-of-two capacity** — fast bitwise-AND indexing, no modulo
 
@@ -155,18 +156,18 @@ assert_eq!(arc2[0], 0xAB);
 
 ## Zero-copy API
 
-All four variants support a zero-copy path for large types:
+All four variants support a zero-copy path using a **typestate pattern**
+that enforces correctness at compile time:
 
 ```rust
 use quetzalcoatl::spsc::RingBuffer;
 use quetzalcoatl::capacity::Capacity;
 
-let (producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
+let (mut producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
 
-// Producer: write directly into the slot
-let mut writer = producer.reserve().unwrap();
-writer.write([0xAB; 4096]);
-writer.commit(); // makes the slot visible to the consumer
+// Producer: reserve a slot, write into it, commit
+let writer = producer.reserve().unwrap();   // SlotWriter (no data yet)
+writer.write([0xAB; 4096]).commit();        // write() → WrittenSlot → commit()
 
 // Consumer: read without copying
 let reader = consumer.pop_ref().unwrap();
@@ -174,18 +175,42 @@ assert_eq!(reader[0], 0xAB);
 // slot is released when `reader` drops
 ```
 
+The type system guarantees soundness:
+
+- `reserve()` returns a `SlotWriter` — you can inspect the slot via
+  `slot_mut()` or initialize it via `write()`.
+- `write()` consumes the `SlotWriter` and returns a `WrittenSlot`.
+- `commit()` is only available on `WrittenSlot`, so you **cannot commit
+  uninitialized data in safe Rust**.
+- For advanced use (initializing via `slot_mut()`), an `unsafe fn
+  commit_unchecked()` is available on `SlotWriter`.
+- Dropping a `SlotWriter` rolls back the reservation (SPSC/SPMC) or
+  tombstones the slot (MPSC/broadcast) — no panic, no abort.
+- Dropping a `WrittenSlot` drops the value and then rolls back or
+  tombstones — no leak, no panic.
+
 ## How it works
 
-- **Slot reservation**: Producers use atomic compare-and-swap (CAS) to claim slots (MPSC/broadcast) or a simple local counter (SPSC/SPMC). Consumers use CAS on the head counter to claim items (SPMC).
-- **Publication signaling**: Per-slot `AtomicBool` ready flags (MPSC/SPMC), tail advancement (SPSC), or per-slot `AtomicUsize` sequence numbers (broadcast).
-- **Memory ordering**: Careful `Acquire`/`Release` pairs ensure data visibility without fences or mutexes.
-- **Cache-line padding**: Head and tail counters are padded to avoid false sharing.
+- **Slot reservation**: Producers use atomic compare-and-swap (CAS) to
+  claim slots (MPSC/broadcast) or a simple local counter (SPSC/SPMC).
+  Consumers use CAS on the head counter to claim items (SPMC).
+- **Publication signaling**: Per-slot `AtomicUsize` sequence numbers
+  encode slot state (free / published / tombstoned). SPSC uses simple
+  tail advancement since only one producer exists.
+- **Memory ordering**: Careful `Acquire`/`Release` pairs ensure data
+  visibility without fences or mutexes.
+- **Cache-line padding**: Head and tail counters are padded to 64 bytes
+  to avoid false sharing.
+- **Tombstoning**: If an MPSC/broadcast `SlotWriter` is dropped without
+  writing, the slot is marked with a tombstone sentinel. Consumers
+  detect tombstones and silently skip past them.
 
 ## Performance
 
 - O(1) push and pop (with CAS retry under contention for MPSC/broadcast)
 - Fixed-size buffer — no allocations on the hot path
 - Scales well with multiple producers (exponential CAS backoff)
+- Two-level `min_head` cache in broadcast avoids O(N) consumer scans
 
 Run benchmarks:
 
@@ -195,7 +220,12 @@ cargo bench
 
 ## Safety
 
-All `unsafe` code is documented with `SAFETY` comments. Run Miri for additional validation:
+All public APIs are safe (no `unsafe` in user-facing code except
+`commit_unchecked()`). Internal `unsafe` blocks are documented with
+`// SAFETY:` comments explaining the invariant that makes each operation
+sound.
+
+Run Miri for additional validation:
 
 ```bash
 cargo +nightly miri test

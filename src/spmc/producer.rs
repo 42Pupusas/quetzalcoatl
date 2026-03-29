@@ -41,6 +41,7 @@ impl<T> Producer<T> {
             Some((data_ptr, seq_ptr, pos)) => {
                 // SAFETY: We are the sole producer and the slot is free.
                 unsafe { (*data_ptr).write(val) };
+                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
                 unsafe {
                     (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
                 }
@@ -105,6 +106,8 @@ pub struct SlotWriter<'a, T> {
     pos: usize,
 }
 
+// SAFETY: SlotWriter holds exclusive access to the slot (single producer).
+// The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
 impl<'a, T> SlotWriter<'a, T> {
@@ -113,6 +116,8 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
+        // SAFETY: Single producer has exclusive access. The pointer is valid
+        // because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
 
@@ -120,6 +125,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
         let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: Exclusive access (single producer), valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,
@@ -165,6 +171,8 @@ pub struct WrittenSlot<'a, T> {
     committed: bool,
 }
 
+// SAFETY: Same as SlotWriter -- exclusive access to a slot in a RingBuffer
+// kept alive by the Producer's Arc.
 unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {

@@ -1,18 +1,18 @@
 //! Lock-free ring buffers for high-performance concurrent communication.
 //!
-//! Quetzalcoatl provides three ring buffer variants, each optimized for a
+//! Quetzalcoatl provides four ring buffer variants, each optimized for a
 //! different producer/consumer topology:
 //!
 //! | Module | Producers | Consumers | Best for |
 //! |---|---|---|---|
-//! | [`mpsc`] | Multiple | Single | Fan-in from worker threads |
 //! | [`spsc`] | Single | Single | Pipelines, audio, networking |
+//! | [`mpsc`] | Multiple | Single | Fan-in from worker threads |
 //! | [`spmc`] | Single | Multiple | Work distribution / fan-out |
 //! | [`broadcast`] | Multiple | Multiple | Pub/sub, event distribution |
 //!
 //! All variants are fully **lock-free** (no mutexes), use fixed-size
 //! power-of-two buffers, and provide both a cloning `pop()` and a
-//! zero-copy `pop_ref()` / `reserve()` API.
+//! zero-copy `pop_ref()` / `reserve()` → `write()` → `commit()` API.
 //!
 //! # Quick start
 //!
@@ -91,8 +91,10 @@
 //!
 //! # Zero-copy API
 //!
-//! For large types, avoid cloning entirely with `reserve()` (producer side)
-//! and `pop_ref()` (consumer side):
+//! For large types, avoid copying with `reserve()` (producer) and
+//! `pop_ref()` (consumer). The `reserve()` API uses a **typestate
+//! pattern** — `write()` consumes the `SlotWriter` and returns a
+//! `WrittenSlot` that can be safely committed:
 //!
 //! ```
 //! use quetzalcoatl::spsc::RingBuffer;

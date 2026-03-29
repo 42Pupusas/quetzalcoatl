@@ -66,18 +66,25 @@ impl<T> AlignedBuf<T> {
 impl<T> std::ops::Deref for AlignedBuf<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
+        // SAFETY: ptr points to a valid allocation of `len` elements (or is
+        // dangling for ZSTs). No mutable aliases exist (&self borrow).
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 impl<T> std::ops::DerefMut for AlignedBuf<T> {
     fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: ptr points to a valid allocation of `len` elements (or is
+        // dangling for ZSTs). &mut self guarantees exclusive access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
 impl<T> Drop for AlignedBuf<T> {
     fn drop(&mut self) {
+        // SAFETY: All `len` elements are initialized (written in new_with).
+        // &mut self guarantees exclusive access. For non-ZSTs the layout
+        // matches the one used in new_with's alloc call.
         unsafe {
             for i in 0..self.len {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i));

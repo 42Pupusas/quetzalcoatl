@@ -130,6 +130,8 @@ impl<'a, T> ArcSlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
+        // SAFETY: Caller guarantees the slot was initialized via slot_mut().
+        // We forward the invariant to the inner SlotWriter.
         self.inner.commit_unchecked();
     }
 }

@@ -522,6 +522,7 @@ mod tests {
             RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.slot_mut().write([0xAB; 256]);
+        // SAFETY: slot_mut().write() initialized the slot above.
         unsafe { w.commit_unchecked() };
         let reader = consumer.pop_ref().unwrap();
         assert_eq!((*reader)[0], 0xAB);

@@ -535,6 +535,7 @@ mod tests {
 
         let mut writer = producer.reserve().unwrap();
         writer.slot_mut().write([0xAB; 64]);
+        // SAFETY: slot_mut().write() initialized the slot above.
         unsafe { writer.commit_unchecked() };
 
         let reader = consumer.pop_ref().unwrap();
