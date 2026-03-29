@@ -24,7 +24,7 @@ Four variants cover every producer/consumer topology:
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.4"
+quetzalcoatl = "0.5"
 ```
 
 ## Quick start
