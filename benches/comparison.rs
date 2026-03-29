@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -273,18 +273,26 @@ fn bench_spmc_comparison(c: &mut Criterion) {
                             )
                             .split();
 
-                        let remaining = Arc::new(AtomicU64::new(total_items));
+                        // Use a read-only done flag instead of a shared
+                        // decrement counter. Consumers only READ this flag
+                        // (no writes = no cache line invalidation between
+                        // consumer threads).
+                        let done = Arc::new(AtomicBool::new(false));
 
                         let start = std::time::Instant::now();
 
                         let consumer_handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let c = consumer.clone();
-                                let rem = Arc::clone(&remaining);
+                                let d = Arc::clone(&done);
                                 thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
+                                    loop {
                                         if c.pop().is_some() {
-                                            rem.fetch_sub(1, Ordering::Relaxed);
+                                            // consumed
+                                        } else if d.load(Ordering::Relaxed) {
+                                            // Producer finished — drain stragglers
+                                            while c.pop().is_some() {}
+                                            break;
                                         } else {
                                             std::hint::spin_loop();
                                         }
@@ -299,6 +307,8 @@ fn bench_spmc_comparison(c: &mut Criterion) {
                                 std::hint::spin_loop();
                             }
                         }
+
+                        done.store(true, Ordering::Relaxed);
 
                         for h in consumer_handles {
                             h.join().unwrap();
@@ -320,18 +330,21 @@ fn bench_spmc_comparison(c: &mut Criterion) {
                     for _ in 0..iters {
                         let (tx, rx) = crossbeam_channel::bounded::<u64>(8192);
 
-                        let remaining = Arc::new(AtomicU64::new(total_items));
+                        let done = Arc::new(AtomicBool::new(false));
 
                         let start = std::time::Instant::now();
 
                         let consumer_handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let r = rx.clone();
-                                let rem = Arc::clone(&remaining);
+                                let d = Arc::clone(&done);
                                 thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
+                                    loop {
                                         if r.try_recv().is_ok() {
-                                            rem.fetch_sub(1, Ordering::Relaxed);
+                                            // consumed
+                                        } else if d.load(Ordering::Relaxed) {
+                                            while r.try_recv().is_ok() {}
+                                            break;
                                         } else {
                                             std::hint::spin_loop();
                                         }
@@ -343,6 +356,8 @@ fn bench_spmc_comparison(c: &mut Criterion) {
                         for i in 0..total_items {
                             tx.send(black_box(i)).unwrap();
                         }
+
+                        done.store(true, Ordering::Relaxed);
 
                         for h in consumer_handles {
                             h.join().unwrap();
