@@ -1,5 +1,5 @@
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
@@ -84,7 +84,7 @@ impl<T> Producer<T> {
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
     #[must_use]
-    pub fn reserve(&self) -> Option<SlotWriter<T>> {
+    pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         let pos = self.try_claim()?;
 
         // SAFETY: Single producer owns this slot. `pos & mask` < cap.
@@ -95,7 +95,7 @@ impl<T> Producer<T> {
 
         Some(SlotWriter {
             slot_data,
-            ring: Arc::clone(&self.queue),
+            tail: &self.queue.tail,
             pos,
             committed: false,
         })
@@ -130,25 +130,25 @@ impl<T> Producer<T> {
 /// You **must** call [`commit`](SlotWriter::commit) after writing data.
 /// Dropping a `SlotWriter` without committing will **abort the process**
 /// because the consumer would never see the data at this index.
-pub struct SlotWriter<T> {
+pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    ring: Arc<RingBuffer<T>>,
+    tail: &'a AtomicUsize,
     pos: usize,
     committed: bool,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (single producer).
-// The raw pointer points into the Arc<RingBuffer<T>> which is kept alive.
-unsafe impl<T: Send> Send for SlotWriter<T> {}
+// The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
+unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
-impl<T> SlotWriter<T> {
+impl<T> SlotWriter<'_, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
     ///
     /// Use this for fine-grained control over initialization.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: Single producer has exclusive access. The pointer
-        // is valid because ring keeps the RingBuffer alive.
+        // is valid because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
 
@@ -171,13 +171,12 @@ impl<T> SlotWriter<T> {
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        // SAFETY: ring keeps the RingBuffer alive.
-        self.ring.tail.store(self.pos + 1, Ordering::Release);
+        self.tail.store(self.pos + 1, Ordering::Release);
         self.committed = true;
     }
 }
 
-impl<T> Drop for SlotWriter<T> {
+impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
         assert!(
             self.committed,

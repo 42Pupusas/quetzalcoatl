@@ -78,10 +78,7 @@ impl<T: Send + Sync> ArcProducer<T> {
     /// [`ArcSlotWriter`] for writing.
     #[must_use]
     pub fn reserve(&self) -> Option<ArcSlotWriter<'_, T>> {
-        self.0.reserve().map(|w| ArcSlotWriter {
-            inner: w,
-            _phantom: std::marker::PhantomData,
-        })
+        self.0.reserve().map(|w| ArcSlotWriter { inner: w })
     }
 
     /// Returns the number of items currently in the buffer.
@@ -107,8 +104,7 @@ impl<T: Send + Sync> ArcProducer<T> {
 ///
 /// Obtained via [`ArcProducer::reserve`].
 pub struct ArcSlotWriter<'a, T> {
-    inner: super::SlotWriter<Arc<T>>,
-    _phantom: std::marker::PhantomData<&'a ()>,
+    inner: super::SlotWriter<'a, Arc<T>>,
 }
 
 impl<T> ArcSlotWriter<'_, T> {

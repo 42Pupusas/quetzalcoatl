@@ -146,12 +146,12 @@ impl<T> Producer<T> {
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
     #[must_use]
-    pub fn reserve(&self) -> Option<SlotWriter<T>> {
+    pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
             slot_data: data_ptr,
-            slot_sequence: seq_ptr,
+            // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
+            slot_sequence: unsafe { &*seq_ptr },
             pos,
-            _ring: Arc::clone(&self.queue),
             committed: false,
         })
     }
@@ -185,24 +185,23 @@ impl<T> Producer<T> {
 /// You **must** call [`commit`](SlotWriter::commit) after writing data.
 /// Dropping a `SlotWriter` without committing will **abort the process**
 /// because the slot cannot be reclaimed (the tail has already advanced).
-pub struct SlotWriter<T> {
+pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_sequence: *const AtomicUsize,
+    slot_sequence: &'a AtomicUsize,
     pos: usize,
-    _ring: Arc<RingBuffer<T>>,
     committed: bool,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (claimed via CAS).
-// The raw pointers point into the Arc<RingBuffer<T>> which is kept alive.
-unsafe impl<T: Send + Sync> Send for SlotWriter<T> {}
+// The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
+unsafe impl<T: Send + Sync> Send for SlotWriter<'_, T> {}
 
-impl<T> SlotWriter<T> {
+impl<T> SlotWriter<'_, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: We have exclusive access via CAS claim. The pointer
-        // is valid because _ring keeps the RingBuffer alive.
+        // is valid because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
 
@@ -224,15 +223,12 @@ impl<T> SlotWriter<T> {
     /// Committing without initializing causes consumers to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        // SAFETY: slot_sequence points into the RingBuffer kept alive by _ring.
-        unsafe {
-            (*self.slot_sequence).store(self.pos + 1, Ordering::Release);
-        }
+        self.slot_sequence.store(self.pos + 1, Ordering::Release);
         self.committed = true;
     }
 }
 
-impl<T> Drop for SlotWriter<T> {
+impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
         assert!(
             self.committed,
