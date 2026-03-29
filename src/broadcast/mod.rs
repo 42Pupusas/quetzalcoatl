@@ -31,7 +31,7 @@ mod consumer;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
-pub use producer::{Producer, SlotWriter};
+pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::{AlignedBuf, CachePadded};
@@ -510,9 +510,8 @@ mod tests {
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
         let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4), 4).split();
-        let mut w = producer.reserve().unwrap();
-        w.write(42);
-        w.commit();
+        let w = producer.reserve().unwrap();
+        w.write(42).commit();
         let reader = consumer.pop_ref().unwrap();
         assert_eq!(*reader, 42);
     }
@@ -523,7 +522,7 @@ mod tests {
             RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.slot_mut().write([0xAB; 256]);
-        w.commit();
+        unsafe { w.commit_unchecked() };
         let reader = consumer.pop_ref().unwrap();
         assert_eq!((*reader)[0], 0xAB);
         assert_eq!((*reader)[255], 0xAB);
@@ -534,10 +533,10 @@ mod tests {
         let (mut producer, _consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
 
         let w1 = producer.reserve().unwrap();
-        w1.commit();
+        w1.write(0).commit();
 
         let w2 = producer.reserve().unwrap();
-        w2.commit();
+        w2.write(0).commit();
 
         assert!(producer.reserve().is_none());
     }
@@ -551,11 +550,11 @@ mod tests {
     #[test]
     fn pop_ref_returns_none_when_not_committed() {
         let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
-        let mut w = producer.reserve().unwrap();
-        w.write(1);
+        let w = producer.reserve().unwrap();
+        let written = w.write(1);
         // Not committed yet
         assert!(consumer.pop_ref().is_none());
-        w.commit();
+        written.commit();
         assert!(consumer.pop_ref().is_some());
     }
 
@@ -589,9 +588,8 @@ mod tests {
     fn mixed_push_reserve_pop_pop_ref() {
         let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(8), 4).split();
         producer.push(1).unwrap();
-        let mut w = producer.reserve().unwrap();
-        w.write(2);
-        w.commit();
+        let w = producer.reserve().unwrap();
+        w.write(2).commit();
         producer.push(3).unwrap();
 
         assert_eq!(consumer.pop(), Some(1));
@@ -606,9 +604,8 @@ mod tests {
         let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         for lap in 0u32..3 {
             for j in 0..4 {
-                let mut w = producer.reserve().unwrap();
-                w.write(lap * 10 + j);
-                w.commit();
+                let w = producer.reserve().unwrap();
+                w.write(lap * 10 + j).commit();
             }
             for j in 0..4 {
                 let reader = consumer.pop_ref().unwrap();
@@ -782,9 +779,8 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for i in 0..total {
                 loop {
-                    if let Some(mut w) = producer.reserve() {
-                        w.write(i);
-                        w.commit();
+                    if let Some(w) = producer.reserve() {
+                        w.write(i).commit();
                         break;
                     }
                     std::hint::spin_loop();
@@ -919,9 +915,8 @@ mod tests {
     fn arc_reserve_write_commit() {
         let (mut producer, mut consumer) =
             arc::ArcRingBuffer::<u64>::new(Capacity::exact(4), 4).split();
-        let mut w = producer.reserve().unwrap();
-        w.write(42);
-        w.commit();
+        let w = producer.reserve().unwrap();
+        w.write(42).commit();
         let val = consumer.pop().unwrap();
         assert_eq!(*val, 42);
     }

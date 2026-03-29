@@ -101,9 +101,8 @@
 //! let (mut producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
 //!
 //! // Write directly into the slot
-//! let mut writer = producer.reserve().unwrap();
-//! writer.write([0xAB; 4096]);
-//! writer.commit();
+//! let writer = producer.reserve().unwrap();
+//! writer.write([0xAB; 4096]).commit();
 //!
 //! // Read without copying
 //! let reader = consumer.pop_ref().unwrap();

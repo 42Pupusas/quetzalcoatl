@@ -220,11 +220,11 @@ fn bench_large_struct_mpsc_zero_copy(c: &mut Criterion) {
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         loop {
-                                            if let Some(mut w) = prod.reserve() {
+                                            if let Some(w) = prod.reserve() {
                                                 w.write(black_box(LargeStruct::new(
                                                     (p as u64 * 100 + i) as u8,
-                                                )));
-                                                w.commit();
+                                                )))
+                                                .commit();
                                                 break;
                                             }
                                             std::hint::spin_loop();

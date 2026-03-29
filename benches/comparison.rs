@@ -582,9 +582,8 @@ fn bench_large_spsc_comparison(c: &mut Criterion) {
                 let ph = thread::spawn(move || {
                     for i in 0..total_items {
                         loop {
-                            if let Some(mut w) = producer.reserve() {
-                                w.write(black_box(LargeStruct::new(i as u8)));
-                                w.commit();
+                            if let Some(w) = producer.reserve() {
+                                w.write(black_box(LargeStruct::new(i as u8))).commit();
                                 break;
                             }
                             std::hint::spin_loop();
@@ -727,11 +726,11 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         loop {
-                                            if let Some(mut w) = prod.reserve() {
+                                            if let Some(w) = prod.reserve() {
                                                 w.write(black_box(LargeStruct::new(
                                                     (p * 100 + i) as u8,
-                                                )));
-                                                w.commit();
+                                                )))
+                                                .commit();
                                                 break;
                                             }
                                             std::hint::spin_loop();

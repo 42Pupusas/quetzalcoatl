@@ -81,12 +81,10 @@ impl<T> Producer<T> {
     ///
     /// Returns `None` if the buffer is full. On success, returns a
     /// [`SlotWriter`] that provides direct mutable access to the slot.
-    /// The slot is not visible to the consumer until [`SlotWriter::commit`]
-    /// is called.
+    /// The slot is not visible to the consumer until committed.
     ///
     /// Takes `&mut self` to guarantee at most one outstanding reservation.
-    /// If the `SlotWriter` is dropped without committing, the reservation
-    /// is silently rolled back — no panic, no abort.
+    /// If dropped without writing, the reservation is silently rolled back.
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
@@ -104,7 +102,6 @@ impl<T> Producer<T> {
             tail: &self.queue.tail,
             write_pos: &self.write_pos,
             pos,
-            state: SlotState::Reserved,
         })
     }
 
@@ -127,45 +124,35 @@ impl<T> Producer<T> {
     }
 }
 
-/// Tracks whether data was written into a reserved slot.
-enum SlotState {
-    /// Reserved but no data written yet.
-    Reserved,
-    /// Data was written via [`SlotWriter::write`].
-    Written,
-    /// Committed — slot is visible to the consumer.
-    Committed,
-}
-
 /// A write-reservation into a ring buffer slot.
 ///
-/// Obtained via [`Producer::reserve`]. Provides direct mutable access
-/// to the slot's memory, enabling zero-copy writes for large types.
+/// Obtained via [`Producer::reserve`]. Call [`write`](Self::write) to
+/// initialize the slot and get a [`WrittenSlot`] that can be committed.
 ///
-/// If dropped without committing, the reservation is rolled back and
-/// any data written via [`write`](SlotWriter::write) is dropped. Data
-/// written directly through [`slot_mut`](SlotWriter::slot_mut) will be
-/// leaked (not dropped) on rollback — use [`write`](SlotWriter::write)
-/// for automatic cleanup.
+/// For fine-grained control, use [`slot_mut`](Self::slot_mut) to access
+/// the raw `MaybeUninit<T>`, then [`commit_unchecked`](Self::commit_unchecked)
+/// (unsafe) to publish.
+///
+/// If dropped, the reservation is silently rolled back.
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     tail: &'a AtomicUsize,
     write_pos: &'a Cell<usize>,
     pos: usize,
-    state: SlotState,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (single producer).
 // The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
-impl<T> SlotWriter<'_, T> {
+impl<'a, T> SlotWriter<'a, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
     ///
-    /// Use this for fine-grained control over initialization. Note: if
-    /// you initialize data through this reference and then drop the
-    /// `SlotWriter` without committing, the value will be leaked. Use
-    /// [`write`](Self::write) instead for automatic cleanup on drop.
+    /// Use [`commit_unchecked`](Self::commit_unchecked) (unsafe) after
+    /// initializing through this reference. If dropped without
+    /// committing, any data written through this reference is leaked.
+    ///
+    /// Prefer [`write`](Self::write) for the safe path.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: Single producer has exclusive access. The pointer
@@ -173,52 +160,79 @@ impl<T> SlotWriter<'_, T> {
         unsafe { &mut *self.slot_data }
     }
 
-    /// Writes a value into the reserved slot and returns a mutable
-    /// reference to the now-initialized data.
-    ///
-    /// If the `SlotWriter` is dropped without committing, the value
-    /// is properly dropped during rollback.
-    pub fn write(&mut self, val: T) -> &mut T {
-        // SAFETY: Same as slot_mut — exclusive access, valid pointer.
-        let r = unsafe { (*self.slot_data).write(val) };
-        self.state = SlotState::Written;
-        r
+    /// Writes a value into the slot, consuming this `SlotWriter` and
+    /// returning a [`WrittenSlot`] that can be safely committed.
+    pub fn write(self, val: T) -> WrittenSlot<'a, T> {
+        // Prevent SlotWriter::drop from rolling back write_pos.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: Exclusive access, valid pointer.
+        unsafe { (*this.slot_data).write(val) };
+        WrittenSlot {
+            slot_data: this.slot_data,
+            tail: this.tail,
+            write_pos: this.write_pos,
+            pos: this.pos,
+            committed: false,
+        }
     }
 
-    /// Commits the write, making the slot visible to the consumer.
+    /// Commits without verifying initialization.
     ///
-    /// Advances the tail pointer with `Release` ordering.
+    /// # Safety
     ///
-    /// # Safety contract
-    ///
-    /// The caller must have initialized the slot data (via [`write`] or
-    /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
+    /// The caller must have initialized the slot data (via
+    /// [`slot_mut`](Self::slot_mut) + [`MaybeUninit::write`]).
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
     #[inline]
-    pub fn commit(mut self) {
-        // Release: ensures the data write is visible before tail advances.
+    pub unsafe fn commit_unchecked(self) {
         self.tail.store(self.pos + 1, Ordering::Release);
-        self.state = SlotState::Committed;
+        // Skip the SlotWriter drop (which would roll back write_pos).
+        std::mem::forget(self);
     }
 }
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        match self.state {
-            SlotState::Committed => {}
-            SlotState::Written => {
-                // Drop the written value, then roll back.
-                // SAFETY: write() initialized this slot.
-                unsafe {
-                    self.slot_data.cast::<T>().drop_in_place();
-                }
-                self.write_pos.set(self.pos);
+        // No data was written (write() consumes self) — just roll back.
+        self.write_pos.set(self.pos);
+    }
+}
+
+/// A slot that has been initialized via [`SlotWriter::write`].
+///
+/// Call [`commit`](Self::commit) to make the data visible to the consumer.
+/// If dropped without committing, the value is dropped and the
+/// reservation is rolled back.
+pub struct WrittenSlot<'a, T> {
+    slot_data: *mut MaybeUninit<T>,
+    tail: &'a AtomicUsize,
+    write_pos: &'a Cell<usize>,
+    pos: usize,
+    committed: bool,
+}
+
+// SAFETY: Same as SlotWriter — exclusive access to a slot in a RingBuffer
+// kept alive by the Producer's Arc.
+unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
+
+impl<T> WrittenSlot<'_, T> {
+    /// Commits the write, making the slot visible to the consumer.
+    #[inline]
+    pub fn commit(mut self) {
+        self.tail.store(self.pos + 1, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl<T> Drop for WrittenSlot<'_, T> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // SAFETY: write() initialized this slot.
+            unsafe {
+                self.slot_data.cast::<T>().drop_in_place();
             }
-            SlotState::Reserved => {
-                // Nothing written — just roll back write_pos.
-                self.write_pos.set(self.pos);
-            }
+            self.write_pos.set(self.pos);
         }
     }
 }

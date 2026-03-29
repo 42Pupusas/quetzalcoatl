@@ -107,18 +107,41 @@ pub struct ArcSlotWriter<'a, T> {
     inner: super::SlotWriter<'a, Arc<T>>,
 }
 
-impl<T> ArcSlotWriter<'_, T> {
+impl<'a, T> ArcSlotWriter<'a, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<Arc<T>> {
         self.inner.slot_mut()
     }
 
-    /// Writes a value (wrapped in `Arc`) into the reserved slot.
-    pub fn write(&mut self, val: T) -> &mut Arc<T> {
-        self.inner.write(Arc::new(val))
+    /// Writes a value (wrapped in `Arc`) into the reserved slot,
+    /// returning an [`ArcWrittenSlot`] that can be committed.
+    pub fn write(self, val: T) -> ArcWrittenSlot<'a, T> {
+        ArcWrittenSlot {
+            inner: self.inner.write(Arc::new(val)),
+        }
     }
 
+    /// Commits without verifying initialization.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have initialized the slot data via
+    /// [`slot_mut`](Self::slot_mut).
+    #[inline]
+    pub unsafe fn commit_unchecked(self) {
+        self.inner.commit_unchecked();
+    }
+}
+
+/// An Arc-wrapped slot that has been initialized.
+///
+/// Call [`commit`](Self::commit) to publish.
+pub struct ArcWrittenSlot<'a, T> {
+    inner: super::WrittenSlot<'a, Arc<T>>,
+}
+
+impl<T> ArcWrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to all consumers.
     #[inline]
     pub fn commit(self) {

@@ -12,9 +12,6 @@ use crate::common::TOMBSTONE;
 /// via atomic CAS.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
-    /// Cached snapshot of `min_head` to avoid scanning all consumer slots on
-    /// every push. Since heads only increase, a stale value is safe — it just
-    /// makes the buffer appear fuller than it is. Refreshed only when needed.
     pub(super) cached_min_head: std::cell::Cell<usize>,
 }
 
@@ -28,13 +25,6 @@ impl<T> Clone for Producer<T> {
 }
 
 impl<T> Producer<T> {
-    /// Atomically claims the next available slot via CAS loop.
-    ///
-    /// Returns raw pointers to the slot's data, sequence atomic, and the
-    /// claimed position. Returns `None` if the buffer is full.
-    ///
-    /// On success, drops any old value in the slot (from a previous lap)
-    /// and clears the sequence to 0.
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let mut backoff = 0u32;
@@ -45,19 +35,11 @@ impl<T> Producer<T> {
             // L2 = shared AtomicUsize (one Acquire load, benefits all producers)
             // L3 = full O(N) scan of consumer heads
             if tail.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
-                // L1 miss — try L2 shared cache.
-                // Acquire syncs with the Release in fetch_max below,
-                // transitively carrying consumer-head Release → min_head()
-                // Acquire → fetch_max Release to this producer.
                 let shared = self.queue.min_head_cache.load(Ordering::Acquire);
                 self.cached_min_head.set(shared);
 
                 if tail.wrapping_sub(shared) >= self.queue.cap {
-                    // L2 miss — full scan (min_head loads heads with Acquire)
                     let min_head = self.queue.min_head();
-                    // Release carries the Acquire from min_head() so other
-                    // producers loading with Acquire see the consumer data.
-                    // fetch_max ensures the cache never goes backward.
                     self.queue
                         .min_head_cache
                         .fetch_max(min_head, Ordering::Release);
@@ -69,9 +51,6 @@ impl<T> Producer<T> {
                 }
             }
 
-            // Atomically reserve this slot
-            // Relaxed on success: the tail CAS is not the publication barrier —
-            // the sequence store (Release) is what makes data visible to consumers.
             match self.queue.tail.compare_exchange_weak(
                 tail,
                 tail.wrapping_add(1),
@@ -79,25 +58,17 @@ impl<T> Producer<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // SAFETY: `tail & mask` is always < cap by construction
                     let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
 
                     // Drop old value if this slot was previously written.
                     if std::mem::needs_drop::<T>() {
-                        // swap(0, Acquire) atomically reads old sequence and clears it,
-                        // synchronizing with the previous producer's Release store.
                         let old_seq = slot.sequence.swap(0, Ordering::Acquire);
                         if old_seq > 0 && old_seq != TOMBSTONE {
-                            // SAFETY: old_seq > 0 and not tombstoned means data was
-                            // initialized by a prior write. All consumers have advanced
-                            // past this slot (min_head check passed).
                             unsafe {
                                 slot.data.get().cast::<T>().drop_in_place();
                             }
                         }
                     } else {
-                        // No destructor needed — just clear the sequence.
-                        // A simple store is cheaper than an atomic swap.
                         slot.sequence.store(0, Ordering::Relaxed);
                     }
 
@@ -113,17 +84,13 @@ impl<T> Producer<T> {
 
     /// Pushes a value into the broadcast ring buffer.
     ///
-    /// Multiple producers can push concurrently. Returns `Err(val)` if the
-    /// buffer is full (all slots occupied by data that the slowest consumer
-    /// hasn't read yet).
+    /// Multiple producers can push concurrently. Returns `Err(val)` if
+    /// the buffer is full.
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, seq_ptr, pos)) => {
-                // SAFETY: We atomically claimed this slot via CAS and dropped
-                // any old value. The slot is now uninitialized and exclusively ours.
                 unsafe { (*data_ptr).write(val) };
-                // Publish: set sequence = pos * 2 + 1 so consumers see this data.
                 unsafe {
                     (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
                 }
@@ -135,23 +102,17 @@ impl<T> Producer<T> {
 
     /// Reserves a slot for zero-copy writing.
     ///
-    /// Returns `None` if the buffer is full. On success, returns a
-    /// [`SlotWriter`] that provides direct mutable access to the slot.
-    ///
     /// Takes `&mut self` to guarantee at most one outstanding reservation
-    /// per producer handle. If the `SlotWriter` is dropped without
-    /// committing, the slot is tombstoned and consumers silently skip
-    /// it — no panic, no abort.
+    /// per producer handle. If dropped without writing, the slot is
+    /// tombstoned and consumers silently skip it.
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot()
             .map(|(data_ptr, seq_ptr, pos)| SlotWriter {
                 slot_data: data_ptr,
-                // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
                 slot_sequence: unsafe { &*seq_ptr },
                 pos,
-                state: SlotState::Reserved,
             })
     }
 
@@ -174,90 +135,93 @@ impl<T> Producer<T> {
     }
 }
 
-/// Tracks whether data was written into a reserved slot.
-enum SlotState {
-    Reserved,
-    Written,
-    Committed,
-}
-
 /// A write-reservation into a broadcast ring buffer slot.
 ///
-/// Obtained via [`Producer::reserve`]. Provides direct mutable access
-/// to the slot's memory, enabling zero-copy writes for large types.
+/// Call [`write`](Self::write) to initialize and get a [`WrittenSlot`].
+/// For raw access, use [`slot_mut`](Self::slot_mut) then
+/// [`commit_unchecked`](Self::commit_unchecked) (unsafe).
 ///
-/// If dropped without committing, the slot is marked as a tombstone
-/// and consumers silently skip it. Any data written via
-/// [`write`](SlotWriter::write) is properly dropped. Data written
-/// directly through [`slot_mut`](SlotWriter::slot_mut) will be leaked
-/// on rollback — use [`write`](SlotWriter::write) for automatic cleanup.
+/// Dropped without writing → slot is tombstoned (consumers skip it).
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
-    state: SlotState,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (claimed via CAS).
-// The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send + Sync> Send for SlotWriter<'_, T> {}
 
-impl<T> SlotWriter<'_, T> {
+impl<'a, T> SlotWriter<'a, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
+    ///
+    /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: We have exclusive access via CAS claim. The pointer
-        // is valid because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
 
-    /// Writes a value into the reserved slot and returns a mutable
-    /// reference to the now-initialized data.
-    ///
-    /// If the `SlotWriter` is dropped without committing, the value
-    /// is properly dropped during tombstoning.
-    pub fn write(&mut self, val: T) -> &mut T {
-        // SAFETY: Same as slot_mut — exclusive access, valid pointer.
-        let r = unsafe { (*self.slot_data).write(val) };
-        self.state = SlotState::Written;
-        r
+    /// Writes a value, consuming this `SlotWriter` and returning a
+    /// [`WrittenSlot`] that can be safely committed.
+    pub fn write(self, val: T) -> WrittenSlot<'a, T> {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        unsafe { (*this.slot_data).write(val) };
+        WrittenSlot {
+            slot_data: this.slot_data,
+            slot_sequence: this.slot_sequence,
+            pos: this.pos,
+            committed: false,
+        }
     }
 
-    /// Commits the write, making the slot visible to all consumers.
+    /// Commits without verifying initialization.
     ///
-    /// Sets the slot's sequence to `pos * 2 + 1` with `Release` ordering.
+    /// # Safety
     ///
-    /// # Safety contract
-    ///
-    /// The caller must have initialized the slot data (via [`write`] or
-    /// [`slot_mut`](Self::slot_mut) + `MaybeUninit::write`) before calling `commit`.
-    /// Committing without initializing causes consumers to read
-    /// uninitialized memory (undefined behavior).
+    /// The caller must have initialized the slot data via
+    /// [`slot_mut`](Self::slot_mut).
     #[inline]
-    pub fn commit(mut self) {
+    pub unsafe fn commit_unchecked(self) {
         self.slot_sequence
             .store(self.pos * 2 + 1, Ordering::Release);
-        self.state = SlotState::Committed;
+        std::mem::forget(self);
     }
 }
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        match self.state {
-            SlotState::Committed => {}
-            SlotState::Written => {
-                // Drop the written value, then tombstone the slot.
-                // SAFETY: write() initialized this slot.
-                unsafe {
-                    self.slot_data.cast::<T>().drop_in_place();
-                }
-                self.slot_sequence.store(TOMBSTONE, Ordering::Release);
+        self.slot_sequence.store(TOMBSTONE, Ordering::Release);
+    }
+}
+
+/// A slot initialized via [`SlotWriter::write`].
+///
+/// Call [`commit`](Self::commit) to publish. Dropped without
+/// committing → value is dropped and slot is tombstoned.
+pub struct WrittenSlot<'a, T> {
+    slot_data: *mut MaybeUninit<T>,
+    slot_sequence: &'a AtomicUsize,
+    pos: usize,
+    committed: bool,
+}
+
+unsafe impl<T: Send + Sync> Send for WrittenSlot<'_, T> {}
+
+impl<T> WrittenSlot<'_, T> {
+    /// Commits the write, making the slot visible to all consumers.
+    #[inline]
+    pub fn commit(mut self) {
+        self.slot_sequence
+            .store(self.pos * 2 + 1, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl<T> Drop for WrittenSlot<'_, T> {
+    fn drop(&mut self) {
+        if !self.committed {
+            unsafe {
+                self.slot_data.cast::<T>().drop_in_place();
             }
-            SlotState::Reserved => {
-                // Nothing written — just tombstone the slot so
-                // consumers can skip past it.
-                self.slot_sequence.store(TOMBSTONE, Ordering::Release);
-            }
+            self.slot_sequence.store(TOMBSTONE, Ordering::Release);
         }
     }
 }

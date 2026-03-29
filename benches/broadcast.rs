@@ -209,9 +209,8 @@ fn bench_large_struct_clone_vs_ref(c: &mut Criterion) {
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
                         loop {
-                            if let Some(mut w) = producer.reserve() {
-                                w.write(black_box(LargeStruct::new(i as u8)));
-                                w.commit();
+                            if let Some(w) = producer.reserve() {
+                                w.write(black_box(LargeStruct::new(i as u8))).commit();
                                 break;
                             }
                             std::hint::spin_loop();

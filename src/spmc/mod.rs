@@ -30,7 +30,7 @@ mod consumer;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
-pub use producer::{Producer, SlotWriter};
+pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
@@ -596,9 +596,8 @@ mod tests {
     fn reserve_write_commit_pop_ref_cycle() {
         let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
 
-        let mut writer = producer.reserve().unwrap();
-        writer.write(42);
-        writer.commit();
+        let writer = producer.reserve().unwrap();
+        writer.write(42).commit();
 
         let reader = consumer.pop_ref().unwrap();
         assert_eq!(*reader, 42);
@@ -613,7 +612,7 @@ mod tests {
 
         let mut writer = producer.reserve().unwrap();
         writer.slot_mut().write([0xAB; 64]);
-        writer.commit();
+        unsafe { writer.commit_unchecked() };
 
         let reader = consumer.pop_ref().unwrap();
         assert_eq!(reader[0], 0xAB);
@@ -624,13 +623,11 @@ mod tests {
     fn reserve_returns_none_when_full() {
         let (mut producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
 
-        let mut w1 = producer.reserve().unwrap();
-        w1.write(1);
-        w1.commit();
+        let w1 = producer.reserve().unwrap();
+        w1.write(1).commit();
 
-        let mut w2 = producer.reserve().unwrap();
-        w2.write(2);
-        w2.commit();
+        let w2 = producer.reserve().unwrap();
+        w2.write(2).commit();
 
         assert!(producer.reserve().is_none());
     }
@@ -647,9 +644,8 @@ mod tests {
 
         // Mix of push and reserve
         producer.push(1).unwrap();
-        let mut w = producer.reserve().unwrap();
-        w.write(2);
-        w.commit();
+        let w = producer.reserve().unwrap();
+        w.write(2).commit();
         producer.push(3).unwrap();
 
         // Mix of pop and pop_ref
@@ -692,9 +688,8 @@ mod tests {
         // 3 full laps via reserve/pop_ref
         for lap in 0..3u32 {
             for i in 0..4 {
-                let mut w = producer.reserve().unwrap();
-                w.write(lap * 4 + i);
-                w.commit();
+                let w = producer.reserve().unwrap();
+                w.write(lap * 4 + i).commit();
             }
             for i in 0..4 {
                 let r = consumer.pop_ref().unwrap();
@@ -713,9 +708,8 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for i in 0..n {
                 loop {
-                    if let Some(mut w) = producer.reserve() {
-                        w.write(i);
-                        w.commit();
+                    if let Some(w) = producer.reserve() {
+                        w.write(i).commit();
                         break;
                     }
                     std::thread::yield_now();
