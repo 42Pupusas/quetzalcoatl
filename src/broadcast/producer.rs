@@ -31,13 +31,23 @@ impl<T> Producer<T> {
     /// keep the hot push loop's instruction footprint small.
     #[inline(never)]
     fn cas_backoff(failures: &mut u32) {
-        let f = *failures;
-        if f > 1 {
-            for _ in 0..1u32 << f {
-                std::hint::spin_loop();
-            }
+        // Under Miri, spin_loop() is an interleaving point. Exponential
+        // spin counts explode the state space, so we just yield instead.
+        #[cfg(miri)]
+        {
+            let _ = failures;
+            std::thread::yield_now();
         }
-        *failures = f.saturating_add(1).min(6);
+        #[cfg(not(miri))]
+        {
+            let f = *failures;
+            if f > 1 {
+                for _ in 0..1u32 << f {
+                    std::hint::spin_loop();
+                }
+            }
+            *failures = f.saturating_add(1).min(6);
+        }
     }
 
     /// Atomically claims the next available slot via CAS loop.
@@ -64,10 +74,12 @@ impl<T> Producer<T> {
             }
 
             // Atomically reserve this slot
+            // Relaxed on success: the tail CAS is not the publication barrier —
+            // the sequence store (Release) is what makes data visible to consumers.
             match self.queue.tail.compare_exchange_weak(
                 tail,
                 tail.wrapping_add(1),
-                Ordering::Release,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
@@ -222,13 +234,11 @@ impl<T> SlotWriter<T> {
 
 impl<T> Drop for SlotWriter<T> {
     fn drop(&mut self) {
-        if !self.committed {
-            eprintln!(
-                "FATAL: SlotWriter<{}> dropped without commit. \
-                 The ring buffer slot is permanently stuck. Aborting.",
-                std::any::type_name::<T>()
-            );
-            std::process::abort();
-        }
+        assert!(
+            self.committed,
+            "SlotWriter<{}> dropped without commit — \
+             the ring buffer slot is permanently stuck.",
+            std::any::type_name::<T>()
+        );
     }
 }

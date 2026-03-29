@@ -178,7 +178,14 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
-        while self.pop().is_some() {}
+        // Only drain if we hold the last consumer reference.
+        // If other consumers exist, draining via pop() would needlessly
+        // contend with them on the shared head via CAS. The RingBuffer::drop
+        // will clean up any remaining items when the last Arc is released.
+        if Arc::strong_count(&self.queue) <= 2 {
+            // <= 2: one for this consumer + one for the producer (or already dropped).
+            while self.pop().is_some() {}
+        }
     }
 }
 

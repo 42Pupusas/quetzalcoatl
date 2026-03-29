@@ -8,6 +8,11 @@ use super::RingBuffer;
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Not
 /// cloneable — only one producer exists per buffer.
+///
+/// `Producer` is [`Send`] but not [`Sync`] (due to internal [`Cell`]s).
+/// Wrapping it in a `Mutex` is valid but pointless — the buffer is SPSC
+/// by design, so there is no benefit to sharing the producer across threads.
+/// If you need multi-producer semantics, use [`mpsc::RingBuffer`](crate::mpsc::RingBuffer).
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Local write cursor — always >= the atomic tail. Incremented on every
@@ -174,13 +179,11 @@ impl<T> SlotWriter<T> {
 
 impl<T> Drop for SlotWriter<T> {
     fn drop(&mut self) {
-        if !self.committed {
-            eprintln!(
-                "FATAL: SlotWriter<{}> dropped without commit. \
-                 The ring buffer slot is permanently stuck. Aborting.",
-                std::any::type_name::<T>()
-            );
-            std::process::abort();
-        }
+        assert!(
+            self.committed,
+            "SlotWriter<{}> dropped without commit — \
+             the ring buffer slot is permanently stuck.",
+            std::any::type_name::<T>()
+        );
     }
 }

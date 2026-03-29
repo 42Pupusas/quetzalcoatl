@@ -79,12 +79,16 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Returns the number of items currently in the buffer.
+    /// Returns the approximate number of items currently in the buffer.
+    ///
+    /// Both cursors are loaded with `Relaxed` ordering, so the result may
+    /// transiently exceed `capacity` when observed from another thread.
+    /// Use this for heuristics, not for precise invariants.
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Relaxed);
-        tail - head
+        tail.wrapping_sub(head)
     }
 
     /// Returns `true` if the buffer contains no items.
@@ -371,16 +375,7 @@ mod tests {
     // Miri-targeted tests: small sizes exercising all unsafe code paths
     // -----------------------------------------------------------------------
 
-    /// Tracks drops via a shared counter to verify no leaks or double-frees.
-    #[derive(Clone, Debug)]
-    struct DropCounter {
-        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl Drop for DropCounter {
-        fn drop(&mut self) {
-            self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    use crate::common::DropCounter;
 
     /// Items still in the buffer when Consumer is dropped must be dropped.
     #[test]
@@ -535,17 +530,15 @@ mod tests {
     fn reserve_returns_none_when_full() {
         let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
 
-        let w1 = producer.reserve().unwrap();
-        let w2 = producer.reserve().unwrap();
-        assert!(producer.reserve().is_none());
-
-        // Must commit to avoid abort
-        let mut w1 = w1;
-        let mut w2 = w2;
+        let mut w1 = producer.reserve().unwrap();
         w1.write(1);
         w1.commit();
+
+        let mut w2 = producer.reserve().unwrap();
         w2.write(2);
         w2.commit();
+
+        assert!(producer.reserve().is_none());
     }
 
     #[test]

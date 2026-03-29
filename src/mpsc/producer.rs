@@ -223,13 +223,11 @@ impl<T> SlotWriter<T> {
 
 impl<T> Drop for SlotWriter<T> {
     fn drop(&mut self) {
-        if !self.committed {
-            eprintln!(
-                "FATAL: SlotWriter<{}> dropped without commit. \
-                 The ring buffer slot is permanently stuck. Aborting.",
-                std::any::type_name::<T>()
-            );
-            std::process::abort();
-        }
+        assert!(
+            self.committed,
+            "SlotWriter<{}> dropped without commit — \
+             the ring buffer slot is permanently stuck.",
+            std::any::type_name::<T>()
+        );
     }
 }

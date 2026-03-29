@@ -188,11 +188,26 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        for i in 0..self.cap {
-            let slot = &self.buf[i];
-            // SAFETY: Exclusive access in drop (&mut self). No concurrency,
-            // so Relaxed is sufficient.
-            if slot.sequence.load(Ordering::Relaxed) > 0 {
+        // Determine the range of slots that may contain initialized data.
+        // `tail` is the total number of items ever pushed. A slot at
+        // position `pos` was last written by push number `pos`, so the
+        // most recent `min(tail, cap)` slots may hold live data.
+        //
+        // We use the per-slot sequence number to decide: seq > 0 means
+        // the producer wrote data and hasn't cleared it. seq == 0 means
+        // either never written or already cleared by a subsequent claim_slot.
+        //
+        // The start of the range is `tail - min(tail, cap)` to avoid
+        // scanning the entire buffer, and the wrapping_sub handles the
+        // (astronomically unlikely) usize wraparound case.
+        let tail = *self.tail.0.get_mut();
+        let start = tail.wrapping_sub(tail.min(self.cap));
+        for pos in start..tail {
+            let slot = &mut self.buf[pos & self.mask];
+            if *slot.sequence.get_mut() > 0 {
+                // SAFETY: sequence > 0 means data was initialized by a producer
+                // and not cleared by a subsequent claim_slot. Exclusive access
+                // in drop (&mut self) guarantees no concurrency.
                 unsafe {
                     slot.data.get().cast::<T>().drop_in_place();
                 }
@@ -206,16 +221,7 @@ mod tests {
     use super::*;
     use crate::capacity::Capacity;
 
-    /// Tracks drops via a shared counter to verify no leaks or double-frees.
-    #[derive(Clone, Debug)]
-    struct DropCounter {
-        counter: Arc<AtomicUsize>,
-    }
-    impl Drop for DropCounter {
-        fn drop(&mut self) {
-            self.counter.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    use crate::common::DropCounter;
 
     // -----------------------------------------------------------------------
     // Basic tests (ported from MPSC/SPSC)
@@ -514,13 +520,14 @@ mod tests {
     #[test]
     fn reserve_returns_none_when_full() {
         let (producer, _consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
-        let w1 = producer.reserve();
-        let w2 = producer.reserve();
-        assert!(w1.is_some());
-        assert!(w2.is_some());
+
+        let w1 = producer.reserve().unwrap();
+        w1.commit();
+
+        let w2 = producer.reserve().unwrap();
+        w2.commit();
+
         assert!(producer.reserve().is_none());
-        w1.unwrap().commit();
-        w2.unwrap().commit();
     }
 
     #[test]

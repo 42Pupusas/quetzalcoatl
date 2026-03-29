@@ -58,6 +58,12 @@ impl<T> std::ops::Deref for AlignedBuf<T> {
     }
 }
 
+impl<T> std::ops::DerefMut for AlignedBuf<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
 impl<T> Drop for AlignedBuf<T> {
     fn drop(&mut self) {
         unsafe {
@@ -87,20 +93,25 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
+/// Tracks drops via a shared counter to verify no leaks or double-frees.
+///
+/// Shared across all ring buffer test modules to avoid duplication.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct DropCounter {
+    pub counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Tracks drops via a shared counter to verify no leaks or double-frees.
-    #[derive(Clone, Debug)]
-    struct DropCounter {
-        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl Drop for DropCounter {
-        fn drop(&mut self) {
-            self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
 
     /// `AlignedBuf` deallocation correctness — drop types with drop glue.
     #[test]
