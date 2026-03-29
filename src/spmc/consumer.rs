@@ -61,13 +61,20 @@ impl<T> Consumer<T> {
     fn claim_slot(
         &self,
     ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
+        // Cache immutable RingBuffer fields in locals. Without this, the
+        // compiler reloads buf/mask from the Arc on every loop iteration
+        // because `lock cmpxchg` acts as a compiler fence and the compiler
+        // conservatively assumes memory behind the Arc may have changed.
+        let q = &*self.queue;
+        let buf = &q.buf;
+        let mask = q.mask;
+
         let mut backoff = 0u32;
         loop {
-            let head = self.queue.head.load(Ordering::Relaxed);
+            let head = q.head.load(Ordering::Relaxed);
 
             // SAFETY: `head & mask` is always < cap by construction
-            let slot =
-                unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            let slot = unsafe { buf.get_unchecked(head & mask) };
 
             // The sequence number is the sole synchronization point.
             // seq == head * 2 + 1 means the producer has finished writing
@@ -75,17 +82,13 @@ impl<T> Consumer<T> {
             // producer's Release store on the sequence, ensuring the data
             // write is visible. Any other value means either empty or
             // not-yet-committed — both cases require returning None.
-            //
-            // For small T, the sequence is on the same cache line as the
-            // data, so this Acquire load is effectively free (we'd pay for
-            // the data cache line transfer anyway).
             let seq = slot.sequence.load(Ordering::Acquire);
             if seq != head * 2 + 1 {
                 return None;
             }
 
             // Ready! Try to claim this slot via CAS.
-            match self.queue.head.compare_exchange_weak(
+            match q.head.compare_exchange_weak(
                 head,
                 head + 1,
                 Ordering::Relaxed,
