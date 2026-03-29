@@ -13,17 +13,12 @@ use super::RingBuffer;
 /// Drains remaining items when dropped.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
-    /// Cached snapshot of `tail` to avoid cross-cache-line reads when the
-    /// buffer is empty. Since `tail` only ever increases, a stale value is
-    /// safe — it just makes the buffer appear emptier than it is.
-    pub(super) cached_tail: std::cell::Cell<usize>,
 }
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         Self {
             queue: Arc::clone(&self.queue),
-            cached_tail: std::cell::Cell::new(self.cached_tail.get()),
         }
     }
 }
@@ -55,8 +50,11 @@ impl<T> Consumer<T> {
 
     /// Atomically claims the next available slot via CAS loop.
     ///
-    /// Uses the slot's sequence number as the synchronization point:
-    /// `seq == head + 1` means the producer has written data at this position.
+    /// Uses the per-slot sequence number as the sole synchronization point,
+    /// avoiding a load of the producer-contended `tail` cache line entirely.
+    /// `seq == head * 2 + 1` means the producer has written data at this
+    /// position. The Acquire on the sequence provides happens-before with
+    /// the producer's data write.
     ///
     /// Returns raw pointers to the slot's data and sequence, plus the
     /// claimed head position, or `None` if the buffer is empty.
@@ -67,23 +65,20 @@ impl<T> Consumer<T> {
         loop {
             let head = self.queue.head.load(Ordering::Relaxed);
 
-            // Fast path: check cached tail before touching any slot's
-            // cache line. This avoids unnecessary Acquire loads when the
-            // buffer is empty or the consumer is faster than the producer.
-            if head >= self.cached_tail.get() {
-                let tail = self.queue.tail.load(Ordering::Acquire);
-                self.cached_tail.set(tail);
-                if head >= tail {
-                    return None;
-                }
-            }
-
             // SAFETY: `head & mask` is always < cap by construction
             let slot =
                 unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-            // The sequence number is the authoritative signal. It guarantees
-            // the producer has finished writing data to this slot.
+            // The sequence number is the sole synchronization point.
+            // seq == head * 2 + 1 means the producer has finished writing
+            // data to this slot. The Acquire ordering synchronizes with the
+            // producer's Release store on the sequence, ensuring the data
+            // write is visible. Any other value means either empty or
+            // not-yet-committed — both cases require returning None.
+            //
+            // For small T, the sequence is on the same cache line as the
+            // data, so this Acquire load is effectively free (we'd pay for
+            // the data cache line transfer anyway).
             let seq = slot.sequence.load(Ordering::Acquire);
             if seq != head * 2 + 1 {
                 return None;
