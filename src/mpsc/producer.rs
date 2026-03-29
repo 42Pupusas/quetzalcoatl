@@ -27,30 +27,6 @@ impl<T> Clone for Producer<T> {
 }
 
 impl<T> Producer<T> {
-    /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
-    /// keep the hot push loop's instruction footprint small — this code only
-    /// matters under real multi-producer contention.
-    #[inline(never)]
-    fn cas_backoff(failures: &mut u32) {
-        // Under Miri, spin_loop() is an interleaving point. Exponential
-        // spin counts explode the state space, so we just yield instead.
-        #[cfg(miri)]
-        {
-            let _ = failures;
-            std::thread::yield_now();
-        }
-        #[cfg(not(miri))]
-        {
-            let f = *failures;
-            if f > 1 {
-                for _ in 0..1u32 << f {
-                    std::hint::spin_loop();
-                }
-            }
-            *failures = f.saturating_add(1).min(6);
-        }
-    }
-
     /// Atomically claims the next available slot via CAS loop.
     ///
     /// Uses a cached head for the distance check (thread-local, zero
@@ -96,7 +72,7 @@ impl<T> Producer<T> {
                 Err(actual) => {
                     // Use the actual tail returned by CAS instead of reloading
                     tail = actual;
-                    Self::cas_backoff(&mut backoff);
+                    crate::common::cas_backoff(&mut backoff);
                 }
             }
         }

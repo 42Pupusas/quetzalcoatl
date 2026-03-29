@@ -45,7 +45,6 @@ use std::sync::Arc;
 /// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
 /// a [`Producer`] / [`Consumer`] pair. The `Consumer` is [`Clone`]; the
 /// `Producer` is not (single-producer).
-#[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<SeqSlot<T>>,
     pub(crate) cap: usize,
@@ -449,18 +448,24 @@ mod tests {
 
     use crate::common::DropCounter;
 
-    /// Items still in the buffer when Consumer is dropped must be dropped.
+    /// Items still in the buffer must be dropped when the RingBuffer drops.
     #[test]
     fn drop_items_on_consumer_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        {
+            let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
-        for _ in 0..4 {
-            producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            for _ in 0..4 {
+                producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            }
+
+            // Consumer::Drop does NOT drain — RingBuffer::Drop handles cleanup.
+            drop(consumer);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            // RingBuffer drops when last Arc (producer) is released.
+            drop(producer);
         }
-
-        // Dropping consumer should drain and drop all 4 items
-        drop(consumer);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
 
@@ -468,21 +473,24 @@ mod tests {
     #[test]
     fn drop_items_on_pop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        {
+            let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
-        for _ in 0..3 {
-            producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            for _ in 0..3 {
+                producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            }
+
+            // Pop 2 — should drop when they go out of scope
+            let a = consumer.pop().unwrap();
+            let b = consumer.pop().unwrap();
+            drop(a);
+            drop(b);
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+            // Remaining 1 dropped when RingBuffer drops (all Arcs released)
+            drop(consumer);
+            drop(producer);
         }
-
-        // Pop 2 — should drop when they go out of scope
-        let a = consumer.pop().unwrap();
-        let b = consumer.pop().unwrap();
-        drop(a);
-        drop(b);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
-
-        // Remaining 1 dropped when consumer is dropped
-        drop(consumer);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 

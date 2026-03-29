@@ -43,7 +43,6 @@ use std::sync::Arc;
 /// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
 /// a [`Producer`] / [`Consumer`] pair. Neither handle is [`Clone`],
 /// enforcing the single-producer, single-consumer invariant.
-#[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     pub(crate) cap: usize,
@@ -102,11 +101,7 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        let producer = Producer {
-            queue: arc.clone(),
-            write_pos: std::cell::Cell::new(0),
-            cached_head: std::cell::Cell::new(0),
-        };
+        let producer = Producer::new(arc.clone());
         let consumer = Consumer {
             queue: arc,
             cached_tail: std::cell::Cell::new(0),

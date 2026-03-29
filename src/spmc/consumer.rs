@@ -24,30 +24,6 @@ impl<T> Clone for Consumer<T> {
 }
 
 impl<T> Consumer<T> {
-    /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
-    /// keep the hot pop loop's instruction footprint small — this code only
-    /// matters under real multi-consumer contention.
-    #[inline(never)]
-    fn cas_backoff(failures: &mut u32) {
-        // Under Miri, spin_loop() is an interleaving point. Exponential
-        // spin counts explode the state space, so we just yield instead.
-        #[cfg(miri)]
-        {
-            let _ = failures;
-            std::thread::yield_now();
-        }
-        #[cfg(not(miri))]
-        {
-            let f = *failures;
-            if f > 1 {
-                for _ in 0..1u32 << f {
-                    std::hint::spin_loop();
-                }
-            }
-            *failures = f.saturating_add(1).min(6);
-        }
-    }
-
     /// Atomically claims the next available slot via CAS loop.
     ///
     /// Uses the per-slot sequence number as the sole synchronization point,
@@ -103,7 +79,7 @@ impl<T> Consumer<T> {
                 }
                 Err(_) => {
                     // Another consumer beat us — retry.
-                    Self::cas_backoff(&mut backoff);
+                    crate::common::cas_backoff(&mut backoff);
                 }
             }
         }
@@ -176,18 +152,8 @@ impl<T> Consumer<T> {
     }
 }
 
-impl<T> Drop for Consumer<T> {
-    fn drop(&mut self) {
-        // Only drain if we hold the last consumer reference.
-        // If other consumers exist, draining via pop() would needlessly
-        // contend with them on the shared head via CAS. The RingBuffer::drop
-        // will clean up any remaining items when the last Arc is released.
-        if Arc::strong_count(&self.queue) <= 2 {
-            // <= 2: one for this consumer + one for the producer (or already dropped).
-            while self.pop().is_some() {}
-        }
-    }
-}
+// No Consumer::Drop — RingBuffer::drop handles cleanup of remaining items
+// when the last Arc reference is released.
 
 /// A zero-copy read reference to an item in the ring buffer.
 ///

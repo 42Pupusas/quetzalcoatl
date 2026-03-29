@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,18 +17,31 @@ use super::RingBuffer;
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Local write cursor — always >= the atomic tail. Incremented on every
-    /// push or reserve. The atomic tail only advances when data is published
-    /// (immediately in `push`, on `commit` for `reserve`).
-    pub(super) write_pos: std::cell::Cell<usize>,
+    /// push or reserve.
+    write_pos: Cell<usize>,
     /// Cached snapshot of `head` to avoid cross-cache-line reads on every push.
     /// Since `head` only ever increases, a stale value is safe — it just makes
     /// the buffer appear fuller than it is. We re-fetch only when needed.
-    pub(super) cached_head: std::cell::Cell<usize>,
+    cached_head: Cell<usize>,
+    /// Count of outstanding uncommitted reservations. When > 0, `push`
+    /// cannot advance `tail` because earlier reserved slots haven't been
+    /// committed yet. When the last reservation commits, `tail` jumps
+    /// to `write_pos`, making all intermediate pushes visible at once.
+    pending_reserves: Cell<usize>,
 }
 
 // No Clone impl — SPSC enforces a single producer.
 
 impl<T> Producer<T> {
+    pub(super) const fn new(queue: Arc<RingBuffer<T>>) -> Self {
+        Self {
+            queue,
+            write_pos: Cell::new(0),
+            cached_head: Cell::new(0),
+            pending_reserves: Cell::new(0),
+        }
+    }
+
     /// Claims the next slot using the local write cursor.
     /// Returns the write position on success, or `None` if the buffer is full.
     #[inline]
@@ -58,12 +72,18 @@ impl<T> Producer<T> {
 
         // SAFETY: Single producer owns this slot. `pos & mask` < cap.
         unsafe {
-            (*self.queue.buf.get_unchecked(pos & self.queue.mask)).get()
+            (*self.queue.buf.get_unchecked(pos & self.queue.mask))
+                .get()
                 .write(MaybeUninit::new(val));
         }
 
-        // Release: ensures the data write above is visible before tail advances.
-        self.queue.tail.store(pos + 1, Ordering::Release);
+        // Only advance tail if no reservations are outstanding.
+        // If there are pending reserves, the data is written but not visible
+        // until the last reserve commits (which advances tail to write_pos).
+        if self.pending_reserves.get() == 0 {
+            // Release: ensures the data write above is visible before tail advances.
+            self.queue.tail.store(pos + 1, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -87,16 +107,20 @@ impl<T> Producer<T> {
     pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         let pos = self.try_claim()?;
 
+        self.pending_reserves.set(self.pending_reserves.get() + 1);
+
         // SAFETY: Single producer owns this slot. `pos & mask` < cap.
         let slot_data = unsafe {
-            (*self.queue.buf.get_unchecked(pos & self.queue.mask)).get()
+            (*self.queue.buf.get_unchecked(pos & self.queue.mask))
+                .get()
                 .cast::<MaybeUninit<T>>()
         };
 
         Some(SlotWriter {
             slot_data,
             tail: &self.queue.tail,
-            pos,
+            write_pos: &self.write_pos,
+            pending_reserves: &self.pending_reserves,
             committed: false,
         })
     }
@@ -133,7 +157,8 @@ impl<T> Producer<T> {
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     tail: &'a AtomicUsize,
-    pos: usize,
+    write_pos: &'a Cell<usize>,
+    pending_reserves: &'a Cell<usize>,
     committed: bool,
 }
 
@@ -161,8 +186,9 @@ impl<T> SlotWriter<'_, T> {
 
     /// Commits the write, making the slot visible to the consumer.
     ///
-    /// Advances the tail pointer with `Release` ordering so the
-    /// consumer's `Acquire` load sees the written data.
+    /// When this is the last outstanding reservation, advances the tail
+    /// pointer to `write_pos` with `Release` ordering, making all
+    /// intermediate pushes and committed reserves visible at once.
     ///
     /// # Safety contract
     ///
@@ -171,7 +197,15 @@ impl<T> SlotWriter<'_, T> {
     /// Committing without initializing causes the consumer to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        self.tail.store(self.pos + 1, Ordering::Release);
+        let pending = self.pending_reserves.get() - 1;
+        self.pending_reserves.set(pending);
+
+        if pending == 0 {
+            // All reserves committed — make everything up to write_pos visible.
+            // Release: ensures all data writes are visible before tail advances.
+            self.tail.store(self.write_pos.get(), Ordering::Release);
+        }
+
         self.committed = true;
     }
 }

@@ -43,7 +43,8 @@ use std::sync::Arc;
 
 pub(super) struct BroadcastSlot<T> {
     pub data: UnsafeCell<MaybeUninit<T>>,
-    /// Sequence number: 0 = empty, `pos + 1` = published at position `pos`.
+    /// Sequence number: 0 = empty, `pos * 2 + 1` = published at position `pos`.
+    /// Uses the same 2x encoding as MPSC/SPMC for consistency.
     pub sequence: AtomicUsize,
 }
 
@@ -57,7 +58,6 @@ pub(super) struct ConsumerSlot {
 ///
 /// Every consumer sees every item published after it subscribes.
 /// Multiple producers push via CAS. Consumers clone to subscribe.
-#[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<BroadcastSlot<T>>,
     pub(crate) cap: usize,

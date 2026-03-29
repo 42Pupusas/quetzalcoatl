@@ -39,7 +39,10 @@ impl<T> AlignedBuf<T> {
             let layout = Self::layout(len);
             // SAFETY: layout has non-zero size (size_of::<T>() > 0 checked above)
             let raw = unsafe { std::alloc::alloc(layout).cast::<T>() };
-            std::ptr::NonNull::new(raw).expect("allocation failed")
+            let Some(ptr) = std::ptr::NonNull::new(raw) else {
+                std::alloc::handle_alloc_error(layout);
+            };
+            ptr
         };
 
         for i in 0..len {
@@ -81,6 +84,30 @@ impl<T> Drop for AlignedBuf<T> {
 // Send/Sync follow from T's bounds, same as Box<[T]>.
 unsafe impl<T: Send> Send for AlignedBuf<T> {}
 unsafe impl<T: Sync> Sync for AlignedBuf<T> {}
+
+/// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
+/// keep the hot CAS loop's instruction footprint small — this code only
+/// matters under real contention.
+#[inline(never)]
+pub fn cas_backoff(failures: &mut u32) {
+    // Under Miri, spin_loop() is an interleaving point. Exponential
+    // spin counts explode the state space, so we just yield instead.
+    #[cfg(miri)]
+    {
+        let _ = failures;
+        std::thread::yield_now();
+    }
+    #[cfg(not(miri))]
+    {
+        let f = *failures;
+        if f > 1 {
+            for _ in 0..1u32 << f {
+                std::hint::spin_loop();
+            }
+        }
+        *failures = f.saturating_add(1).min(6);
+    }
+}
 
 /// Cache-line-sized padding to prevent false sharing between atomics.
 #[repr(align(64))]

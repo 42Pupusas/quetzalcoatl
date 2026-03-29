@@ -27,29 +27,6 @@ impl<T> Clone for Producer<T> {
 }
 
 impl<T> Producer<T> {
-    /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
-    /// keep the hot push loop's instruction footprint small.
-    #[inline(never)]
-    fn cas_backoff(failures: &mut u32) {
-        // Under Miri, spin_loop() is an interleaving point. Exponential
-        // spin counts explode the state space, so we just yield instead.
-        #[cfg(miri)]
-        {
-            let _ = failures;
-            std::thread::yield_now();
-        }
-        #[cfg(not(miri))]
-        {
-            let f = *failures;
-            if f > 1 {
-                for _ in 0..1u32 << f {
-                    std::hint::spin_loop();
-                }
-            }
-            *failures = f.saturating_add(1).min(6);
-        }
-    }
-
     /// Atomically claims the next available slot via CAS loop.
     ///
     /// Returns raw pointers to the slot's data, sequence atomic, and the
@@ -109,7 +86,7 @@ impl<T> Producer<T> {
                 }
                 Err(actual) => {
                     tail = actual;
-                    Self::cas_backoff(&mut backoff);
+                    crate::common::cas_backoff(&mut backoff);
                 }
             }
         }
@@ -126,9 +103,9 @@ impl<T> Producer<T> {
                 // SAFETY: We atomically claimed this slot via CAS and dropped
                 // any old value. The slot is now uninitialized and exclusively ours.
                 unsafe { (*data_ptr).write(val) };
-                // Publish: set sequence = pos + 1 so consumers see this data.
+                // Publish: set sequence = pos * 2 + 1 so consumers see this data.
                 unsafe {
-                    (*seq_ptr).store(pos + 1, Ordering::Release);
+                    (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
                 }
                 Ok(())
             }
@@ -214,7 +191,7 @@ impl<T> SlotWriter<'_, T> {
 
     /// Commits the write, making the slot visible to all consumers.
     ///
-    /// Sets the slot's sequence to `pos + 1` with `Release` ordering.
+    /// Sets the slot's sequence to `pos * 2 + 1` with `Release` ordering.
     ///
     /// # Safety contract
     ///
@@ -223,7 +200,7 @@ impl<T> SlotWriter<'_, T> {
     /// Committing without initializing causes consumers to read
     /// uninitialized memory (undefined behavior).
     pub fn commit(mut self) {
-        self.slot_sequence.store(self.pos + 1, Ordering::Release);
+        self.slot_sequence.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;
     }
 }

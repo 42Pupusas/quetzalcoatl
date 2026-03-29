@@ -74,16 +74,16 @@ impl<T> Consumer<T> {
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
         // The sequence number is the sole synchronization point.
-        // seq == head + 1 means the producer has written data at this position.
+        // seq == head * 2 + 1 means the producer has written data at this position.
         // The Acquire ordering synchronizes with the producer's Release store
         // on the sequence, ensuring the data write is visible.
         // Any other value means either empty or not-yet-committed.
         let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != head + 1 {
+        if seq != head * 2 + 1 {
             return None;
         }
 
-        // SAFETY: sequence == head + 1 synchronizes with producer's Release,
+        // SAFETY: sequence == head * 2 + 1 synchronizes with producer's Release,
         // ensuring the data write is visible. The data won't be overwritten
         // because this consumer's head hasn't advanced (min_head blocks producer).
         let val = unsafe { (*slot.data.get()).assume_init_ref().clone() };
@@ -114,7 +114,7 @@ impl<T> Consumer<T> {
         let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
         let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != head + 1 {
+        if seq != head * 2 + 1 {
             return None;
         }
 
