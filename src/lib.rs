@@ -98,7 +98,7 @@
 //! use quetzalcoatl::spsc::RingBuffer;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
+//! let (mut producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
 //!
 //! // Write directly into the slot
 //! let mut writer = producer.reserve().unwrap();

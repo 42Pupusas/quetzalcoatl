@@ -578,7 +578,7 @@ fn bench_large_spsc_comparison(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
+                let (mut producer, mut consumer) =
                     quetzalcoatl::spsc::RingBuffer::<LargeStruct>::new(
                         quetzalcoatl::capacity::Capacity::exact(256),
                     )
@@ -732,7 +732,7 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
 
                         let handles: Vec<_> = (0..num_producers)
                             .map(|p| {
-                                let prod = producer.clone();
+                                let mut prod = producer.clone();
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         loop {

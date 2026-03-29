@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::TOMBSTONE;
 
 /// The producer side of an MPSC ring buffer.
 ///
@@ -105,19 +106,19 @@ impl<T> Producer<T> {
     /// Returns `None` if the buffer is full. On success, returns a
     /// [`SlotWriter`] that provides direct mutable access to the slot.
     ///
-    /// # Contract
-    ///
-    /// You **must** call [`SlotWriter::commit`] after writing data.
-    /// Dropping a `SlotWriter` without committing aborts the process.
+    /// Takes `&mut self` to guarantee at most one outstanding reservation
+    /// per producer handle. If the `SlotWriter` is dropped without
+    /// committing, the slot is tombstoned and the consumer silently
+    /// skips it — no panic, no abort.
     #[inline]
     #[must_use]
-    pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
+    pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
             slot_data: data_ptr,
             // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
             slot_seq: unsafe { &*seq_ptr },
             pos,
-            committed: false,
+            state: SlotState::Reserved,
         })
     }
 
@@ -140,21 +141,28 @@ impl<T> Producer<T> {
     }
 }
 
+/// Tracks whether data was written into a reserved slot.
+enum SlotState {
+    Reserved,
+    Written,
+    Committed,
+}
+
 /// A write-reservation into a ring buffer slot.
 ///
 /// Obtained via [`Producer::reserve`]. Provides direct mutable access
 /// to the slot's memory, enabling zero-copy writes for large types.
 ///
-/// # Contract
-///
-/// You **must** call [`commit`](SlotWriter::commit) after writing data.
-/// Dropping a `SlotWriter` without committing will **abort the process**
-/// because the slot cannot be reclaimed (the tail has already advanced).
+/// If dropped without committing, the slot is marked as a tombstone
+/// and the consumer silently skips it. Any data written via
+/// [`write`](SlotWriter::write) is properly dropped. Data written
+/// directly through [`slot_mut`](SlotWriter::slot_mut) will be leaked
+/// on rollback — use [`write`](SlotWriter::write) for automatic cleanup.
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_seq: &'a AtomicUsize,
     pos: usize,
-    committed: bool,
+    state: SlotState,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (claimed via CAS).
@@ -164,7 +172,10 @@ unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 impl<T> SlotWriter<'_, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
     ///
-    /// Use this for fine-grained control over initialization.
+    /// Use this for fine-grained control over initialization. Note: if
+    /// you initialize data through this reference and then drop the
+    /// `SlotWriter` without committing, the value will be leaked. Use
+    /// [`write`](Self::write) instead for automatic cleanup on drop.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: We have exclusive access via CAS claim. The pointer
@@ -174,9 +185,14 @@ impl<T> SlotWriter<'_, T> {
 
     /// Writes a value into the reserved slot and returns a mutable
     /// reference to the now-initialized data.
+    ///
+    /// If the `SlotWriter` is dropped without committing, the value
+    /// is properly dropped during tombstoning.
     pub fn write(&mut self, val: T) -> &mut T {
         // SAFETY: Same as slot_mut — exclusive access, valid pointer.
-        unsafe { (*self.slot_data).write(val) }
+        let r = unsafe { (*self.slot_data).write(val) };
+        self.state = SlotState::Written;
+        r
     }
 
     /// Commits the write, making the slot visible to the consumer.
@@ -193,17 +209,27 @@ impl<T> SlotWriter<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
-        self.committed = true;
+        self.state = SlotState::Committed;
     }
 }
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        assert!(
-            self.committed,
-            "SlotWriter<{}> dropped without commit — \
-             the ring buffer slot is permanently stuck.",
-            std::any::type_name::<T>()
-        );
+        match self.state {
+            SlotState::Committed => {}
+            SlotState::Written => {
+                // Drop the written value, then tombstone the slot.
+                // SAFETY: write() initialized this slot.
+                unsafe {
+                    self.slot_data.cast::<T>().drop_in_place();
+                }
+                self.slot_seq.store(TOMBSTONE, Ordering::Release);
+            }
+            SlotState::Reserved => {
+                // Nothing written — just tombstone the slot so the
+                // consumer can skip past it.
+                self.slot_seq.store(TOMBSTONE, Ordering::Release);
+            }
+        }
     }
 }

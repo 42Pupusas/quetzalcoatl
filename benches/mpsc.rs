@@ -220,7 +220,7 @@ fn bench_large_struct_mpsc_zero_copy(c: &mut Criterion) {
 
                         let handles: Vec<_> = (0..num_producers)
                             .map(|p| {
-                                let prod = producer.clone();
+                                let mut prod = producer.clone();
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         loop {

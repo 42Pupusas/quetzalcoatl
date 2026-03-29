@@ -77,7 +77,7 @@ impl<T: Send + Sync> ArcProducer<T> {
     /// Returns `None` if the buffer is full. On success, returns an
     /// [`ArcSlotWriter`] for writing.
     #[must_use]
-    pub fn reserve(&self) -> Option<ArcSlotWriter<'_, T>> {
+    pub fn reserve(&mut self) -> Option<ArcSlotWriter<'_, T>> {
         self.0.reserve().map(|w| ArcSlotWriter { inner: w })
     }
 

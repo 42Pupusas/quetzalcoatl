@@ -2,6 +2,13 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicUsize;
 
+/// Sentinel sequence value marking an abandoned slot (reserved but never
+/// committed). Consumers detect this and silently skip past the slot.
+///
+/// Uses `usize::MAX` which cannot collide with valid `pos * 2 + 1` values
+/// for any practical position (would require 2^63 pushes).
+pub const TOMBSTONE: usize = usize::MAX;
+
 /// Per-slot state using a sequence number instead of a ready flag.
 ///
 /// The sequence encodes both readiness and ownership using a 2x encoding

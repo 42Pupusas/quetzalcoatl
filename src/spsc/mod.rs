@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn drop_items_on_consumer_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
         for _ in 0..4 {
             producer.push(DropCounter { counter: counter.clone() }).unwrap();
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
 
         let mut writer = producer.reserve().unwrap();
         writer.write(42);
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn reserve_slot_mut_commit() {
-        let (producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
 
         let mut writer = producer.reserve().unwrap();
         writer.slot_mut().write([0xAB; 64]);
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn reserve_returns_none_when_full() {
-        let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (mut producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
 
         // Commit each writer immediately to avoid panicking on drop if
         // a later assertion fails.
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn pop_ref_returns_none_when_not_ready() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
 
         // Reserve but don't commit — slot is claimed but not visible
         let mut writer = producer.reserve().unwrap();
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn mixed_push_reserve_pop_pop_ref() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
 
         // Mix of push and reserve
         producer.push(1).unwrap();
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn reserve_pop_ref_wraparound() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps via reserve/pop_ref
         for lap in 0..3u32 {
@@ -495,8 +495,61 @@ mod tests {
     }
 
     #[test]
+    fn reserve_drop_without_commit_rolls_back() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        producer.push(1).unwrap();
+        {
+            let mut w = producer.reserve().unwrap();
+            w.write(2);
+            // drop without commit — should roll back, not panic
+        }
+        producer.push(3).unwrap();
+
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(3));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn reserve_drop_without_write_rolls_back() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        producer.push(10).unwrap();
+        {
+            let _w = producer.reserve().unwrap();
+            // drop without write or commit
+        }
+        producer.push(20).unwrap();
+
+        assert_eq!(consumer.pop(), Some(10));
+        assert_eq!(consumer.pop(), Some(20));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn reserve_drop_does_not_leak() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut producer, _consumer) =
+            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+        {
+            let mut w = producer.reserve().unwrap();
+            w.write(crate::common::DropCounter {
+                counter: counter.clone(),
+            });
+            // drop without commit — value should be dropped
+        }
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "written value should be dropped on SlotWriter rollback"
+        );
+    }
+
+    #[test]
     fn concurrent_reserve_pop_ref() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {

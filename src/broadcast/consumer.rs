@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::TOMBSTONE;
 
 /// The consumer side of a broadcast ring buffer.
 ///
@@ -60,40 +61,50 @@ impl<T> Consumer<T> {
     ///
     /// Uses the per-slot sequence number as the sole synchronization point,
     /// avoiding a load of the contended `tail` cache line entirely.
+    /// Automatically skips tombstoned slots (abandoned reservations).
     #[inline]
     #[must_use]
     pub fn pop(&mut self) -> Option<T>
     where
         T: Clone,
     {
-        let head = self.queue.consumer_slots[self.slot_index]
-            .head
-            .load(Ordering::Relaxed);
+        loop {
+            let head = self.queue.consumer_slots[self.slot_index]
+                .head
+                .load(Ordering::Relaxed);
 
-        // SAFETY: `head & mask` is always < cap by construction
-        let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            // SAFETY: `head & mask` is always < cap by construction
+            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-        // The sequence number is the sole synchronization point.
-        // seq == head * 2 + 1 means the producer has written data at this position.
-        // The Acquire ordering synchronizes with the producer's Release store
-        // on the sequence, ensuring the data write is visible.
-        // Any other value means either empty or not-yet-committed.
-        let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != head * 2 + 1 {
-            return None;
+            let seq = slot.sequence.load(Ordering::Acquire);
+
+            if seq == TOMBSTONE {
+                // Abandoned slot — skip it by advancing this consumer's head.
+                self.queue.consumer_slots[self.slot_index]
+                    .head
+                    .store(head + 1, Ordering::Release);
+                continue;
+            }
+
+            // The sequence number is the sole synchronization point.
+            // seq == head * 2 + 1 means the producer has written data at this position.
+            // Any other value means either empty or not-yet-committed.
+            if seq != head * 2 + 1 {
+                return None;
+            }
+
+            // SAFETY: sequence == head * 2 + 1 synchronizes with producer's Release,
+            // ensuring the data write is visible. The data won't be overwritten
+            // because this consumer's head hasn't advanced (min_head blocks producer).
+            let val = unsafe { (*slot.data.get()).assume_init_ref().clone() };
+
+            // Advance this consumer's head
+            self.queue.consumer_slots[self.slot_index]
+                .head
+                .store(head + 1, Ordering::Release);
+
+            return Some(val);
         }
-
-        // SAFETY: sequence == head * 2 + 1 synchronizes with producer's Release,
-        // ensuring the data write is visible. The data won't be overwritten
-        // because this consumer's head hasn't advanced (min_head blocks producer).
-        let val = unsafe { (*slot.data.get()).assume_init_ref().clone() };
-
-        // Advance this consumer's head
-        self.queue.consumer_slots[self.slot_index]
-            .head
-            .store(head + 1, Ordering::Release);
-
-        Some(val)
     }
 
     /// Returns a zero-copy read reference to the next item.
@@ -104,28 +115,41 @@ impl<T> Consumer<T> {
     ///
     /// Returns `None` if the buffer is empty or the next slot hasn't
     /// been committed yet.
+    ///
+    /// Automatically skips tombstoned slots (abandoned reservations).
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
-        let head = self.queue.consumer_slots[self.slot_index]
-            .head
-            .load(Ordering::Relaxed);
+        loop {
+            let head = self.queue.consumer_slots[self.slot_index]
+                .head
+                .load(Ordering::Relaxed);
 
-        // SAFETY: `head & mask` is always < cap by construction
-        let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            // SAFETY: `head & mask` is always < cap by construction
+            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
 
-        let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != head * 2 + 1 {
-            return None;
+            let seq = slot.sequence.load(Ordering::Acquire);
+
+            if seq == TOMBSTONE {
+                // Abandoned slot — skip it.
+                self.queue.consumer_slots[self.slot_index]
+                    .head
+                    .store(head + 1, Ordering::Release);
+                continue;
+            }
+
+            if seq != head * 2 + 1 {
+                return None;
+            }
+
+            let data_ptr = slot.data.get().cast_const();
+
+            return Some(SlotReader {
+                data_ptr,
+                consumer: self,
+                head,
+            });
         }
-
-        let data_ptr = slot.data.get().cast_const();
-
-        Some(SlotReader {
-            data_ptr,
-            consumer: self,
-            head,
-        })
     }
 
     /// Returns the number of items this consumer has yet to read.

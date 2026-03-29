@@ -241,7 +241,7 @@ fn bench_large_struct_spsc_zero_copy(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
+                let (mut producer, mut consumer) =
                     RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let start = std::time::Instant::now();

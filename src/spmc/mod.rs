@@ -14,7 +14,7 @@
 //! use quetzalcoatl::spmc::RingBuffer;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, consumer) = RingBuffer::new(Capacity::exact(16)).split();
+//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
 //! let c2 = consumer.clone();
 //!
 //! producer.push(1u32).unwrap();
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn capacity_one() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn zero_sized_types() {
-        let (producer, consumer) = RingBuffer::<()>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<()>::new(Capacity::exact(4)).split();
 
         producer.push(()).unwrap();
         assert_eq!(consumer.pop(), Some(()));
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn pop_empty_is_idempotent() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(consumer.pop(), None);
         assert!(consumer.is_empty());
         assert_eq!(consumer.len(), 0);
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn length_invariants() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(2)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(2)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn overwrite_oldest_element() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn wraparound_behavior() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         assert_eq!(consumer.pop(), Some(1));
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity() {
-        let (producer, consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
+        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
 
         for i in 0..16 {
             producer.push(i).unwrap();
@@ -274,7 +274,7 @@ mod tests {
     #[ignore = "too slow for Miri"]
     fn multiple_consumers_concurrent() {
         let total = 1000usize;
-        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total));
 
         let handles: Vec<_> = (0..10)
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn dynamic_consumer_creation() {
-        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
+        let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
 
         // Push items first
         for i in 0..5 {
@@ -356,7 +356,7 @@ mod tests {
     fn spmc_stress_test() {
         let total_items = 4000usize;
         let num_consumers = 4;
-        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(total_items));
 
         let consumer_handles: Vec<_> = (0..num_consumers)
@@ -398,7 +398,7 @@ mod tests {
     #[ignore = "too slow for Miri"]
     fn clone_consumer_competes() {
         let n = 100usize;
-        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(64)).split();
+        let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(64)).split();
         let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(n));
 
         let c2 = consumer.clone();
@@ -456,7 +456,7 @@ mod tests {
     fn drop_items_on_consumer_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+            let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
             for _ in 0..4 {
                 producer.push(DropCounter { counter: counter.clone() }).unwrap();
@@ -477,7 +477,7 @@ mod tests {
     fn drop_items_on_pop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+            let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
             for _ in 0..3 {
                 producer.push(DropCounter { counter: counter.clone() }).unwrap();
@@ -500,7 +500,7 @@ mod tests {
     /// Exercise `get_unchecked` on every index by wrapping around multiple times.
     #[test]
     fn wraparound_exercises_all_slots() {
-        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps = 12 push/pops, covering slot indices 0-3 three times
         for lap in 0..3u32 {
@@ -517,7 +517,7 @@ mod tests {
     /// Concurrent push/pop with a tiny buffer — Miri checks for data races.
     #[test]
     fn concurrent_data_race_check() {
-        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn concurrent_spmc_data_race_check() {
         let total = 16usize;
-        let (producer, consumer) = RingBuffer::<usize>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(4)).split();
 
         let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
 
         let mut writer = producer.reserve().unwrap();
         writer.write(42);
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn reserve_slot_mut_commit() {
-        let (producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
 
         let mut writer = producer.reserve().unwrap();
         writer.slot_mut().write([0xAB; 64]);
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn reserve_returns_none_when_full() {
-        let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (mut producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
 
         let mut w1 = producer.reserve().unwrap();
         w1.write(1);
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn mixed_push_reserve_pop_pop_ref() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
 
         // Mix of push and reserve
         producer.push(1).unwrap();
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn reserve_pop_ref_wraparound() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps via reserve/pop_ref
         for lap in 0..3u32 {
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn concurrent_reserve_pop_ref() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {

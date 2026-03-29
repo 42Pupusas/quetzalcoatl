@@ -212,10 +212,12 @@ impl<T> Drop for RingBuffer<T> {
         let start = tail.wrapping_sub(tail.min(self.cap));
         for pos in start..tail {
             let slot = &mut self.buf[pos & self.mask];
-            if *slot.sequence.get_mut() > 0 {
-                // SAFETY: sequence > 0 means data was initialized by a producer
-                // and not cleared by a subsequent claim_slot. Exclusive access
-                // in drop (&mut self) guarantees no concurrency.
+            let seq = *slot.sequence.get_mut();
+            if seq > 0 && seq != crate::common::TOMBSTONE {
+                // SAFETY: sequence > 0 and not tombstoned means data was
+                // initialized by a producer and not cleared by a subsequent
+                // claim_slot. Exclusive access in drop (&mut self) guarantees
+                // no concurrency.
                 unsafe {
                     slot.data.get().cast::<T>().drop_in_place();
                 }
@@ -414,7 +416,7 @@ mod tests {
 
     #[test]
     fn no_consumers_black_hole() {
-        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         drop(consumer);
         // With no consumers, push should succeed (buffer acts as black hole)
         for i in 0..100 {
@@ -506,7 +508,7 @@ mod tests {
 
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.write(42);
         w.commit();
@@ -516,7 +518,7 @@ mod tests {
 
     #[test]
     fn reserve_slot_mut_commit() {
-        let (producer, mut consumer) = RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.slot_mut().write([0xAB; 256]);
         w.commit();
@@ -527,7 +529,7 @@ mod tests {
 
     #[test]
     fn reserve_returns_none_when_full() {
-        let (producer, _consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+        let (mut producer, _consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
 
         let w1 = producer.reserve().unwrap();
         w1.commit();
@@ -546,7 +548,7 @@ mod tests {
 
     #[test]
     fn pop_ref_returns_none_when_not_committed() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.write(1);
         // Not committed yet
@@ -583,7 +585,7 @@ mod tests {
 
     #[test]
     fn mixed_push_reserve_pop_pop_ref() {
-        let (producer, mut consumer) =
+        let (mut producer, mut consumer) =
             RingBuffer::<u32>::new(Capacity::exact(8), 4).split();
         producer.push(1).unwrap();
         let mut w = producer.reserve().unwrap();
@@ -600,7 +602,7 @@ mod tests {
 
     #[test]
     fn reserve_pop_ref_wraparound() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         for lap in 0u32..3 {
             for j in 0..4 {
                 let mut w = producer.reserve().unwrap();
@@ -773,7 +775,7 @@ mod tests {
 
     #[test]
     fn concurrent_reserve_pop_ref() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8), 4).split();
         let total = 100u64;
 
         let handle = std::thread::spawn(move || {
@@ -915,7 +917,7 @@ mod tests {
 
     #[test]
     fn arc_reserve_write_commit() {
-        let (producer, mut consumer) =
+        let (mut producer, mut consumer) =
             arc::ArcRingBuffer::<u64>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.write(42);
