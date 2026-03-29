@@ -26,12 +26,12 @@
 //! assert_eq!(c2.pop(), Some(20));
 //! ```
 
-mod producer;
-mod consumer;
 pub mod arc;
+mod consumer;
+mod producer;
 
-pub use producer::{Producer, SlotWriter};
 pub use consumer::{Consumer, SlotReader};
+pub use producer::{Producer, SlotWriter};
 
 use crate::capacity::Capacity;
 use crate::common::{AlignedBuf, CachePadded};
@@ -69,7 +69,7 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Shared L2 cache of `min_head()`. Updated by any producer after a full
     /// scan; read by all producers to avoid redundant O(N) scans.
-    /// Always ≤ actual min_head (conservative), so a stale value is safe.
+    /// Always ≤ actual `min_head` (conservative), so a stale value is safe.
     pub(crate) min_head_cache: CachePadded<AtomicUsize>,
 }
 
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn no_consumers_black_hole() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         drop(consumer);
         // With no consumers, push should succeed (buffer acts as black hole)
         for i in 0..100 {
@@ -448,7 +448,8 @@ mod tests {
     #[test]
     fn producer_drops_old_values_on_overwrite() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::<DropCounter>::new(Capacity::exact(4), 4).split();
+        let (producer, mut consumer) =
+            RingBuffer::<DropCounter>::new(Capacity::exact(4), 4).split();
         // Fill buffer
         for _ in 0..4 {
             producer
@@ -518,7 +519,8 @@ mod tests {
 
     #[test]
     fn reserve_slot_mut_commit() {
-        let (mut producer, mut consumer) = RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
+        let (mut producer, mut consumer) =
+            RingBuffer::<[u8; 256]>::new(Capacity::exact(4), 4).split();
         let mut w = producer.reserve().unwrap();
         w.slot_mut().write([0xAB; 256]);
         w.commit();
@@ -585,8 +587,7 @@ mod tests {
 
     #[test]
     fn mixed_push_reserve_pop_pop_ref() {
-        let (mut producer, mut consumer) =
-            RingBuffer::<u32>::new(Capacity::exact(8), 4).split();
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(8), 4).split();
         producer.push(1).unwrap();
         let mut w = producer.reserve().unwrap();
         w.write(2);
@@ -886,8 +887,7 @@ mod tests {
 
     #[test]
     fn arc_push_returns_val_on_full() {
-        let (producer, _consumer) =
-            arc::ArcRingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+        let (producer, _consumer) = arc::ArcRingBuffer::<u32>::new(Capacity::exact(2), 4).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         let err = producer.push(3).unwrap_err();
@@ -934,7 +934,9 @@ mod tests {
                 arc::ArcRingBuffer::<DropCounter>::new(Capacity::exact(4), 4).split();
             let mut c2 = c1.clone();
             producer
-                .push(DropCounter { counter: counter.clone() })
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
                 .unwrap();
             let v1 = c1.pop().unwrap();
             let v2 = c2.pop().unwrap();

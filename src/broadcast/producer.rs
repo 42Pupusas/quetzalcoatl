@@ -36,9 +36,7 @@ impl<T> Producer<T> {
     /// On success, drops any old value in the slot (from a previous lap)
     /// and clears the sequence to 0.
     #[inline]
-    fn claim_slot(
-        &self,
-    ) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let mut backoff = 0u32;
         let mut tail = self.queue.tail.load(Ordering::Relaxed);
         loop {
@@ -82,8 +80,7 @@ impl<T> Producer<T> {
             ) {
                 Ok(_) => {
                     // SAFETY: `tail & mask` is always < cap by construction
-                    let slot =
-                        unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
+                    let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
 
                     // Drop old value if this slot was previously written.
                     if std::mem::needs_drop::<T>() {
@@ -148,13 +145,14 @@ impl<T> Producer<T> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
-        self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
-            slot_data: data_ptr,
-            // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
-            slot_sequence: unsafe { &*seq_ptr },
-            pos,
-            state: SlotState::Reserved,
-        })
+        self.claim_slot()
+            .map(|(data_ptr, seq_ptr, pos)| SlotWriter {
+                slot_data: data_ptr,
+                // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
+                slot_sequence: unsafe { &*seq_ptr },
+                pos,
+                state: SlotState::Reserved,
+            })
     }
 
     /// Returns the number of items currently in the buffer.
@@ -237,7 +235,8 @@ impl<T> SlotWriter<'_, T> {
     /// uninitialized memory (undefined behavior).
     #[inline]
     pub fn commit(mut self) {
-        self.slot_sequence.store(self.pos * 2 + 1, Ordering::Release);
+        self.slot_sequence
+            .store(self.pos * 2 + 1, Ordering::Release);
         self.state = SlotState::Committed;
     }
 }

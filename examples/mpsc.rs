@@ -73,10 +73,7 @@ fn main() {
     // Verify results
     println!("=== Results ===");
     println!("Total items consumed: {}", total_consumed);
-    println!(
-        "Expected: {}",
-        num_producers * items_per_producer
-    );
+    println!("Expected: {}", num_producers * items_per_producer);
 
     for (id, count) in items_by_producer.iter().enumerate() {
         println!("  Producer {}: {} items", id, count);

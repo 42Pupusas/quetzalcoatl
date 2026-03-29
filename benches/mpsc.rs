@@ -73,49 +73,45 @@ fn bench_contention(c: &mut Criterion) {
 
     for cap in [64, 256, 1024] {
         group.throughput(Throughput::Elements(total_items));
-        group.bench_with_input(
-            BenchmarkId::new("cap", cap),
-            &cap,
-            |b, &cap| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+        group.bench_with_input(BenchmarkId::new("cap", cap), &cap, |b, &cap| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    let (producer, mut consumer) =
+                        RingBuffer::<u64>::new(Capacity::exact(cap)).split();
 
-                        let start = std::time::Instant::now();
+                    let start = std::time::Instant::now();
 
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|_| {
-                                let p = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..items_per_producer {
-                                        while p.push(black_box(i)).is_err() {
-                                            std::hint::spin_loop();
-                                        }
+                    let handles: Vec<_> = (0..num_producers)
+                        .map(|_| {
+                            let p = producer.clone();
+                            thread::spawn(move || {
+                                for i in 0..items_per_producer {
+                                    while p.push(black_box(i)).is_err() {
+                                        std::hint::spin_loop();
                                     }
-                                })
+                                }
                             })
-                            .collect();
+                        })
+                        .collect();
 
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if consumer.pop().is_some() {
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
+                    let mut received = 0u64;
+                    while received < total_items {
+                        if consumer.pop().is_some() {
+                            received += 1;
+                        } else {
+                            std::hint::spin_loop();
                         }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
                     }
-                    total
-                });
-            },
-        );
+
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
     }
     group.finish();
 }
@@ -132,9 +128,7 @@ struct LargeStruct {
 
 impl LargeStruct {
     fn new(seed: u8) -> Self {
-        Self {
-            data: [seed; 2048],
-        }
+        Self { data: [seed; 2048] }
     }
 }
 
@@ -163,7 +157,9 @@ fn bench_large_struct_mpsc(c: &mut Criterion) {
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         while prod
-                                            .push(black_box(LargeStruct::new((p as u64 * 100 + i) as u8)))
+                                            .push(black_box(LargeStruct::new(
+                                                (p as u64 * 100 + i) as u8,
+                                            )))
                                             .is_err()
                                         {
                                             std::hint::spin_loop();

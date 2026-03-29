@@ -87,10 +87,7 @@ fn main() {
             }
         }
 
-        println!(
-            "\nServer: Processed {} messages total",
-            messages_received
-        );
+        println!("\nServer: Processed {} messages total", messages_received);
         messages_received
     });
 

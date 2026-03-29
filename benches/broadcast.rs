@@ -152,9 +152,7 @@ struct LargeStruct {
 
 impl LargeStruct {
     fn new(seed: u8) -> Self {
-        Self {
-            data: [seed; 2048],
-        }
+        Self { data: [seed; 2048] }
     }
 }
 
@@ -176,10 +174,7 @@ fn bench_large_struct_clone_vs_ref(c: &mut Criterion) {
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
-                        while producer
-                            .push(black_box(LargeStruct::new(i as u8)))
-                            .is_err()
-                        {
+                        while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
                             std::hint::spin_loop();
                         }
                     }
@@ -261,8 +256,7 @@ fn bench_arc_large_struct(c: &mut Criterion) {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let (producer, consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), num_consumers + 1)
-                        .split();
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), num_consumers + 1).split();
                 let mut consumers: Vec<_> =
                     (0..num_consumers - 1).map(|_| consumer.clone()).collect();
                 consumers.push(consumer);
@@ -271,10 +265,7 @@ fn bench_arc_large_struct(c: &mut Criterion) {
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
-                        while producer
-                            .push(black_box(LargeStruct::new(i as u8)))
-                            .is_err()
-                        {
+                        while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
                             std::hint::spin_loop();
                         }
                     }
@@ -322,10 +313,7 @@ fn bench_arc_large_struct(c: &mut Criterion) {
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
-                        while producer
-                            .push(black_box(LargeStruct::new(i as u8)))
-                            .is_err()
-                        {
+                        while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
                             std::hint::spin_loop();
                         }
                     }

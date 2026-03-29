@@ -35,9 +35,7 @@ impl<T> Producer<T> {
     /// check guarantees the slot is free — no per-slot atomic load needed
     /// on the producer side.
     #[inline]
-    fn claim_slot(
-        &self,
-    ) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let mut backoff = 0u32;
         let mut tail = self.queue.tail.load(Ordering::Relaxed);
         loop {
@@ -63,13 +61,8 @@ impl<T> Producer<T> {
                     // SAFETY: `tail & mask` is always < cap by construction.
                     // The distance check guarantees this slot has been fully
                     // consumed — no sequence check needed on the producer side.
-                    let slot =
-                        unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-                    return Some((
-                        slot.data.get(),
-                        &raw const slot.sequence,
-                        tail,
-                    ));
+                    let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
+                    return Some((slot.data.get(), &raw const slot.sequence, tail));
                 }
                 Err(actual) => {
                     // Use the actual tail returned by CAS instead of reloading
@@ -113,13 +106,14 @@ impl<T> Producer<T> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
-        self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {
-            slot_data: data_ptr,
-            // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
-            slot_seq: unsafe { &*seq_ptr },
-            pos,
-            state: SlotState::Reserved,
-        })
+        self.claim_slot()
+            .map(|(data_ptr, seq_ptr, pos)| SlotWriter {
+                slot_data: data_ptr,
+                // SAFETY: seq_ptr points into the RingBuffer kept alive by our Arc.
+                slot_seq: unsafe { &*seq_ptr },
+                pos,
+                state: SlotState::Reserved,
+            })
     }
 
     /// Returns the number of items currently in the buffer.

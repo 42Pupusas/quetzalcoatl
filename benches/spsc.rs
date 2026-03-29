@@ -73,8 +73,7 @@ fn bench_push_pop_alternating(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
-                    RingBuffer::<u64>::new(Capacity::exact(64)).split();
+                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(64)).split();
                 let start = std::time::Instant::now();
                 for i in 0..ops {
                     let _ = producer.push(black_box(i));
@@ -182,9 +181,7 @@ struct LargeStruct {
 
 impl LargeStruct {
     fn new(seed: u8) -> Self {
-        Self {
-            data: [seed; 2048],
-        }
+        Self { data: [seed; 2048] }
     }
 }
 

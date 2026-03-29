@@ -29,10 +29,10 @@
 //!
 //! // Clone the producer for multiple threads
 //! let p2 = producer.clone();
-//! std::thread::spawn(move || { p2.push(1u64).unwrap(); });
+//! let handle = std::thread::spawn(move || { p2.push(1u64).unwrap(); });
 //!
 //! producer.push(2).unwrap();
-//! # std::thread::sleep(std::time::Duration::from_millis(50));
+//! handle.join().unwrap();
 //!
 //! let mut values = vec![];
 //! while let Some(v) = consumer.pop() { values.push(v); }
@@ -135,9 +135,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::perf)]
 #![allow(clippy::missing_errors_doc)]
 
+pub mod broadcast;
 pub mod capacity;
 pub(crate) mod common;
 pub mod mpsc;
-pub mod spsc;
 pub mod spmc;
-pub mod broadcast;
+pub mod spsc;

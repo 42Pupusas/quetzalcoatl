@@ -16,11 +16,11 @@ impl Capacity {
     /// Panics if `cap` is not a power of two or is zero.
     #[must_use]
     pub fn exact(cap: usize) -> Self {
-        assert!(cap > 0 && cap.is_power_of_two(), "capacity must be a non-zero power of two");
-        Self {
-            cap,
-            mask: cap - 1,
-        }
+        assert!(
+            cap > 0 && cap.is_power_of_two(),
+            "capacity must be a non-zero power of two"
+        );
+        Self { cap, mask: cap - 1 }
     }
 
     /// Creates a capacity of at least `min` elements by rounding up
@@ -33,10 +33,7 @@ impl Capacity {
     pub fn at_least(min: usize) -> Self {
         assert!(min > 0, "capacity must be non-zero");
         let cap = min.next_power_of_two();
-        Self {
-            cap,
-            mask: cap - 1,
-        }
+        Self { cap, mask: cap - 1 }
     }
 
     /// Returns the actual capacity (always a power of two).

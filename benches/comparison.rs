@@ -21,11 +21,10 @@ fn bench_spsc_comparison(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            quetzalcoatl::spsc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::exact(4096),
-                            )
-                            .split();
+                        let (producer, mut consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::exact(4096),
+                        )
+                        .split();
 
                         let start = std::time::Instant::now();
 
@@ -112,11 +111,10 @@ fn bench_mpsc_comparison(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::exact(8192),
-                            )
-                            .split();
+                        let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::exact(8192),
+                        )
+                        .split();
 
                         let start = std::time::Instant::now();
 
@@ -267,11 +265,10 @@ fn bench_spmc_comparison(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, consumer) =
-                            quetzalcoatl::spmc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::exact(8192),
-                            )
-                            .split();
+                        let (producer, consumer) = quetzalcoatl::spmc::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::exact(8192),
+                        )
+                        .split();
 
                         // Use a read-only done flag instead of a shared
                         // decrement counter. Consumers only READ this flag
@@ -394,12 +391,11 @@ fn bench_broadcast_comparison(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, consumer) =
-                            quetzalcoatl::broadcast::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::exact(4096),
-                                num_consumers as usize + 1,
-                            )
-                            .split();
+                        let (producer, consumer) = quetzalcoatl::broadcast::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::exact(4096),
+                            num_consumers as usize + 1,
+                        )
+                        .split();
                         let mut consumers: Vec<_> =
                             (0..num_consumers - 1).map(|_| consumer.clone()).collect();
                         consumers.push(consumer);
@@ -521,9 +517,7 @@ struct LargeStruct {
 
 impl LargeStruct {
     fn new(seed: u8) -> Self {
-        Self {
-            data: [seed; 2048],
-        }
+        Self { data: [seed; 2048] }
     }
 }
 
@@ -541,11 +535,10 @@ fn bench_large_spsc_comparison(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
-                    quetzalcoatl::spsc::RingBuffer::<LargeStruct>::new(
-                        quetzalcoatl::capacity::Capacity::exact(256),
-                    )
-                    .split();
+                let (producer, mut consumer) = quetzalcoatl::spsc::RingBuffer::<LargeStruct>::new(
+                    quetzalcoatl::capacity::Capacity::exact(256),
+                )
+                .split();
 
                 let start = std::time::Instant::now();
 
@@ -683,9 +676,7 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
                                         while prod
-                                            .push(black_box(LargeStruct::new(
-                                                (p * 100 + i) as u8,
-                                            )))
+                                            .push(black_box(LargeStruct::new((p * 100 + i) as u8)))
                                             .is_err()
                                         {
                                             std::hint::spin_loop();
@@ -787,10 +778,8 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
                                 let t = tx.clone();
                                 thread::spawn(move || {
                                     for i in 0..items_per_producer {
-                                        t.send(black_box(LargeStruct::new(
-                                            (p * 100 + i) as u8,
-                                        )))
-                                        .unwrap();
+                                        t.send(black_box(LargeStruct::new((p * 100 + i) as u8)))
+                                            .unwrap();
                                     }
                                 })
                             })
@@ -829,8 +818,7 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         total += rt.block_on(async {
-                            let (tx, mut rx) =
-                                tokio::sync::mpsc::channel::<LargeStruct>(256);
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<LargeStruct>(256);
 
                             let start = std::time::Instant::now();
 
@@ -919,10 +907,7 @@ fn bench_large_spmc_comparison(c: &mut Criterion) {
                             .collect();
 
                         for i in 0..total_items {
-                            while producer
-                                .push(black_box(LargeStruct::new(i as u8)))
-                                .is_err()
-                            {
+                            while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
                                 std::hint::spin_loop();
                             }
                         }

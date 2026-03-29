@@ -35,9 +35,7 @@ impl<T> Consumer<T> {
     /// Returns raw pointers to the slot's data and sequence, plus the
     /// claimed head position, or `None` if the buffer is empty.
     #[inline]
-    fn claim_slot(
-        &self,
-    ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
         // Cache immutable RingBuffer fields in locals. Without this, the
         // compiler reloads buf/mask from the Arc on every loop iteration
         // because `lock cmpxchg` acts as a compiler fence and the compiler
@@ -65,18 +63,12 @@ impl<T> Consumer<T> {
             }
 
             // Ready! Try to claim this slot via CAS.
-            match q.head.compare_exchange_weak(
-                head,
-                head + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match q
+                .head
+                .compare_exchange_weak(head, head + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => {
-                    return Some((
-                        slot.data.get().cast_const(),
-                        &raw const slot.sequence,
-                        head,
-                    ));
+                    return Some((slot.data.get().cast_const(), &raw const slot.sequence, head));
                 }
                 Err(_) => {
                     // Another consumer beat us — retry.

@@ -1,5 +1,5 @@
-use quetzalcoatl::spmc::RingBuffer;
 use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::spmc::RingBuffer;
 
 fn main() {
     let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();

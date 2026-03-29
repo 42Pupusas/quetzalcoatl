@@ -22,11 +22,11 @@
 //! assert_eq!(v, [1, 2]);
 //! ```
 
-mod producer;
 mod consumer;
+mod producer;
 
-pub use producer::{Producer, SlotWriter};
 pub use consumer::{Consumer, SlotReader};
+pub use producer::{Producer, SlotWriter};
 
 use crate::capacity::Capacity;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
@@ -390,10 +390,14 @@ mod tests {
     #[test]
     fn drop_items_on_consumer_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
         for _ in 0..4 {
-            producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
         }
 
         // Dropping consumer should drain and drop all 4 items
@@ -408,7 +412,11 @@ mod tests {
         let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
 
         for _ in 0..3 {
-            producer.push(DropCounter { counter: counter.clone() }).unwrap();
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
         }
 
         // Pop 2 — should drop when they go out of scope

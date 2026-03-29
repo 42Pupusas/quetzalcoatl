@@ -31,7 +31,9 @@ pub struct AlignedBuf<T> {
 
 impl<T> AlignedBuf<T> {
     fn layout(len: usize) -> std::alloc::Layout {
-        let size = std::mem::size_of::<T>().checked_mul(len).expect("capacity overflow");
+        let size = std::mem::size_of::<T>()
+            .checked_mul(len)
+            .expect("capacity overflow");
         let align = std::mem::align_of::<T>().max(64);
         std::alloc::Layout::from_size_align(size, align).expect("invalid layout")
     }
@@ -139,7 +141,8 @@ pub struct DropCounter {
 #[cfg(test)]
 impl Drop for DropCounter {
     fn drop(&mut self) {
-        self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -152,7 +155,9 @@ mod tests {
     fn aligned_buf_drop_correctness() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let _buf = AlignedBuf::new_with(8, || DropCounter { counter: counter.clone() });
+            let _buf = AlignedBuf::new_with(8, || DropCounter {
+                counter: counter.clone(),
+            });
         }
         // 8 DropCounters created inside AlignedBuf, all should be dropped
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 8);
