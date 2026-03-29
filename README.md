@@ -13,7 +13,7 @@ Four variants cover every producer/consumer topology:
 
 ## Features
 
-- **Lock-free** — no mutexes, only atomic CAS / Acquire-Release
+- **Lock-free** — no mutexes, only atomic CAS / FAA / Acquire-Release
 - **Zero dependencies** — pure `std` implementation
 - **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side
 - **Sound by construction** — `commit()` is only available on `WrittenSlot` (after `write()`), so safe code cannot cause UB
@@ -192,7 +192,8 @@ The type system guarantees soundness:
 ## How it works
 
 - **Slot reservation**: Producers use atomic compare-and-swap (CAS) to
-  claim slots (MPSC/broadcast) or a simple local counter (SPSC/SPMC).
+  claim slots (MPSC) or fetch-and-add (FAA) for contention-free claiming
+  (broadcast). SPSC/SPMC use a simple local counter on the producer side.
   Consumers use CAS on the head counter to claim items (SPMC).
 - **Publication signaling**: Per-slot `AtomicUsize` sequence numbers
   encode slot state (free / published / tombstoned). SPSC uses simple
@@ -207,9 +208,11 @@ The type system guarantees soundness:
 
 ## Performance
 
-- O(1) push and pop (with CAS retry under contention for MPSC/broadcast)
+- O(1) push and pop (with CAS retry under contention for MPSC/SPMC,
+  contention-free FAA for broadcast)
 - Fixed-size buffer — no allocations on the hot path
-- Scales well with multiple producers (exponential CAS backoff)
+- Scales well with multiple producers (CAS with exponential backoff for
+  MPSC, lock-free FAA for broadcast)
 - Two-level `min_head` cache in broadcast avoids O(N) consumer scans
 
 Run benchmarks:

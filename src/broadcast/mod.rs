@@ -1,7 +1,7 @@
 //! Multi-producer, multi-consumer (MPMC) broadcast ring buffer.
 //!
 //! Every consumer sees every item published after it subscribes. Multiple
-//! producers push via CAS; consumers are dynamically created by cloning
+//! producers push via atomic fetch-and-add (FAA); consumers are dynamically created by cloning
 //! an existing [`Consumer`].
 //!
 //! Items require `T: Clone` for [`Consumer::pop`], or use
@@ -57,7 +57,7 @@ pub(super) struct ConsumerSlot {
 /// Lock-free MPMC broadcast ring buffer.
 ///
 /// Every consumer sees every item published after it subscribes.
-/// Multiple producers push via CAS. Consumers clone to subscribe.
+/// Multiple producers push via atomic FAA. Consumers clone to subscribe.
 // repr(C) locks field order: shared immutable fields first (same cache
 // line), then the contended tail on its own cache-padded line.
 #[repr(C)]

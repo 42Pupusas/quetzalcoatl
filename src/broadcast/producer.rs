@@ -9,7 +9,7 @@ use crate::common::TOMBSTONE;
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
 /// — each clone shares the same underlying buffer and competes for slots
-/// via atomic CAS.
+/// via atomic fetch-and-add (FAA).
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_min_head: std::cell::Cell<usize>,
@@ -27,62 +27,66 @@ impl<T> Clone for Producer<T> {
 impl<T> Producer<T> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
-        let mut backoff = 0u32;
-        let mut tail = self.queue.tail.load(Ordering::Relaxed);
-        loop {
-            // Two-level min_head cache:
-            // L1 = per-producer Cell (zero-cost, no atomic)
-            // L2 = shared AtomicUsize (one Acquire load, benefits all producers)
-            // L3 = full O(N) scan of consumer heads
-            if tail.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
-                let shared = self.queue.min_head_cache.load(Ordering::Acquire);
-                self.cached_min_head.set(shared);
+        // Pre-check with L1/L2/L3 min_head cache: avoid a wasted FAA
+        // when the buffer is clearly full.
+        let current_tail = self.queue.tail.load(Ordering::Relaxed);
+        if current_tail.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
+            let shared = self.queue.min_head_cache.load(Ordering::Acquire);
+            self.cached_min_head.set(shared);
 
-                if tail.wrapping_sub(shared) >= self.queue.cap {
-                    let min_head = self.queue.min_head();
-                    self.queue
-                        .min_head_cache
-                        .fetch_max(min_head, Ordering::Release);
-                    self.cached_min_head.set(min_head);
+            if current_tail.wrapping_sub(shared) >= self.queue.cap {
+                let min_head = self.queue.min_head();
+                self.queue
+                    .min_head_cache
+                    .fetch_max(min_head, Ordering::Release);
+                self.cached_min_head.set(min_head);
 
-                    if tail.wrapping_sub(min_head) >= self.queue.cap {
-                        return None;
-                    }
-                }
-            }
-
-            match self.queue.tail.compare_exchange_weak(
-                tail,
-                tail.wrapping_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // SAFETY: `tail & mask` is always < cap by construction.
-                    let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-
-                    // Drop old value if this slot was previously written.
-                    if std::mem::needs_drop::<T>() {
-                        let old_seq = slot.sequence.swap(0, Ordering::Acquire);
-                        if old_seq > 0 && old_seq != TOMBSTONE {
-                            // SAFETY: old_seq > 0 means data was initialized
-                            // by a prior push. We own the slot via CAS claim.
-                            unsafe {
-                                slot.data.get().cast::<T>().drop_in_place();
-                            }
-                        }
-                    } else {
-                        slot.sequence.store(0, Ordering::Relaxed);
-                    }
-
-                    return Some((slot.data.get(), &raw const slot.sequence, tail));
-                }
-                Err(actual) => {
-                    tail = actual;
-                    crate::common::cas_backoff(&mut backoff);
+                if current_tail.wrapping_sub(min_head) >= self.queue.cap {
+                    return None;
                 }
             }
         }
+
+        // Claim a unique position via FAA — always succeeds on the first
+        // try, eliminating inter-producer cache-line contention entirely.
+        let pos = self.queue.tail.fetch_add(1, Ordering::Relaxed);
+
+        // SAFETY: `pos & mask` is always < cap by construction.
+        let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
+
+        // Wait for all consumers to advance past the slot's previous
+        // occupant (pos - cap). Each producer spins on min_head — no
+        // inter-producer contention on the tail cache line.
+        if pos.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
+            let mut backoff = 0u32;
+            loop {
+                let min_head = self.queue.min_head();
+                self.queue
+                    .min_head_cache
+                    .fetch_max(min_head, Ordering::Release);
+                self.cached_min_head.set(min_head);
+                if pos.wrapping_sub(min_head) < self.queue.cap {
+                    break;
+                }
+                crate::common::cas_backoff(&mut backoff);
+            }
+        }
+
+        // Drop old value if this slot was previously written.
+        if std::mem::needs_drop::<T>() {
+            let old_seq = slot.sequence.swap(0, Ordering::Acquire);
+            if old_seq > 0 && old_seq != TOMBSTONE {
+                // SAFETY: old_seq > 0 means data was initialized
+                // by a prior push. We own the slot via FAA claim.
+                unsafe {
+                    slot.data.get().cast::<T>().drop_in_place();
+                }
+            }
+        } else {
+            slot.sequence.store(0, Ordering::Relaxed);
+        }
+
+        Some((slot.data.get(), &raw const slot.sequence, pos))
     }
 
     /// Pushes a value into the broadcast ring buffer.
@@ -93,7 +97,7 @@ impl<T> Producer<T> {
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, seq_ptr, pos)) => {
-                // SAFETY: We exclusively own this slot via CAS claim.
+                // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
                 // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
                 unsafe {
@@ -154,7 +158,7 @@ pub struct SlotWriter<'a, T> {
     pos: usize,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (CAS claim).
+// SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
 // The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send + Sync> Send for SlotWriter<'_, T> {}
 
@@ -164,7 +168,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: Exclusive access via CAS claim. The pointer is valid
+        // SAFETY: Exclusive access via FAA claim. The pointer is valid
         // because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
@@ -173,7 +177,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
         let mut this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: Exclusive access via CAS claim, valid pointer.
+        // SAFETY: Exclusive access via FAA claim, valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,
