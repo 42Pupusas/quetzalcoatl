@@ -43,6 +43,9 @@ use std::sync::Arc;
 /// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
 /// a [`Producer`] / [`Consumer`] pair. Neither handle is [`Clone`],
 /// enforcing the single-producer, single-consumer invariant.
+// repr(C) locks field order: shared immutable fields first (same cache
+// line), then head and tail each on their own cache-padded line.
+#[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     pub(crate) cap: usize,

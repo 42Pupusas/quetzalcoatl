@@ -33,6 +33,7 @@ impl<T> Producer<T> {
     /// contention), then CAS on tail to claim the position. The distance
     /// check guarantees the slot is free — no per-slot atomic load needed
     /// on the producer side.
+    #[inline]
     fn claim_slot(
         &self,
     ) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
@@ -82,6 +83,7 @@ impl<T> Producer<T> {
     ///
     /// Multiple producers can push concurrently. Uses CAS loop to
     /// atomically reserve slots.
+    #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, seq_ptr, pos)) => {
@@ -107,6 +109,7 @@ impl<T> Producer<T> {
     ///
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
+    #[inline]
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {

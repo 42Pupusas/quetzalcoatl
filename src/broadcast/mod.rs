@@ -58,12 +58,15 @@ pub(super) struct ConsumerSlot {
 ///
 /// Every consumer sees every item published after it subscribes.
 /// Multiple producers push via CAS. Consumers clone to subscribe.
+// repr(C) locks field order: shared immutable fields first (same cache
+// line), then the contended tail on its own cache-padded line.
+#[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<BroadcastSlot<T>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
-    pub(crate) tail: CachePadded<AtomicUsize>,
     pub(crate) consumer_slots: Box<[ConsumerSlot]>,
+    pub(crate) tail: CachePadded<AtomicUsize>,
 }
 
 // SAFETY: RingBuffer is shared via Arc between producers and consumers on

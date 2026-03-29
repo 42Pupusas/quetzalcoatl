@@ -34,6 +34,7 @@ impl<T> Consumer<T> {
     ///
     /// Returns raw pointers to the slot's data and sequence, plus the
     /// claimed head position, or `None` if the buffer is empty.
+    #[inline]
     fn claim_slot(
         &self,
     ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
@@ -92,6 +93,7 @@ impl<T> Consumer<T> {
     /// consumer.
     ///
     /// Returns `None` if the buffer is empty.
+    #[inline]
     #[must_use]
     pub fn pop(&self) -> Option<T> {
         let (data_ptr, seq_ptr, head) = self.claim_slot()?;
@@ -120,6 +122,7 @@ impl<T> Consumer<T> {
     ///
     /// Requires `&mut self` to guarantee only one [`SlotReader`] per
     /// consumer clone at a time.
+    #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let (data_ptr, seq_ptr, head) = self.claim_slot()?;

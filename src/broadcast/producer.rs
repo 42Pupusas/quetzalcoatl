@@ -34,6 +34,7 @@ impl<T> Producer<T> {
     ///
     /// On success, drops any old value in the slot (from a previous lap)
     /// and clears the sequence to 0.
+    #[inline]
     fn claim_slot(
         &self,
     ) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
@@ -97,6 +98,7 @@ impl<T> Producer<T> {
     /// Multiple producers can push concurrently. Returns `Err(val)` if the
     /// buffer is full (all slots occupied by data that the slowest consumer
     /// hasn't read yet).
+    #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, seq_ptr, pos)) => {
@@ -122,6 +124,7 @@ impl<T> Producer<T> {
     ///
     /// You **must** call [`SlotWriter::commit`] after writing data.
     /// Dropping a `SlotWriter` without committing aborts the process.
+    #[inline]
     #[must_use]
     pub fn reserve(&self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot().map(|(data_ptr, seq_ptr, pos)| SlotWriter {

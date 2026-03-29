@@ -104,6 +104,7 @@ impl<T> Consumer<T> {
     ///
     /// Returns `None` if the buffer is empty or the next slot hasn't
     /// been committed yet.
+    #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let head = self.queue.consumer_slots[self.slot_index]
