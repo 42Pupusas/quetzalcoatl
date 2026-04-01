@@ -108,6 +108,106 @@ impl<T> Consumer<T> {
         }
     }
 
+    /// Drains all available items, calling `f` for each one.
+    ///
+    /// Unlike calling [`pop`](Self::pop) in a loop, this amortizes the
+    /// `head` pointer update: individual slot sequences are released
+    /// immediately (so producers spinning on a slot can proceed), but the
+    /// shared `head` pointer is written **once** at the end of the batch.
+    /// This reduces cache-line invalidation traffic from O(n) to O(1) for
+    /// the most contended atomic.
+    ///
+    /// Returns the number of items drained.
+    pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut head = self.queue.head.load(Ordering::Relaxed);
+        let mut count = 0usize;
+
+        loop {
+            // SAFETY: `head & mask` is always < cap by construction
+            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+
+            let seq = slot.sequence.load(Ordering::Acquire);
+
+            if seq == TOMBSTONE {
+                // Abandoned slot — release it for reuse and skip.
+                slot.sequence
+                    .store((head + self.queue.cap) * 2, Ordering::Release);
+                head += 1;
+                continue;
+            }
+
+            if seq != head * 2 + 1 {
+                break;
+            }
+
+            // SAFETY: We checked that the slot is ready
+            let val = unsafe { (*slot.data.get()).assume_init_read() };
+
+            // Release the slot so producers can reuse it immediately.
+            // Head update is deferred to batch all items into a single store.
+            slot.sequence
+                .store((head + self.queue.cap) * 2, Ordering::Release);
+
+            head += 1;
+            count += 1;
+            f(val);
+        }
+
+        if count > 0 {
+            // Single head update for the entire batch — this is the key
+            // optimization. Producers use head for fullness pre-checks,
+            // so batching reduces cache-line invalidations from O(n) to O(1).
+            self.queue.head.store(head, Ordering::Release);
+        }
+
+        count
+    }
+
+    /// Drains up to `limit` available items, calling `f` for each one.
+    ///
+    /// Same amortized-head optimization as [`drain`](Self::drain), but
+    /// stops after `limit` items. Useful for fairness in multi-source
+    /// consumer loops.
+    ///
+    /// Returns the number of items drained.
+    pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut head = self.queue.head.load(Ordering::Relaxed);
+        let mut count = 0usize;
+
+        while count < limit {
+            // SAFETY: `head & mask` is always < cap by construction
+            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+
+            let seq = slot.sequence.load(Ordering::Acquire);
+
+            if seq == TOMBSTONE {
+                slot.sequence
+                    .store((head + self.queue.cap) * 2, Ordering::Release);
+                head += 1;
+                continue;
+            }
+
+            if seq != head * 2 + 1 {
+                break;
+            }
+
+            let val = unsafe { (*slot.data.get()).assume_init_read() };
+
+            slot.sequence
+                .store((head + self.queue.cap) * 2, Ordering::Release);
+
+            head += 1;
+            count += 1;
+            f(val);
+        }
+
+        if count > 0 {
+            self.queue.head.store(head, Ordering::Release);
+        }
+
+        count
+    }
+
     /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -8,8 +8,9 @@ use crate::common::TOMBSTONE;
 /// The producer side of an MPSC ring buffer.
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
-/// — each clone shares the same underlying buffer and competes for slots
-/// via atomic CAS.
+/// — each clone shares the same underlying buffer and claims slots via
+/// atomic fetch-and-add (FAA), eliminating inter-producer cache-line
+/// contention on the tail pointer.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_head: std::cell::Cell<usize>,
@@ -27,35 +28,41 @@ impl<T> Clone for Producer<T> {
 impl<T> Producer<T> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
-        let mut backoff = 0u32;
-        let mut tail = self.queue.tail.load(Ordering::Relaxed);
-        loop {
-            if tail - self.cached_head.get() >= self.queue.cap {
-                let head = self.queue.head.load(Ordering::Acquire);
-                self.cached_head.set(head);
+        // Pre-check: is there room? Uses cached head as a fast-path to avoid
+        // an atomic load. Since head only increases, a stale cache just makes
+        // the buffer look fuller than it is — safe to refresh on demand.
+        let current_tail = self.queue.tail.load(Ordering::Relaxed);
+        if current_tail - self.cached_head.get() >= self.queue.cap {
+            let head = self.queue.head.load(Ordering::Acquire);
+            self.cached_head.set(head);
 
-                if tail - head >= self.queue.cap {
-                    return None;
-                }
-            }
-
-            match self.queue.tail.compare_exchange_weak(
-                tail,
-                tail + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // SAFETY: `tail & mask` is always < cap by construction.
-                    let slot = unsafe { self.queue.buf.get_unchecked(tail & self.queue.mask) };
-                    return Some((slot.data.get(), &raw const slot.sequence, tail));
-                }
-                Err(actual) => {
-                    tail = actual;
-                    crate::common::cas_backoff(&mut backoff);
-                }
+            if current_tail - head >= self.queue.cap {
+                return None;
             }
         }
+
+        // Claim a unique position via fetch-and-add. Unlike CAS, this always
+        // succeeds on the first try — no retry loop, no inter-producer
+        // cache-line contention on the tail pointer.
+        let pos = self.queue.tail.fetch_add(1, Ordering::Relaxed);
+
+        // SAFETY: `pos & mask` is always < cap by construction.
+        let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
+
+        // Wait for the slot to be free. This handles the race where multiple
+        // producers passed the pre-check and claimed positions via FAA — some
+        // may land on slots the consumer hasn't released yet. Each producer
+        // spins on its own slot's sequence number (different cache lines),
+        // so there is no cross-producer contention during this wait.
+        let seq = slot.sequence.load(Ordering::Acquire);
+        if seq != pos * 2 {
+            let mut backoff = 0u32;
+            while slot.sequence.load(Ordering::Acquire) != pos * 2 {
+                crate::common::cas_backoff(&mut backoff);
+            }
+        }
+
+        Some((slot.data.get(), &raw const slot.sequence, pos))
     }
 
     /// Pushes a value into the ring buffer.

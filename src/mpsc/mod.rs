@@ -1,8 +1,14 @@
 //! Multi-producer, single-consumer (MPSC) lock-free ring buffer.
 //!
-//! Multiple producers push concurrently via atomic CAS; a single consumer
-//! pops items in FIFO order. The producer handle is [`Clone`], so new
-//! producers can be created at any time.
+//! Multiple producers push concurrently via atomic fetch-and-add (FAA);
+//! a single consumer pops items in FIFO order. The producer handle is
+//! [`Clone`], so new producers can be created at any time.
+//!
+//! FAA eliminates inter-producer contention on the tail pointer — each
+//! producer claims a unique position on the first try, then spins on its
+//! own slot's sequence number (a separate cache line) until the slot is
+//! free. This scales significantly better than CAS under high producer
+//! counts (8+).
 //!
 //! # Example
 //!
@@ -52,7 +58,7 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
 }
 
-// Safety: Multiple producers use CAS to atomically claim tail slots.
+// Safety: Multiple producers use FAA to atomically claim tail slots.
 // Single consumer touches head. Sequence numbers ensure proper synchronization.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
@@ -691,6 +697,122 @@ mod tests {
             1,
             "written value should be dropped on SlotWriter drop"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain API tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_empty_returns_zero() {
+        let (_producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        assert_eq!(consumer.drain(|_| unreachable!()), 0);
+    }
+
+    #[test]
+    fn drain_all_available() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+
+        for i in 0..5 {
+            producer.push(i).unwrap();
+        }
+
+        let mut items = Vec::new();
+        let count = consumer.drain(|v| items.push(v));
+        assert_eq!(count, 5);
+        assert_eq!(items, vec![0, 1, 2, 3, 4]);
+        assert!(consumer.is_empty());
+    }
+
+    #[test]
+    fn drain_up_to_limits() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+
+        for i in 0..5 {
+            producer.push(i).unwrap();
+        }
+
+        let mut items = Vec::new();
+        let count = consumer.drain_up_to(3, |v| items.push(v));
+        assert_eq!(count, 3);
+        assert_eq!(items, vec![0, 1, 2]);
+
+        // Remaining 2 items still available
+        assert_eq!(consumer.pop(), Some(3));
+        assert_eq!(consumer.pop(), Some(4));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn drain_drops_values() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+
+        for _ in 0..3 {
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+        }
+
+        let count = consumer.drain(|v| drop(v));
+        assert_eq!(count, 3);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn drain_skips_tombstones() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        producer.push(1).unwrap();
+        {
+            let _w = producer.reserve().unwrap();
+            // dropped without commit → tombstone
+        }
+        producer.push(3).unwrap();
+
+        let mut items = Vec::new();
+        let count = consumer.drain(|v| items.push(v));
+        assert_eq!(count, 2);
+        assert_eq!(items, vec![1, 3]);
+    }
+
+    #[test]
+    #[ignore = "too slow for Miri"]
+    fn concurrent_drain() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+        let total = 100_000u64;
+        let num_producers = 4u64;
+        let per_producer = total / num_producers;
+
+        let handles: Vec<_> = (0..num_producers)
+            .map(|_| {
+                let p = producer.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_producer {
+                        while p.push(i).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut received = 0u64;
+        while received < total {
+            let drained = consumer.drain(|_| {});
+            if drained > 0 {
+                received += drained as u64;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received, total);
     }
 
     #[test]

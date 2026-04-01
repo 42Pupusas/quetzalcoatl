@@ -30,3 +30,7 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bench]]
+name = "fanin"
+harness = false

@@ -11,7 +11,7 @@ fn bench_mpsc_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("mpsc_scaling");
     let items_per_producer = 50_000u64;
 
-    for num_producers in [1, 2, 4, 8] {
+    for num_producers in [1, 2, 4, 8, 12, 16] {
         let total_items = items_per_producer * num_producers as u64;
         group.throughput(Throughput::Elements(total_items));
         group.bench_with_input(
