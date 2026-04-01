@@ -118,9 +118,12 @@
 //!   single `Acquire`/`Release` pair. Use when you have exactly one
 //!   producer and one consumer.
 //!
-//! - **[`mpsc`]**: Multiple producers share a CAS loop to claim slots.
-//!   Single consumer pops lock-free. Use for fan-in patterns (many
-//!   writers, one reader).
+//! - **[`mpsc`]**: Multiple producers claim slots via fetch-and-add (FAA),
+//!   eliminating inter-producer contention on the tail pointer. Single
+//!   consumer pops lock-free. Use for fan-in patterns (many writers, one
+//!   reader). For high-throughput bulk consumption, use
+//!   [`mpsc::Consumer::drain`] which amortizes the head pointer update
+//!   across an entire batch.
 //!
 //! - **[`spmc`]**: Single producer writes lock-free. Multiple consumers
 //!   share a CAS loop to claim items. Each item goes to exactly one

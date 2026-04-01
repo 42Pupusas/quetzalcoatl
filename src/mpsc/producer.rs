@@ -72,7 +72,7 @@ impl<T> Producer<T> {
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, seq_ptr, pos)) => {
-                // SAFETY: We exclusively own this slot via CAS claim.
+                // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
                 // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
                 unsafe {
@@ -133,7 +133,7 @@ pub struct SlotWriter<'a, T> {
     pos: usize,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (CAS claim).
+// SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
 // The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
@@ -143,7 +143,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: Exclusive access via CAS claim. The pointer is valid
+        // SAFETY: Exclusive access via FAA claim. The pointer is valid
         // because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
@@ -152,7 +152,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
         let mut this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: Exclusive access via CAS claim, valid pointer.
+        // SAFETY: Exclusive access via FAA claim, valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,

@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(received, n);
     }
 
-    /// Two producers, tiny buffer — checks CAS + sequence synchronization.
+    /// Two producers, tiny buffer — checks FAA + sequence synchronization.
     #[test]
     fn concurrent_mpsc_data_race_check() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
