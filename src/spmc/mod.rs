@@ -53,22 +53,37 @@ use std::sync::Arc;
 /// cache-line padded so a consumer's release-store on slot `s` does not
 /// invalidate the producer's lines for adjacent slots.
 ///
-/// # Synchronization
+/// # Synchronization (split-plane protocol)
 ///
-/// Each slot `s` has a paired `ready[s]: AtomicUsize` whose value encodes
-/// the slot's logical position:
+/// Two per-slot atomic arrays, on separate cache lines:
 ///
-/// * `ready[s] == p`     → free for producer at position `p`
-///   (initial: `ready[s] = s`)
-/// * `ready[s] == p + 1` → contains data from position `p`, ready for
-///   consumer at position `p`
+/// * `ready[s]` — **producer-write, consumer-read**. Producer Release-stores
+///   `ready[s] = p + 1` to publish data at logical position `p`; consumer
+///   Acquire-loads to see when data is available.
 ///
-/// The producer never reads `head`; consumers never read `tail`. The
-/// only producer↔consumer handoff is the per-slot `ready` marker.
+/// * `done[s]` — **consumer-write, producer-read**. Consumer Release-stores
+///   `done[s] = h + cap` after reading data, telling the producer the slot
+///   is free for reuse at logical position `h + cap` (the next lap).
+///   Initial: `done[s] = s` so the first lap is free.
+///
+/// Crucially, the producer's hot path never writes the `done` line and the
+/// consumer's release-store never touches the `ready` line. The two
+/// producer↔consumer handoff streams ping-pong on **different** physical
+/// cache lines, eliminating the symmetric ping-pong of the previous design
+/// where both directions wrote `ready[s]`.
+///
+/// The producer never reads `head`; consumers never read `tail` (except
+/// for the pre-FAA peek and `len()` diagnostics).
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
+    /// Producer-write, consumer-read publish marker. Each on its own
+    /// cache line so a producer write to ready[s] does not invalidate
+    /// adjacent slots.
     pub(crate) ready: AlignedBuf<CachePadded<AtomicUsize>>,
+    /// Consumer-write, producer-read free-for-reuse marker. Distinct
+    /// cache lines from `ready` to break the producer↔consumer ping-pong.
+    pub(crate) done: AlignedBuf<CachePadded<AtomicUsize>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
@@ -92,17 +107,27 @@ impl<T> RingBuffer<T> {
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
+        // ready[s] = 0 — producer doesn't read this for freeness, only
+        // writes it for publish. Consumers Acquire-load and compare
+        // against (h + 1), so the initial 0 just means "not yet
+        // published"; consumers won't reach it until the producer has
+        // pushed at least s+1 items (head can't FAA past tail==0).
+        let ready = AlignedBuf::new_with(cap, || CachePadded(AtomicUsize::new(0)));
+        // done[s] = s — slot s is "free for producer at logical position
+        // s" on the first lap. After a consumer at position p reads slot
+        // s, it stores done[s] = p + cap, marking it free for the next
+        // lap (logical position p + cap == s + cap == s + cap).
         let mut idx = 0usize;
-        let ready = AlignedBuf::new_with(cap, || {
-            // Initial: slot `s` is free for the producer at position `s`.
-            let r = CachePadded(AtomicUsize::new(idx));
+        let done = AlignedBuf::new_with(cap, || {
+            let d = CachePadded(AtomicUsize::new(idx));
             idx += 1;
-            r
+            d
         });
 
         Self {
             data,
             ready,
+            done,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
             closed: CachePadded(AtomicBool::new(false)),
@@ -164,9 +189,12 @@ impl<T> Drop for RingBuffer<T> {
         for pos in head..tail {
             let s = pos & self.mask;
             let r = *self.ready[s].0.get_mut();
-            if r == pos + 1 {
-                // SAFETY: ready == pos+1 means producer published and
-                // no consumer has claimed; data is initialized.
+            let d = *self.done[s].0.get_mut();
+            // Slot at logical position `pos` holds live data iff the
+            // producer published (ready == pos+1) AND no consumer has
+            // released it yet (done < pos+cap).
+            if r == pos + 1 && d != pos + self.cap {
+                // SAFETY: data is initialized and unconsumed.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();
                 }

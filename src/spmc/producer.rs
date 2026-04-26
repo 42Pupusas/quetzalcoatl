@@ -14,27 +14,31 @@ use super::RingBuffer;
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Local write cursor. Single producer means no atomics needed for
-    /// our own state — we publish via per-slot `ready` markers and
-    /// (Release-)update the shared `tail` so consumers can pre-FAA peek.
+    /// our own state — we publish via `ready[s]` per slot, update the
+    /// shared `tail` (Release) for consumer pre-FAA peeks, and read
+    /// `done[s]` to confirm the slot is free for reuse.
     pub(super) write_pos: std::cell::Cell<usize>,
 }
 
 impl<T> Producer<T> {
     /// Tries to claim slot at logical position `tail`.
     ///
-    /// The slot is free iff `ready[s] == tail` — i.e. the previous
+    /// The slot is free iff `done[s] == tail` — i.e. the previous
     /// consumer at logical position `tail - cap` released it for us
-    /// (or, for the first lap, this is the slot's initial state).
+    /// (or, for the first lap, this is the slot's initial state, since
+    /// `done[s]` is initialized to `s`).
     fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let pos = self.write_pos.get();
         let s = pos & self.queue.mask;
 
         // SAFETY: `s` is always < cap by construction.
-        let ready = unsafe { self.queue.ready.get_unchecked(s) };
-        if ready.0.load(Ordering::Acquire) != pos {
+        let done = unsafe { self.queue.done.get_unchecked(s) };
+        if done.0.load(Ordering::Acquire) != pos {
             return None;
         }
 
+        // SAFETY: `s` is always < cap by construction.
+        let ready = unsafe { self.queue.ready.get_unchecked(s) };
         // SAFETY: `s` is always < cap by construction.
         let data_ptr = unsafe { self.queue.data.get_unchecked(s) }.get();
 
@@ -108,8 +112,9 @@ impl<T> Producer<T> {
 
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
-        // Wake any consumer spinning on overshoot. Release synchronizes
-        // with consumer's Acquire-load of the closed flag.
+        // Mark the queue closed so consumers spinning on overshoot
+        // can return None. Release synchronizes with consumer's
+        // Acquire-load of the closed flag.
         self.queue.closed.0.store(true, Ordering::Release);
     }
 }
@@ -176,7 +181,8 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        // ready is still `pos` (free) — just roll back the local cursor.
+        // ready was never written; done was unchanged. Just roll back
+        // the local cursor.
         self.write_pos.set(self.pos);
     }
 }
@@ -215,8 +221,10 @@ impl<T> Drop for WrittenSlot<'_, T> {
             unsafe {
                 self.slot_data.cast::<T>().drop_in_place();
             }
-            // Restore ready to "free for producer at this position".
-            self.slot_ready.store(self.pos, Ordering::Release);
+            // Slot freeness is gated by `done`, not `ready`. Since we
+            // never published `ready`, no consumer can claim this slot
+            // — but `done[s]` still says `pos`, which is what producer's
+            // try_claim checks. Roll back the local cursor to retry.
             self.write_pos.set(self.pos);
         }
     }

@@ -11,12 +11,14 @@ use super::RingBuffer;
 /// — each clone shares the same underlying buffer and competes for items
 /// via **fetch-and-add** on the head pointer.
 ///
-/// # Synchronization
+/// # Synchronization (split-plane)
 ///
-/// Consumers use FAA on `head` to claim slots, after a peek at `tail`
-/// confirms data is available. FAA always succeeds, so there is no
-/// consumer-vs-consumer CAS retry storm. Each consumer then waits on
-/// its own (cache-padded) `ready[h]` line for the producer's publish.
+/// The consumer reads `ready[s]` to wait for the producer's publish and
+/// writes `done[s]` to signal slot reuse. These are on **different cache
+/// lines**, so the consumer's release-store does not invalidate the line
+/// the producer needs to write next. The producer reads `done[s]` (a line
+/// last touched by some consumer) and writes `ready[s]` (a line last
+/// touched by itself, so its writes hit M-state without a coherence stall).
 ///
 /// # Overshoot
 ///
@@ -24,8 +26,7 @@ use super::RingBuffer;
 /// in parallel, a consumer may obtain a head ticket `h >= tail`. Since
 /// the queue is lossless, the consumer must wait for the producer to
 /// publish at `h` rather than abandon the ticket. This is bounded by
-/// producer push latency and only occurs under high consumer contention
-/// on a near-empty queue.
+/// producer push latency.
 ///
 /// If the producer is dropped (sets the `closed` flag), consumers
 /// spinning on overshoot return `None` rather than hanging.
@@ -33,10 +34,10 @@ pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Local snapshot of the producer's `tail`. Avoids an Acquire-load
     /// of the producer-write line on every pop; we only re-load when
-    /// our cached value says the queue is empty. The producer's stores
-    /// to `tail` are monotonic, so a stale cached value is always a
-    /// safe under-estimate (we may return `None` when data is actually
-    /// available; the caller's next pop will refresh).
+    /// our cached value says the queue is empty. Monotonic-safe: tail
+    /// only grows, so a stale cached value is always a safe under-
+    /// estimate (we may briefly return `None` when data is actually
+    /// available; the caller's next pop refreshes).
     ///
     /// `Cell` makes Consumer `!Sync` — share via `clone()` instead.
     cached_tail: Cell<usize>,
@@ -51,9 +52,8 @@ impl<T> Clone for Consumer<T> {
     }
 }
 
-// SAFETY: Cell is !Sync, but Consumer is Send (single-threaded use per
-// clone). The raw pointers in returned slot pointers point into the
-// RingBuffer kept alive by the Arc.
+// SAFETY: Cell is !Sync, but Consumer is Send (each clone is single-
+// threaded by contract). The queue Arc keeps the RingBuffer alive.
 unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T> Consumer<T> {
@@ -67,45 +67,25 @@ impl<T> Consumer<T> {
     /// Claims the next slot via FAA on `head`, then waits for the
     /// producer to publish data at the claimed position.
     ///
-    /// Returns `None` only if (a) the queue is observed empty before
-    /// the FAA, or (b) the consumer overshot and the producer is
-    /// closed (gone). Once FAA has been issued and the producer is
-    /// active, the consumer waits for the publish.
-    ///
-    /// # Overshoot recovery
-    ///
-    /// If the consumer FAAs a position `h` past the current `tail`
-    /// (because of racing peeks), it spin-waits on `ready[h] == h+1`.
-    /// In each iteration it also re-checks `closed`; if the producer
-    /// is gone *and* we're still beyond `tail`, the slot will never
-    /// be filled, so we publish a "skip" marker and return `None`.
-    ///
-    /// The skip marker (`ready[s] = h + 1 + cap`) tells any future
-    /// producer-resurrection (impossible here; producer is dropped)
-    /// that the slot was abandoned, but more importantly it marks the
-    /// slot as "consumed" so `RingBuffer::Drop` does not try to drop
-    /// uninitialized data.
+    /// Returns `(data_ptr, done_ptr, h)` on success. Returns `None`
+    /// if the queue was observed empty before the FAA, or if the
+    /// consumer overshot and the producer is closed.
     #[inline]
     fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
         let q = &*self.queue;
         let data = &q.data;
         let ready = &q.ready;
+        let done = &q.done;
         let mask = q.mask;
 
-        // Pre-FAA peek using the cached tail. The cached value is
-        // monotonic-safe: tail only grows, so if cached_tail says
-        // there's data, there really is. If cached_tail says empty,
-        // we refresh from the shared atomic (one Acquire-load) before
-        // returning None.
+        // Pre-FAA peek using the cached tail.
         let head = q.head.load(Ordering::Relaxed);
         let mut tail = self.cached_tail.get();
         if head >= tail {
-            // Cache says empty — refresh from shared `tail`.
             tail = q.tail.load(Ordering::Acquire);
             self.cached_tail.set(tail);
             if head >= tail {
                 if q.closed.0.load(Ordering::Acquire) {
-                    // Producer is gone; one final tail re-check.
                     let tail2 = q.tail.load(Ordering::Acquire);
                     self.cached_tail.set(tail2);
                     let head2 = q.head.load(Ordering::Relaxed);
@@ -123,35 +103,28 @@ impl<T> Consumer<T> {
         let s = h & mask;
         // SAFETY: `s` is always < cap by construction.
         let slot_ready = unsafe { ready.get_unchecked(s) };
+        let slot_done = unsafe { done.get_unchecked(s) };
 
-        // Wait for producer to publish at logical position h.
-        // Common case (we peeked non-empty and h < tail): immediate.
-        // Overshoot case: spin until producer reaches h, OR until producer
-        // is closed and won't reach h.
+        // Wait for the producer to publish at logical position h.
+        // ready[s] == h + 1 means data is there. Common case (we peeked
+        // non-empty and h < tail): immediate. Overshoot case: spin until
+        // producer reaches h, OR until producer is closed and won't.
         let mut backoff = 0u32;
         loop {
-            let r = slot_ready.0.load(Ordering::Acquire);
-            if r == h + 1 {
-                // Data published.
+            if slot_ready.0.load(Ordering::Acquire) == h + 1 {
                 let data_ptr = unsafe { data.get_unchecked(s) }.get().cast_const();
-                return Some((data_ptr, &raw const slot_ready.0, h));
+                return Some((data_ptr, &raw const slot_done.0, h));
             }
 
-            // Not yet ready. Check if producer is gone and won't ever
-            // publish at h.
             if q.closed.0.load(Ordering::Acquire) {
                 let tail_now = q.tail.load(Ordering::Acquire);
                 if h >= tail_now {
-                    // Producer is gone and never reached h. Mark the
-                    // slot as "consumed" for this lap by storing the
-                    // post-consume value, so RingBuffer::Drop and any
-                    // (impossible) future producer see a coherent state.
-                    slot_ready.0.store(h + q.cap, Ordering::Release);
+                    // Producer is gone and never reached h. Mark slot
+                    // consumed via `done` so RingBuffer::Drop sees the
+                    // slot as released (no double-drop, no leak).
+                    slot_done.0.store(h + q.cap, Ordering::Release);
                     return None;
                 }
-                // Otherwise: producer published past h before drop;
-                // ready[s] just hasn't propagated yet — keep spinning,
-                // it's about to land.
             }
 
             crate::common::cas_backoff(&mut backoff);
@@ -159,27 +132,21 @@ impl<T> Consumer<T> {
     }
 
     /// Pops an item from the ring buffer.
-    ///
-    /// Multiple consumers can pop concurrently. Uses FAA on `head` —
-    /// no consumer-vs-consumer CAS contention.
-    ///
-    /// Returns `None` if the queue is empty *and* either the producer
-    /// is currently inactive or has been dropped. May briefly wait
-    /// (microseconds) if a racing peek causes consumer overshoot.
     #[inline]
     #[must_use]
     pub fn pop(&self) -> Option<T> {
-        let (data_ptr, ready_ptr, head) = self.claim_slot()?;
+        let (data_ptr, done_ptr, head) = self.claim_slot()?;
 
         // SAFETY: ready[s] == head+1 was verified, so data is initialized
         // and exclusively ours (FAA gave us a unique head ticket).
         let val = unsafe { data_ptr.cast::<T>().read() };
 
-        // Release: ready[s] = head + cap means "free for producer at
-        // logical position head + cap" (next lap of this slot).
-        // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc.
+        // Release the slot via the consumer-write `done` line. The
+        // producer at logical position head + cap will Acquire-load
+        // done[s] == head + cap and proceed to overwrite the slot.
+        // SAFETY: done_ptr points into the RingBuffer kept alive by Arc.
         unsafe {
-            (*ready_ptr).store(head + self.queue.cap, Ordering::Release);
+            (*done_ptr).store(head + self.queue.cap, Ordering::Release);
         }
 
         Some(val)
@@ -189,11 +156,11 @@ impl<T> Consumer<T> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
-        let (data_ptr, ready_ptr, head) = self.claim_slot()?;
+        let (data_ptr, done_ptr, head) = self.claim_slot()?;
 
         Some(SlotReader {
             data_ptr,
-            ready_ptr,
+            done_ptr,
             head,
             cap: self.queue.cap,
             _consumer: self,
@@ -222,7 +189,7 @@ impl<T> Consumer<T> {
 /// A zero-copy read reference to an item in the ring buffer.
 pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
-    ready_ptr: *const AtomicUsize,
+    done_ptr: *const AtomicUsize,
     head: usize,
     cap: usize,
     _consumer: &'a mut Consumer<T>,
@@ -243,10 +210,10 @@ impl<T> Drop for SlotReader<'_, T> {
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
-        // SAFETY: ready_ptr points into the RingBuffer kept alive by
-        // consumer's Arc.
+        // Release via the `done` line. SAFETY: done_ptr points into the
+        // RingBuffer kept alive by consumer's Arc.
         unsafe {
-            (*self.ready_ptr).store(self.head + self.cap, Ordering::Release);
+            (*self.done_ptr).store(self.head + self.cap, Ordering::Release);
         }
     }
 }
