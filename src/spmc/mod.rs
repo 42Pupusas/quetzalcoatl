@@ -33,11 +33,11 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
-use crate::common::{AlignedBuf, CachePadded, SeqSlot};
+use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A lock-free SPMC ring buffer.
@@ -45,21 +45,44 @@ use std::sync::Arc;
 /// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
 /// a [`Producer`] / [`Consumer`] pair. The `Consumer` is [`Clone`]; the
 /// `Producer` is not (single-producer).
-// repr(C) locks field order: shared immutable fields first (same cache
-// line), then head and tail each on their own cache-padded line.
+///
+/// # Layout
+///
+/// Data and per-slot readiness markers live in **separate arrays**. Data
+/// is packed (one element per slot, no padding); the readiness array is
+/// cache-line padded so a consumer's release-store on slot `s` does not
+/// invalidate the producer's lines for adjacent slots.
+///
+/// # Synchronization
+///
+/// Each slot `s` has a paired `ready[s]: AtomicUsize` whose value encodes
+/// the slot's logical position:
+///
+/// * `ready[s] == p`     → free for producer at position `p`
+///   (initial: `ready[s] = s`)
+/// * `ready[s] == p + 1` → contains data from position `p`, ready for
+///   consumer at position `p`
+///
+/// The producer never reads `head`; consumers never read `tail`. The
+/// only producer↔consumer handoff is the per-slot `ready` marker.
 #[repr(C)]
 pub struct RingBuffer<T> {
-    pub(crate) buf: AlignedBuf<SeqSlot<T>>,
+    pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
+    pub(crate) ready: AlignedBuf<CachePadded<AtomicUsize>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
+    /// Producer cursor, published Release. Consumers Acquire-load it
+    /// during the pre-FAA peek to determine whether data is available.
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// Set by `Producer::Drop` so that consumers spinning on overshoot
+    /// can return `None` instead of hanging when the producer is gone.
+    pub(crate) closed: CachePadded<AtomicBool>,
 }
 
-// Safety: Single producer advances tail and writes to slots guarded by
-// sequence numbers. Multiple consumers use CAS on head to claim slots.
-// Sequence numbers ensure proper synchronization between producer and
-// consumers.
+// Safety: Single producer writes to slot data, gated by per-slot `ready`
+// markers. Multiple consumers CAS on `head` to claim slots and synchronize
+// with the producer via Acquire/Release on `ready`.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
@@ -68,20 +91,21 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
+        let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
         let mut idx = 0usize;
-        let buf = AlignedBuf::new_with(cap, || {
-            let slot = SeqSlot {
-                data: UnsafeCell::new(MaybeUninit::uninit()),
-                sequence: AtomicUsize::new(idx * 2),
-            };
+        let ready = AlignedBuf::new_with(cap, || {
+            // Initial: slot `s` is free for the producer at position `s`.
+            let r = CachePadded(AtomicUsize::new(idx));
             idx += 1;
-            slot
+            r
         });
 
         Self {
-            buf,
+            data,
+            ready,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
+            closed: CachePadded(AtomicBool::new(false)),
             cap,
             mask: capacity.mask,
         }
@@ -119,7 +143,7 @@ impl<T> RingBuffer<T> {
             queue: arc.clone(),
             write_pos: std::cell::Cell::new(0),
         };
-        let consumer = Consumer { queue: arc };
+        let consumer = Consumer::new(arc);
         (producer, consumer)
     }
 }
@@ -128,11 +152,24 @@ impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();
         let tail = *self.tail.0.get_mut();
+        // With FAA-based consumers, `head` can transiently exceed
+        // `tail` if consumers overshot (abandoned slots). The actual
+        // live-data range is positions `pos in head..tail` whose slot
+        // has `ready[s] == pos + 1` (i.e. producer published, consumer
+        // hasn't claimed). Slots with any other `ready` value are
+        // either consumed (`pos + cap`) or not yet published.
+        if head >= tail {
+            return;
+        }
         for pos in head..tail {
-            let slot = &self.buf[pos & self.mask];
-            // SAFETY: slots between head and tail contain initialized data.
-            unsafe {
-                slot.data.get().cast::<T>().drop_in_place();
+            let s = pos & self.mask;
+            let r = *self.ready[s].0.get_mut();
+            if r == pos + 1 {
+                // SAFETY: ready == pos+1 means producer published and
+                // no consumer has claimed; data is initialized.
+                unsafe {
+                    self.data[s].get().cast::<T>().drop_in_place();
+                }
             }
         }
     }

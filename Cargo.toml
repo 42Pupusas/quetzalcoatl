@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "fanin"
 harness = false
+
+[[bench]]
+name = "spmc"
+harness = false
