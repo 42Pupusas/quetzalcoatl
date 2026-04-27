@@ -81,8 +81,21 @@ use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
+
+/// Number of producer park slots. Each producer takes a stable
+/// slot index (modulo this) at clone time; bit `i` of `wake_state`
+/// signals "producer in slot `i` is parked."
+///
+/// 64 fits a single `AtomicU64` for the wake bitmap, capping the
+/// number of distinct concurrently-parking producers we can wake
+/// individually. Beyond 64 producers, slot indices alias and a
+/// wake on bit `i` rouses every producer mapped to `i` (correct
+/// but slightly wasteful).
+pub(crate) const PARK_SLOTS: usize = 64;
+pub(crate) const PARK_MASK: usize = PARK_SLOTS - 1;
 
 #[repr(C)]
 pub struct RingBuffer<T> {
@@ -124,6 +137,36 @@ pub struct RingBuffer<T> {
     /// affect the hot path.
     pub(crate) clone_counter: CachePadded<AtomicUsize>,
     pub(crate) closed: CachePadded<AtomicBool>,
+    /// Futex-style wake bitmap: bit `i` set ↔ producer in park slot
+    /// `i` is currently parked, awaiting a `done[s]` release.
+    ///
+    /// Producer parks: `parkers[i] = thread_handle`; then
+    /// `wake_state.fetch_or(1 << i, SeqCst)`; then re-check `done`;
+    /// then `park`.
+    /// Consumer wakes: after `done[s].store(Release)`, load
+    /// `wake_state` (Relaxed). If non-zero, pick a set bit, atomic
+    /// `fetch_and(!(1 << i))` to claim it; if our `fetch_and`
+    /// actually cleared the bit, read `parkers[i]` and `unpark`.
+    ///
+    /// Single 64-bit line — far cheaper than walking a parker
+    /// pointer ring on every pop.
+    pub(crate) wake_state: CachePadded<AtomicU64>,
+    /// Stable per-park-slot `Thread` handle storage. Producer at
+    /// slot `i` initializes its handle here on first park; the
+    /// handle stays for the lifetime of the queue (idempotent
+    /// `OnceLock::set`). Consumers obtain a `&Thread` reference
+    /// via `OnceLock::get`, valid for as long as `&self` (i.e.
+    /// the queue) is live — no raw pointers, no manual lifetime
+    /// reasoning.
+    ///
+    /// Slot aliasing (when more than `PARK_SLOTS` producers ever
+    /// existed) means the `OnceLock` is set by the first producer
+    /// to claim that slot, and subsequent producers' `set()`
+    /// calls return `Err` and are no-ops. A wake on a shared bit
+    /// then `unpark`s the first installer — possibly the wrong
+    /// producer (false wake — benign; the woken producer just
+    /// re-checks and re-parks).
+    pub(crate) parkers: AlignedBuf<OnceLock<Thread>>,
 }
 
 // SAFETY: All shared state is atomic; per-slot CAS gives unique
@@ -172,6 +215,8 @@ impl<T> RingBuffer<T> {
             closed: CachePadded(AtomicBool::new(false)),
             cap,
             mask: capacity.mask,
+            wake_state: CachePadded(AtomicU64::new(0)),
+            parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
         }
     }
 
@@ -269,7 +314,46 @@ impl<T> Drop for RingBuffer<T> {
             }
             // state == 0 → free, no live data.
         }
+
+        // OnceLock<Thread> in `parkers` cleans itself up — no
+        // manual reclamation needed.
     }
+}
+
+/// Wakes one parked producer (if any).
+///
+/// Reads `wake_state`, picks a set bit, atomically clears it, and
+/// `unpark`s the corresponding `parkers[i]` thread. Caller MUST
+/// gate this on `wake_state.load(Relaxed) != 0` so the no-park-no-cost
+/// fast path stays cheap.
+///
+/// Concurrent consumers racing on the same set bit: only one's
+/// `fetch_and` actually clears the bit (the other sees the bit
+/// already clear in the returned old value). The winner unparks;
+/// losers do nothing.
+#[inline]
+pub(crate) fn wake_one_parked<T>(q: &RingBuffer<T>) {
+    let ws = q.wake_state.load(Ordering::Relaxed);
+    if ws == 0 {
+        return;
+    }
+    // Pick the lowest set bit. Doesn't matter which — every bit
+    // represents an interchangeable parked producer.
+    let bit = ws.trailing_zeros();
+    let mask = 1u64 << bit;
+    // Atomic clear: only one consumer wins per bit. `prev & mask`
+    // tells us if WE cleared it.
+    let prev = q.wake_state.fetch_and(!mask, Ordering::Relaxed);
+    if prev & mask == 0 {
+        // Some other consumer beat us to it; nothing to do.
+        return;
+    }
+    if let Some(handle) = q.parkers[bit as usize].get() {
+        handle.unpark();
+    }
+    // None case: producer set its wake bit before installing its
+    // handle. Benign — that producer's own re-check after install
+    // will catch the missed wake.
 }
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
-use super::RingBuffer;
+use super::{RingBuffer, PARK_MASK};
 
 /// Maximum positions reserved per FAA on the shared `claim` cursor.
 /// Larger = fewer cacheline transfers on the contended `claim` line,
@@ -54,16 +55,27 @@ pub struct Producer<T> {
     /// Tracked for diagnostics; the live state of the batch is in
     /// `batch_unused`.
     batch_size: Cell<u32>,
+    /// Park slot index in `RingBuffer::wake_state` / `parkers`.
+    /// Stable for this producer's lifetime — assigned at clone time
+    /// from the queue's `clone_counter`. Beyond `PARK_SLOTS = 64`
+    /// producers, slots alias and a wake on the shared bit rouses
+    /// every producer mapped there (correct, slightly wasteful).
+    park_slot: usize,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
-        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        let n = self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             batch_start: Cell::new(0),
             batch_unused: Cell::new(0),
             batch_size: Cell::new(0),
+            // Each clone gets its own park slot. `producer_count`
+            // is monotonically incremented at clone time and never
+            // decremented, so successive clones get distinct
+            // values; mod PARK_SLOTS keeps it within the bitmap.
+            park_slot: (n + 1) & PARK_MASK,
         }
     }
 }
@@ -79,6 +91,8 @@ impl<T> Producer<T> {
             batch_start: Cell::new(0),
             batch_unused: Cell::new(0),
             batch_size: Cell::new(0),
+            // The original Producer (made by split()) owns slot 0.
+            park_slot: 0,
         }
     }
 
@@ -174,16 +188,104 @@ impl<T> Producer<T> {
         }
 
         if !found_ready {
-            // No ready slot anywhere; keep spinning on the primary
-            // with exponential backoff.
-            let done = q.done_slot(primary_pos);
+            // No slot in the batch is ready. Park-with-rescan on
+            // the futex-style wake bitmap: on each pass, re-check
+            // every unused bit in the batch (any consumer release
+            // unblocks any of them); if still no luck, set our
+            // wake_state bit and park.
+            //
+            // Why park: under p+q saturating the CPU (e.g. p=q=8
+            // on 16 logical cores), pure spin loops steal SMT
+            // decode bandwidth from the very consumers we're
+            // waiting on. Park lets the kernel hand the core to
+            // the consumer immediately.
+            //
+            // Why rescan-all: any slot in our batch is an
+            // interchangeable publish target — whichever consumer
+            // releases first wins. Sticking on the primary alone
+            // wastes producer time when sibling slots free up
+            // first.
+            //
+            // Missed-wake protection: we set the wake_state bit
+            // BEFORE re-checking `done[s]` (with SeqCst pairing
+            // against the consumer's done-store + wake_state load).
+            // If a consumer signaled between our last check and
+            // bit-set, the consumer's load sees our bit and
+            // unparks us; if not, we see done released here and
+            // skip the park. A 200μs timeout backstop covers any
+            // edge case.
             let mut backoff = 0u32;
-            while done.load(Ordering::Acquire) != primary_pos {
-                crate::common::cas_backoff(&mut backoff);
+            // Lazily install our park handle on first park (kept
+            // for the producer's lifetime, dropped in RingBuffer
+            // ::drop).
+            ensure_handle_installed(q, self.park_slot);
+            let bit_mask = 1u64 << self.park_slot;
+
+            'outer: loop {
+                // Cheap rescan first — short-circuit before any
+                // park machinery if anything is ready.
+                let mut bits = unused;
+                while bits != 0 {
+                    let b = bits.trailing_zeros();
+                    let p = start + b as usize;
+                    if q.done_slot(p).load(Ordering::Acquire) == p {
+                        bit = b;
+                        pos = p;
+                        break 'outer;
+                    }
+                    bits &= bits - 1;
+                }
+                // Spin-with-backoff before paying for the park
+                // round-trip. cas_backoff saturates at f=12; we
+                // park only once it has fully escalated (yields
+                // included), meaning we've already waited ~tens
+                // of microseconds and the kernel has had a chance
+                // to reschedule. At that point a futex round-trip
+                // (1-2μs) is amortized.
+                if backoff < 12 {
+                    crate::common::cas_backoff(&mut backoff);
+                    continue;
+                }
+
+                // Set our wake bit (SeqCst gives the StoreLoad
+                // barrier needed against consumers' done-store +
+                // wake_state load; either we see done released in
+                // the re-check below, or they see our bit).
+                q.wake_state.fetch_or(bit_mask, Ordering::SeqCst);
+
+                // Re-check `done[s]` for all unused bits. If
+                // ready now, retract our wake bit and proceed.
+                let mut bits = unused;
+                let mut found = None;
+                while bits != 0 {
+                    let b = bits.trailing_zeros();
+                    let p = start + b as usize;
+                    if q.done_slot(p).load(Ordering::Acquire) == p {
+                        found = Some((b, p));
+                        break;
+                    }
+                    bits &= bits - 1;
+                }
+                if let Some((b, p)) = found {
+                    q.wake_state.fetch_and(!bit_mask, Ordering::Relaxed);
+                    bit = b;
+                    pos = p;
+                    break 'outer;
+                }
+
+                // Park with a 200μs safety-net timeout. Even if a
+                // wake is somehow lost (impossible with the SeqCst
+                // pairing above, but defensive against future
+                // refactors), the timeout caps wait latency.
+                std::thread::park_timeout(Duration::from_micros(200));
+
+                // Clear our bit on wake. Either consumer cleared
+                // it when waking us (fetch_and returns prev with
+                // bit clear) or we clear it ourselves (timeout
+                // path); both are safe.
+                q.wake_state.fetch_and(!bit_mask, Ordering::Relaxed);
+                // Loop and re-check.
             }
-            // Use the primary.
-            bit = primary_bit;
-            pos = primary_pos;
         }
 
         // Clear the chosen bit — this position is now consumed-by-us.
@@ -237,6 +339,38 @@ impl<T> Drop for Producer<T> {
 
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.queue.closed.0.store(true, Ordering::Release);
+            // Wake any siblings still parked in their push slow
+            // path so they can observe `closed` and exit cleanly.
+            // Cheap — only runs at the last-producer drop.
+            let ws = self.queue.wake_state.swap(0, Ordering::AcqRel);
+            let mut bits = ws;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                if let Some(handle) = self.queue.parkers[b].get() {
+                    handle.unpark();
+                }
+                bits &= bits - 1;
+            }
         }
     }
+}
+
+/// Install this producer's `Thread` handle in `q.parkers[slot]` if
+/// it isn't there yet. The handle is set once (idempotent
+/// `OnceLock::set`) and stays for the lifetime of the queue;
+/// consumers obtain `&Thread` references via `OnceLock::get`,
+/// avoiding any unsafe pointer plumbing.
+///
+/// First-park-only: subsequent calls (by this or any other
+/// producer mapped to the same slot) observe `OnceLock` already
+/// initialized and no-op. With more than `PARK_SLOTS` producers,
+/// slot aliasing means a wake unparks the *first installer* — a
+/// possibly-wrong producer for the wakeup, which is a benign
+/// false wake (the woken producer just re-checks and re-parks).
+#[inline]
+fn ensure_handle_installed<T>(q: &RingBuffer<T>, slot: usize) {
+    // OnceLock::set is itself idempotent and atomic; calling it
+    // unconditionally is fine. The Err return on already-set is
+    // discarded.
+    let _ = q.parkers[slot].set(std::thread::current());
 }

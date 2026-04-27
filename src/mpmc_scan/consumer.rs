@@ -155,6 +155,15 @@ impl<T> Consumer<T> {
                     // Release: done[s] = round_pos + cap → "free for
                     // the next round at logical pos round_pos + cap."
                     q.done_slot(scan).store(round_pos + cap, Ordering::Release);
+                    // Wake one parked producer if any. Single
+                    // u64 load on the fast path — Relaxed is OK
+                    // because any missed wake is bounded by the
+                    // producer's 200μs park timeout, while a
+                    // SeqCst load here would cost a full barrier
+                    // per pop and tank low-contention throughput.
+                    if q.wake_state.load(Ordering::Relaxed) != 0 {
+                        super::wake_one_parked(q);
+                    }
                     // Advance scan to just past the consumed slot's
                     // round. We use round_pos + 1 (rather than
                     // scan + 1) so a successful claim of a "future"
