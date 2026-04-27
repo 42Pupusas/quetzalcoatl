@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-27
+
 ### Changed
+- **SPMC layout**: data and per-slot synchronization markers now live
+  in separate cache-padded arrays (struct-of-arrays). The producer's
+  `ready[s]` write and the consumer's `done[s]` write target distinct
+  cache lines, eliminating the symmetric producer↔consumer ping-pong
+  on the readiness array.
 - **SPMC consumer**: replaced per-pop `head.fetch_add(1)` with batched
   bounded-CAS claim. Consumers reserve up to `BATCH_SIZE = 32` positions
   in a single CAS bounded by the producer's `tail`, then drain locally
@@ -25,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped, letting workers exit cleanly when the queue drains. Used in
   the example/bench harnesses in place of the prior shared-counter
   termination scheme.
+- `bench_slow_work_scaling` and `bench_burst_producer_slow_work` in
+  `benches/spmc.rs` — exercise the consumer claim path under
+  ~50µs/item synthetic work modelling realistic consumer pools (e.g.
+  signature verification). Confirms the bounded-CAS clamp `take =
+  min(BATCH_SIZE, tail - head)` prevents monopoly windows from forming
+  when the queue is shallow; SPMC tracks N×SPSC round-robin within
+  ~5–15% across burst sizes 8, 32, 64 and consumer counts 1–8 under
+  layout-fair conditions.
 
 ## [0.1.0] - 2024-02-05
 
@@ -55,5 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.6.0...v0.7.0
 [0.1.0]: https://github.com/42Pupusas/quetzalcoatl/releases/tag/v0.1.0
