@@ -594,4 +594,31 @@ mod tests {
 
         handle.join().unwrap();
     }
+
+    /// Capacity-1 with concurrent producer/consumer threads. Tightest
+    /// possible synchronization — every push must wait for every pop.
+    #[test]
+    fn capacity_one_concurrent() {
+        let n = 8u64;
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1)).split();
+
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut got = Vec::new();
+        while got.len() < n as usize {
+            if let Some(v) = consumer.pop() {
+                got.push(v);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        h.join().unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
 }

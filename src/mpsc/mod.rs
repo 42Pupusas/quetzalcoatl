@@ -857,4 +857,120 @@ mod tests {
 
         handle.join().unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Audit gap scenarios (Miri-friendly)
+    // -----------------------------------------------------------------------
+
+    /// `RingBuffer::Drop` walks `head..tail` and drops only slots whose
+    /// sequence is the published value. Verifies that interleaving real
+    /// pushes with abandoned reservations doesn't double-drop or skip.
+    #[test]
+    fn drop_skips_tombstoned_slots() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (mut producer, _consumer) =
+                RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+
+            // Reserve + drop without commit → tombstone, no value
+            {
+                let _w = producer.reserve().unwrap();
+            }
+
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+
+            // Reserve + write but no commit → value dropped now,
+            // slot tombstoned
+            {
+                let w = producer.reserve().unwrap();
+                w.write(DropCounter {
+                    counter: counter.clone(),
+                });
+            }
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "WrittenSlot::Drop runs immediately"
+            );
+        }
+        // Consumer's Drop drains via pop, walking past the tombstones
+        // and dropping 2 published values.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "1 in-flight + 2 published = 3 drops"
+        );
+    }
+
+    /// Concurrent multi-producer + drain consumer at small N (Miri-tractable).
+    #[test]
+    fn concurrent_drain_small_n() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let n_per = 4u64;
+        let n_producers = 2u64;
+
+        let handles: Vec<_> = (0..n_producers)
+            .map(|tid| {
+                let p = producer.clone();
+                std::thread::spawn(move || {
+                    for i in 0..n_per {
+                        while p.push(tid * n_per + i).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut received = 0u64;
+        let total = n_per * n_producers;
+        while received < total {
+            let drained = consumer.drain(|_| {});
+            if drained > 0 {
+                received += drained as u64;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received, total);
+    }
+
+    /// Capacity-1 with concurrent producer/consumer.
+    #[test]
+    fn capacity_one_concurrent() {
+        let n = 8u64;
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1)).split();
+
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut got = Vec::new();
+        while got.len() < n as usize {
+            if let Some(v) = consumer.pop() {
+                got.push(v);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        h.join().unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
 }

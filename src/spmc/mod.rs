@@ -856,4 +856,144 @@ mod tests {
 
         handle.join().unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // Audit gap scenarios (small-N, Miri-friendly)
+    // -----------------------------------------------------------------------
+
+    /// Producer drop sets `closed`; consumer drains then sees None and
+    /// `is_closed() == true`. Exercises the closed-flag synchronization edge.
+    #[test]
+    fn producer_drop_marks_closed_after_drain() {
+        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        for i in 0..3 {
+            producer.push(i).unwrap();
+        }
+        drop(producer);
+
+        assert!(consumer.is_closed());
+
+        let mut got = Vec::new();
+        while let Some(v) = consumer.pop() {
+            got.push(v);
+        }
+        assert_eq!(got, vec![0, 1, 2]);
+        assert!(consumer.is_closed());
+        assert_eq!(consumer.pop(), None);
+    }
+
+    /// Consumer dropped mid-batch must release `done` so a subsequent
+    /// producer push at the same slot succeeds. Without proper Drop, the
+    /// producer would stall forever.
+    #[test]
+    fn consumer_drop_mid_batch_releases_done() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cap = 4;
+        let (producer, consumer) = RingBuffer::new(Capacity::exact(cap)).split();
+
+        // Fill the buffer.
+        for _ in 0..cap {
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+        }
+
+        // Pop one item, claiming a batch of size cap. The consumer's
+        // private cursor now sits mid-batch; positions [1, cap) are
+        // claimed-but-unread.
+        let v = consumer.pop().unwrap();
+        drop(v);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the popped item should be dropped"
+        );
+
+        // Drop the consumer mid-batch: must drop the unread items AND
+        // release each `done[s] = pos + cap` so the producer can reuse.
+        drop(consumer);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            cap,
+            "all unread items in the batch must be dropped"
+        );
+
+        // Producer can now push `cap` more items into the released slots.
+        for _ in 0..cap {
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+        }
+
+        // Cleanup: drop producer + ringbuffer drops the new cap items.
+        drop(producer);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            cap * 2,
+            "all items ever pushed should be dropped exactly once"
+        );
+    }
+
+    /// Capacity-1 with concurrent producer/consumer threads. Tightest
+    /// possible synchronization — every push must wait for every pop.
+    #[test]
+    fn capacity_one_concurrent() {
+        let n = 8u64;
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(1)).split();
+
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut got = Vec::new();
+        while got.len() < n as usize {
+            if let Some(v) = consumer.pop() {
+                got.push(v);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        h.join().unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    /// ZST that has Drop glue. ZSTs use a dangling pointer in AlignedBuf;
+    /// Drop must still run for each slot.
+    #[test]
+    fn zst_with_drop_glue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Debug)]
+        struct RealZst;
+        impl Drop for RealZst {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(std::mem::size_of::<RealZst>(), 0);
+
+        DROPS.store(0, Ordering::Relaxed);
+        {
+            let (producer, consumer) = RingBuffer::<RealZst>::new(Capacity::exact(4)).split();
+            for _ in 0..4 {
+                producer.push(RealZst).unwrap();
+            }
+            drop(consumer.pop().unwrap());
+            drop(consumer.pop().unwrap());
+            assert_eq!(DROPS.load(Ordering::Relaxed), 2);
+            // RingBuffer::Drop drops the remaining 2
+            drop(consumer);
+            drop(producer);
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), 4);
+    }
 }

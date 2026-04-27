@@ -958,4 +958,115 @@ mod tests {
         // RingBuffer dropped — the Arc in the slot is released, dropping the DropCounter
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Audit gap scenarios (Miri-friendly)
+    // -----------------------------------------------------------------------
+
+    /// Holding a `SlotReader` blocks the producer's overwrite via `min_head`.
+    /// This exercises the liveness contract: as long as a reader exists,
+    /// the producer cannot reclaim that slot, so a fill-then-push fails.
+    #[test]
+    fn pop_ref_blocks_producer_overwrite() {
+        let cap = 4;
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(cap), 4).split();
+
+        for i in 0..cap as u32 {
+            producer.push(i).unwrap();
+        }
+        assert!(producer.push(99).is_err(), "buffer is full");
+
+        // Hold the first item via pop_ref — consumer's head does NOT
+        // advance until the reader drops.
+        let reader = consumer.pop_ref().unwrap();
+        assert_eq!(*reader, 0);
+
+        // Producer still cannot push: this consumer's head is at 0,
+        // so min_head == 0 and the buffer appears full.
+        assert!(
+            producer.push(99).is_err(),
+            "producer must be blocked while a reader holds slot 0"
+        );
+
+        // Drop the reader → consumer head advances → producer can push.
+        drop(reader);
+        assert!(producer.push(99).is_ok());
+
+        let _ = consumer.pop().unwrap(); // 1
+        let _ = consumer.pop().unwrap(); // 2
+        let _ = consumer.pop().unwrap(); // 3
+        assert_eq!(consumer.pop(), Some(99));
+    }
+
+    /// `RingBuffer::Drop` must drop only slots whose sequence number
+    /// indicates real published data — not tombstones.
+    #[test]
+    fn drop_skips_tombstoned_slots() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let (mut producer, _consumer) =
+                RingBuffer::<DropCounter>::new(Capacity::exact(4), 4).split();
+
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+
+            // Reserve + drop without commit → tombstone (no value to drop)
+            {
+                let _w = producer.reserve().unwrap();
+            }
+
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+
+            // Reserve + write but no commit → WrittenSlot::Drop drops
+            // the value immediately and tombstones the slot.
+            {
+                let w = producer.reserve().unwrap();
+                w.write(DropCounter {
+                    counter: counter.clone(),
+                });
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+            // Drop the RingBuffer: must drop the 2 published values
+            // (positions 0 and 2), skip the 2 tombstoned slots.
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            3,
+            "1 in-flight + 2 still-published = 3 total drops"
+        );
+    }
+
+    /// Capacity-1 broadcast with a producer thread + consumer thread.
+    #[test]
+    fn capacity_one_concurrent() {
+        let n = 8u32;
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(1), 4).split();
+
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut got = Vec::new();
+        while got.len() < n as usize {
+            if let Some(v) = consumer.pop() {
+                got.push(v);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        h.join().unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
 }
