@@ -26,24 +26,31 @@ pub struct Consumer<T> {
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
+        // Stagger this consumer's starting scan position by one
+        // cap-fraction per clone. With N consumers, this distributes
+        // them at offsets 0, cap/N, 2*cap/N, ... so they scan
+        // different regions of the ring on the first pop instead of
+        // all racing slot 0.
+        //
+        // Safety: each consumer's pop walks `cap` slot indices per
+        // call, so any starting position visits the whole ring within
+        // one pop — orphan slots can't be stranded by the offset.
+        let n = self
+            .queue
+            .clone_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        // Spread across the ring assuming ≤ 8 typical consumers.
+        // With more consumers, the modulo wraps and pairs of
+        // consumers share a starting region — but they still diverge
+        // over time as each advances locally. Using `cap / 8` is a
+        // compromise: large enough that small consumer counts get
+        // wide separation, small enough that 16-32 consumers don't
+        // need to wrap immediately.
+        let stagger = (n * (self.queue.cap / 8).max(1)) & self.queue.mask;
         Self {
             queue: Arc::clone(&self.queue),
-            // New consumer starts scanning from 0 (logical position).
-            // We previously tried `claim` (most recent producer
-            // cursor) to stagger consumers, but that creates a fatal
-            // hazard: if any slot's previous round was published but
-            // never claimed (because all existing consumers had
-            // already scanned past it), the new consumer starting at
-            // `claim` *also* skips it, and the slot becomes
-            // permanently stranded — the next-round producer waits on
-            // `done[s] == pos` forever.
-            //
-            // Starting at 0 means the new consumer scans through the
-            // whole ring once (cheap: at most `cap` slot reads with no
-            // contention — most slots are claimed-state and skipped
-            // instantly), picking up any orphans, then naturally
-            // drifts forward. The cost is paid once per Clone.
-            next_scan: Cell::new(0),
+            next_scan: Cell::new(stagger),
         }
     }
 }

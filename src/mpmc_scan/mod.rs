@@ -105,6 +105,12 @@ pub struct RingBuffer<T> {
     pub(crate) claim: CachePadded<AtomicUsize>,
     /// Number of live producers; last-drop sets `closed`.
     pub(crate) producer_count: CachePadded<AtomicUsize>,
+    /// Monotonic counter incremented on each Consumer clone. Each
+    /// new consumer derives a starting `next_scan` offset from this
+    /// to spread consumers across the ring instead of stacking them
+    /// all at scan=0. Touched only at clone time, so it doesn't
+    /// affect the hot path.
+    pub(crate) clone_counter: CachePadded<AtomicUsize>,
     pub(crate) closed: CachePadded<AtomicBool>,
 }
 
@@ -149,6 +155,7 @@ impl<T> RingBuffer<T> {
             done,
             claim: CachePadded(AtomicUsize::new(0)),
             producer_count: CachePadded(AtomicUsize::new(1)),
+            clone_counter: CachePadded(AtomicUsize::new(0)),
             closed: CachePadded(AtomicBool::new(false)),
             cap,
             mask: capacity.mask,
