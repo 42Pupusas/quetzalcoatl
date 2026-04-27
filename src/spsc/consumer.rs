@@ -48,12 +48,9 @@ impl<T> Consumer<T> {
             return None;
         }
 
-        // SAFETY: `head & mask` is always < cap by construction.
-        // The producer has written this slot and advanced tail with Release,
-        // which we synchronized with via Acquire in `available`.
-        let val = unsafe {
-            (*(*self.queue.buf.get_unchecked(head & self.queue.mask)).get()).assume_init_read()
-        };
+        // SAFETY: producer wrote this slot and advanced tail with Release,
+        // synchronized with our Acquire in `available`.
+        let val = unsafe { (*self.queue.slot(head).get()).assume_init_read() };
 
         // Release: ensures the read above completes before head advances,
         // signaling to the producer that the slot is free.
@@ -78,13 +75,9 @@ impl<T> Consumer<T> {
             return None;
         }
 
-        // SAFETY: `head & mask` is always < cap. Data is initialized
-        // because tail has advanced past this slot (synchronized via Acquire).
-        let data_ptr = unsafe {
-            (*self.queue.buf.get_unchecked(head & self.queue.mask))
-                .get()
-                .cast_const()
-        };
+        // Data is initialized — tail advanced past this slot, synchronized
+        // via Acquire in `available`.
+        let data_ptr = self.queue.slot(head).get().cast_const();
 
         Some(SlotReader {
             data_ptr,

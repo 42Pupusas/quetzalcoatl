@@ -187,13 +187,11 @@ impl<T> Consumer<T> {
     fn bind_pos(
         &self,
         h: usize,
-        mask: usize,
+        _mask: usize,
     ) -> (*const MaybeUninit<T>, *const AtomicUsize, usize) {
         let q = &*self.queue;
-        let s = h & mask;
-        // SAFETY: `s` is always < cap by construction.
-        let data_ptr = unsafe { q.data.get_unchecked(s) }.get().cast_const();
-        let slot_done = unsafe { q.done.get_unchecked(s) };
+        let data_ptr = q.data_slot(h).get().cast_const();
+        let slot_done = q.done_slot(h);
         (data_ptr, &raw const slot_done.0, h)
     }
 
@@ -271,25 +269,17 @@ impl<T> Drop for Consumer<T> {
         // Each unconsumed slot has live data (producer published before
         // we claimed via bounded CAS), so we must drop the value too.
         let q = &*self.queue;
-        let mask = q.mask;
         let cap = q.cap;
         let next = self.batch_next.get();
         let end = self.batch_end.get();
         for pos in next..end {
-            let s = pos & mask;
             // SAFETY: bounded CAS guaranteed pos < tail at claim time, so
             // `ready[s] == pos+1` is observable and data is initialized.
             // We are the unique owner of this position.
             unsafe {
-                q.data.get_unchecked(s).get().cast::<T>().drop_in_place();
+                q.data_slot(pos).get().cast::<T>().drop_in_place();
             }
-            // SAFETY: `s` < cap.
-            unsafe {
-                q.done
-                    .get_unchecked(s)
-                    .0
-                    .store(pos + cap, Ordering::Release);
-            }
+            q.done_slot(pos).0.store(pos + cap, Ordering::Release);
         }
     }
 }

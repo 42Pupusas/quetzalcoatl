@@ -51,8 +51,7 @@ impl<T> Producer<T> {
         // try, eliminating inter-producer cache-line contention entirely.
         let pos = self.queue.tail.fetch_add(1, Ordering::Relaxed);
 
-        // SAFETY: `pos & mask` is always < cap by construction.
-        let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
+        let slot = self.queue.slot(pos);
 
         // Wait for all consumers to advance past the slot's previous
         // occupant (pos - cap). Each producer spins on min_head — no

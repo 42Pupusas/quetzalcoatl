@@ -64,11 +64,9 @@ impl<T> Producer<T> {
             return Err(val);
         };
 
-        // SAFETY: Single producer owns this slot. `pos & mask` < cap.
+        // SAFETY: Single producer owns this slot — no aliasing.
         unsafe {
-            (*self.queue.buf.get_unchecked(pos & self.queue.mask))
-                .get()
-                .write(MaybeUninit::new(val));
+            self.queue.slot(pos).get().write(MaybeUninit::new(val));
         }
 
         // Release: ensures the data write above is visible before tail advances.
@@ -90,12 +88,7 @@ impl<T> Producer<T> {
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         let pos = self.try_claim()?;
 
-        // SAFETY: Single producer owns this slot. `pos & mask` < cap.
-        let slot_data = unsafe {
-            (*self.queue.buf.get_unchecked(pos & self.queue.mask))
-                .get()
-                .cast::<MaybeUninit<T>>()
-        };
+        let slot_data = self.queue.slot(pos).get().cast::<MaybeUninit<T>>();
 
         Some(SlotWriter {
             slot_data,

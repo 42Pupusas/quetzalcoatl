@@ -100,6 +100,20 @@ impl<T> RingBuffer<T> {
         self.len() == self.cap
     }
 
+    /// Returns a reference to the slot at logical position `pos`.
+    ///
+    /// Single point of unsafety: `pos & mask` is always `< cap == buf.len()`
+    /// because `mask = cap - 1` and `cap` is a power of two. Hinting this
+    /// to the optimizer lets safe indexing compile to the same code as
+    /// `get_unchecked`, while keeping every call site in safe Rust.
+    #[inline]
+    pub(crate) fn slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
+        let idx = pos & self.mask;
+        // SAFETY: mask = cap - 1, cap = buf.len(), so idx < buf.len().
+        unsafe { std::hint::assert_unchecked(idx < self.buf.len()) };
+        &self.buf[idx]
+    }
+
     /// Splits the ring buffer into a [`Producer`] and [`Consumer`] pair.
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {

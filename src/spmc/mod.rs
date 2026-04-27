@@ -185,6 +185,37 @@ impl<T> RingBuffer<T> {
         self.len() == self.cap
     }
 
+    /// Returns a reference to the data slot at logical position `pos`.
+    ///
+    /// Single point of unsafety for indexing: `pos & mask < cap == buf.len()`
+    /// because `mask = cap - 1`. The three per-slot arrays (`data`, `ready`,
+    /// `done`) all have length `cap`, so the same index is valid for each.
+    #[inline]
+    pub(crate) fn data_slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
+        let idx = pos & self.mask;
+        // SAFETY: mask = cap - 1, cap = data.len(), so idx < data.len().
+        unsafe { std::hint::assert_unchecked(idx < self.data.len()) };
+        &self.data[idx]
+    }
+
+    /// Returns a reference to the ready marker at logical position `pos`.
+    #[inline]
+    pub(crate) fn ready_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
+        let idx = pos & self.mask;
+        // SAFETY: mask = cap - 1, cap = ready.len(), so idx < ready.len().
+        unsafe { std::hint::assert_unchecked(idx < self.ready.len()) };
+        &self.ready[idx]
+    }
+
+    /// Returns a reference to the done marker at logical position `pos`.
+    #[inline]
+    pub(crate) fn done_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
+        let idx = pos & self.mask;
+        // SAFETY: mask = cap - 1, cap = done.len(), so idx < done.len().
+        unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
+        &self.done[idx]
+    }
+
     /// Splits the ring buffer into a [`Producer`] and [`Consumer`] pair.
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {

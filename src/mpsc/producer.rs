@@ -46,8 +46,7 @@ impl<T> Producer<T> {
         // cache-line contention on the tail pointer.
         let pos = self.queue.tail.fetch_add(1, Ordering::Relaxed);
 
-        // SAFETY: `pos & mask` is always < cap by construction.
-        let slot = unsafe { self.queue.buf.get_unchecked(pos & self.queue.mask) };
+        let slot = self.queue.slot(pos);
 
         // Wait for the slot to be free. This handles the race where multiple
         // producers passed the pre-check and claimed positions via FAA — some

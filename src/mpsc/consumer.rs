@@ -26,8 +26,7 @@ impl<T> Consumer<T> {
         loop {
             let head = self.queue.head.load(Ordering::Relaxed);
 
-            // SAFETY: `head & mask` is always < cap by construction
-            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            let slot = self.queue.slot(head);
 
             let seq = slot.sequence.load(Ordering::Acquire);
 
@@ -78,8 +77,7 @@ impl<T> Consumer<T> {
         loop {
             let head = self.queue.head.load(Ordering::Relaxed);
 
-            // SAFETY: `head & mask` is always < cap by construction
-            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            let slot = self.queue.slot(head);
 
             let seq = slot.sequence.load(Ordering::Acquire);
 
@@ -123,8 +121,7 @@ impl<T> Consumer<T> {
         let mut count = 0usize;
 
         loop {
-            // SAFETY: `head & mask` is always < cap by construction
-            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            let slot = self.queue.slot(head);
 
             let seq = slot.sequence.load(Ordering::Acquire);
 
@@ -175,8 +172,7 @@ impl<T> Consumer<T> {
         let mut count = 0usize;
 
         while count < limit {
-            // SAFETY: `head & mask` is always < cap by construction
-            let slot = unsafe { self.queue.buf.get_unchecked(head & self.queue.mask) };
+            let slot = self.queue.slot(head);
 
             let seq = slot.sequence.load(Ordering::Acquire);
 

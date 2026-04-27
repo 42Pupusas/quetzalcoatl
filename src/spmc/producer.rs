@@ -29,18 +29,14 @@ impl<T> Producer<T> {
     /// `done[s]` is initialized to `s`).
     fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
         let pos = self.write_pos.get();
-        let s = pos & self.queue.mask;
 
-        // SAFETY: `s` is always < cap by construction.
-        let done = unsafe { self.queue.done.get_unchecked(s) };
+        let done = self.queue.done_slot(pos);
         if done.0.load(Ordering::Acquire) != pos {
             return None;
         }
 
-        // SAFETY: `s` is always < cap by construction.
-        let ready = unsafe { self.queue.ready.get_unchecked(s) };
-        // SAFETY: `s` is always < cap by construction.
-        let data_ptr = unsafe { self.queue.data.get_unchecked(s) }.get();
+        let ready = self.queue.ready_slot(pos);
+        let data_ptr = self.queue.data_slot(pos).get();
 
         self.write_pos.set(pos + 1);
         Some((data_ptr, &raw const ready.0, pos))
