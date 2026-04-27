@@ -1,8 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spmc::RingBuffer;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -27,16 +25,17 @@ fn bench_spmc_scaling(c: &mut Criterion) {
                     for _ in 0..iters {
                         let (producer, consumer) =
                             RingBuffer::<u64>::new(Capacity::exact(8192)).split();
-                        let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
                         let handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let c = consumer.clone();
-                                let rem = remaining.clone();
                                 thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
+                                    loop {
                                         if c.pop().is_some() {
-                                            rem.fetch_sub(1, Ordering::Relaxed);
+                                            // counted via natural exit
+                                        } else if c.is_closed() {
+                                            while c.pop().is_some() {}
+                                            break;
                                         } else {
                                             std::hint::spin_loop();
                                         }
@@ -54,6 +53,8 @@ fn bench_spmc_scaling(c: &mut Criterion) {
                                 std::hint::spin_loop();
                             }
                         }
+                        // Signal workers to drain and exit.
+                        drop(producer);
                         for h in handles {
                             h.join().unwrap();
                         }
@@ -123,19 +124,18 @@ fn bench_spmc_contention(c: &mut Criterion) {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
-                    let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
                     let handles: Vec<_> = (0..num_consumers)
                         .map(|_| {
                             let c = consumer.clone();
-                            let rem = remaining.clone();
-                            thread::spawn(move || {
-                                while rem.load(Ordering::Relaxed) > 0 {
-                                    if c.pop().is_some() {
-                                        rem.fetch_sub(1, Ordering::Relaxed);
-                                    } else {
-                                        std::hint::spin_loop();
-                                    }
+                            thread::spawn(move || loop {
+                                if c.pop().is_some() {
+                                    // counted via natural exit
+                                } else if c.is_closed() {
+                                    while c.pop().is_some() {}
+                                    break;
+                                } else {
+                                    std::hint::spin_loop();
                                 }
                             })
                         })
@@ -149,6 +149,7 @@ fn bench_spmc_contention(c: &mut Criterion) {
                             std::hint::spin_loop();
                         }
                     }
+                    drop(producer);
                     for h in handles {
                         h.join().unwrap();
                     }
@@ -192,19 +193,18 @@ fn bench_large_struct_spmc(c: &mut Criterion) {
                     for _ in 0..iters {
                         let (producer, consumer) =
                             RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-                        let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
                         let handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let c = consumer.clone();
-                                let rem = remaining.clone();
-                                thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
-                                        if c.pop().is_some() {
-                                            rem.fetch_sub(1, Ordering::Relaxed);
-                                        } else {
-                                            std::hint::spin_loop();
-                                        }
+                                thread::spawn(move || loop {
+                                    if c.pop().is_some() {
+                                        // counted via natural exit
+                                    } else if c.is_closed() {
+                                        while c.pop().is_some() {}
+                                        break;
+                                    } else {
+                                        std::hint::spin_loop();
                                     }
                                 })
                             })
@@ -218,6 +218,7 @@ fn bench_large_struct_spmc(c: &mut Criterion) {
                                 std::hint::spin_loop();
                             }
                         }
+                        drop(producer);
                         for h in handles {
                             h.join().unwrap();
                         }
@@ -250,22 +251,31 @@ fn bench_large_struct_spmc_zero_copy(c: &mut Criterion) {
                     for _ in 0..iters {
                         let (mut producer, consumer) =
                             RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-                        let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
                         let handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let mut c = consumer.clone();
-                                let rem = remaining.clone();
-                                thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
+                                thread::spawn(move || loop {
+                                    let got = {
                                         if let Some(r) = c.pop_ref() {
                                             black_box(&*r);
                                             drop(r);
-                                            rem.fetch_sub(1, Ordering::Relaxed);
+                                            true
                                         } else {
-                                            std::hint::spin_loop();
+                                            false
                                         }
+                                    };
+                                    if got {
+                                        continue;
                                     }
+                                    if c.is_closed() {
+                                        while let Some(r) = c.pop_ref() {
+                                            black_box(&*r);
+                                            drop(r);
+                                        }
+                                        break;
+                                    }
+                                    std::hint::spin_loop();
                                 })
                             })
                             .collect();
@@ -282,6 +292,7 @@ fn bench_large_struct_spmc_zero_copy(c: &mut Criterion) {
                                 std::hint::spin_loop();
                             }
                         }
+                        drop(producer);
                         for h in handles {
                             h.join().unwrap();
                         }
@@ -323,19 +334,18 @@ fn bench_work_distribution(c: &mut Criterion) {
                     for _ in 0..iters {
                         let (producer, consumer) =
                             RingBuffer::<u64>::new(Capacity::exact(8192)).split();
-                        let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
                         let handles: Vec<_> = (0..num_consumers)
                             .map(|_| {
                                 let c = consumer.clone();
-                                let rem = remaining.clone();
-                                thread::spawn(move || {
-                                    while rem.load(Ordering::Relaxed) > 0 {
-                                        if c.pop().is_some() {
-                                            rem.fetch_sub(1, Ordering::Relaxed);
-                                        } else {
-                                            std::hint::spin_loop();
-                                        }
+                                thread::spawn(move || loop {
+                                    if c.pop().is_some() {
+                                        // counted via natural exit
+                                    } else if c.is_closed() {
+                                        while c.pop().is_some() {}
+                                        break;
+                                    } else {
+                                        std::hint::spin_loop();
                                     }
                                 })
                             })
@@ -348,8 +358,7 @@ fn bench_work_distribution(c: &mut Criterion) {
                                 std::hint::spin_loop();
                             }
                         }
-                        // Drop producer so any overshooting consumer
-                        // sees `closed` and exits cleanly.
+                        // Drop producer so consumers see `closed` and exit.
                         drop(producer);
                         for h in handles {
                             h.join().unwrap();

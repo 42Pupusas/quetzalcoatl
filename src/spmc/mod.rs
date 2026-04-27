@@ -8,6 +8,25 @@
 //! time. The producer is **not** cloneable — single-producer is enforced
 //! at compile time.
 //!
+//! # Ordering guarantees
+//!
+//! Items are claimed in batches: each consumer reserves up to `BATCH_SIZE`
+//! consecutive positions in one bounded CAS on the shared `head` cursor,
+//! then drains its batch from a private cursor. The implications:
+//!
+//! * **Per-consumer FIFO**: within a single consumer's stream, items are
+//!   delivered in the order they were pushed.
+//! * **Cross-consumer order is best-effort**: the interleaving between
+//!   consumers' streams is determined by who wins each batch CAS, not by
+//!   item-arrival order. With `BATCH_SIZE = 32`, one consumer can grab 32
+//!   consecutive items before another sees any.
+//! * **Each item is delivered to exactly one consumer.** No duplication,
+//!   no loss.
+//!
+//! If you need strict global FIFO across consumers, use one consumer; the
+//! batched claim is a work-distribution optimization that trades cross-
+//! consumer ordering for substantially higher throughput under contention.
+//!
 //! # Example
 //!
 //! ```
@@ -72,8 +91,9 @@ use std::sync::Arc;
 /// cache lines, eliminating the symmetric ping-pong of the previous design
 /// where both directions wrote `ready[s]`.
 ///
-/// The producer never reads `head`; consumers never read `tail` (except
-/// for the pre-FAA peek and `len()` diagnostics).
+/// The producer never reads `head`; consumers never read `tail` except
+/// to bound their batched CAS claim (see `Consumer::claim_batch`) and for
+/// `len()` diagnostics.
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
@@ -87,11 +107,12 @@ pub struct RingBuffer<T> {
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
-    /// Producer cursor, published Release. Consumers Acquire-load it
-    /// during the pre-FAA peek to determine whether data is available.
+    /// Producer cursor, published Release. Consumers Acquire-load it to
+    /// bound their batched CAS claim, ensuring they never claim a
+    /// position the producer has not yet published.
     pub(crate) tail: CachePadded<AtomicUsize>,
-    /// Set by `Producer::Drop` so that consumers spinning on overshoot
-    /// can return `None` instead of hanging when the producer is gone.
+    /// Set by `Producer::Drop` so that consumers can distinguish
+    /// "transiently empty" from "permanently drained" via `is_closed()`.
     pub(crate) closed: CachePadded<AtomicBool>,
 }
 
@@ -140,6 +161,10 @@ impl<T> RingBuffer<T> {
     ///
     /// Both cursors are loaded with `Relaxed` ordering, so the result may
     /// transiently exceed `capacity` when observed from another thread.
+    /// Additionally, consumers reserve positions in batches via the head
+    /// cursor — items reserved-but-not-yet-popped are counted as
+    /// consumed by this method, so `len()` may transiently underestimate
+    /// the number of pending items by up to `BATCH_SIZE` per consumer.
     /// Use this for heuristics, not for precise invariants.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -269,8 +294,12 @@ mod tests {
         assert_eq!(producer.len(), 2);
         assert_eq!(producer.push(3), Err(3));
         assert_eq!(producer.len(), 2);
+        // After pop, len() may underestimate by up to BATCH_SIZE per
+        // consumer because consumers reserve positions in batches via
+        // the head cursor. We only check that len() is bounded by the
+        // count of remaining items.
         assert_eq!(consumer.pop(), Some(1));
-        assert_eq!(consumer.len(), 1);
+        assert!(consumer.len() <= 1);
         assert_eq!(consumer.pop(), Some(2));
         assert_eq!(consumer.len(), 0);
     }

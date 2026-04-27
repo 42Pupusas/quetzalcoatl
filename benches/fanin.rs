@@ -52,11 +52,10 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
-                            )
-                            .split();
+                        let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
+                        )
+                        .split();
 
                         let start = Instant::now();
 
@@ -100,11 +99,10 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
-                            )
-                            .split();
+                        let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                            quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
+                        )
+                        .split();
 
                         let start = Instant::now();
 
@@ -157,11 +155,10 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                         let start = Instant::now();
 
                         for _ in 0..num_producers {
-                            let (producer, consumer) =
-                                quetzalcoatl::spsc::RingBuffer::<u64>::new(
-                                    quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
-                                )
-                                .split();
+                            let (producer, consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                                quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
+                            )
+                            .split();
                             consumers.push(consumer);
 
                             producer_handles.push(thread::spawn(move || {
@@ -212,11 +209,10 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                         let start = Instant::now();
 
                         for _ in 0..num_producers {
-                            let (producer, consumer) =
-                                quetzalcoatl::spsc::RingBuffer::<u64>::new(
-                                    quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
-                                )
-                                .split();
+                            let (producer, consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                                quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
+                            )
+                            .split();
                             consumers.push(consumer);
 
                             producer_handles.push(thread::spawn(move || {
@@ -271,8 +267,7 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         total += rt.block_on(async {
-                            let (tx, mut rx) =
-                                tokio::sync::mpsc::unbounded_channel::<u64>();
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
                             let start = Instant::now();
 
@@ -321,8 +316,7 @@ fn bench_fanin_throughput(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         total += rt.block_on(async {
-                            let (tx, mut rx) =
-                                tokio::sync::mpsc::channel::<u64>(mpsc_cap);
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(mpsc_cap);
 
                             let start = Instant::now();
 
@@ -414,52 +408,47 @@ fn bench_fanin_capacity_impact(c: &mut Criterion) {
     for cap in [256, 1024, 4096, 8192, 16384] {
         group.throughput(Throughput::Elements(total_items));
 
-        group.bench_with_input(
-            BenchmarkId::new("mpsc", cap),
-            &cap,
-            |b, &cap| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let (producer, mut consumer) =
-                            quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                                quetzalcoatl::capacity::Capacity::exact(cap),
-                            )
-                            .split();
+        group.bench_with_input(BenchmarkId::new("mpsc", cap), &cap, |b, &cap| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                        quetzalcoatl::capacity::Capacity::exact(cap),
+                    )
+                    .split();
 
-                        let start = Instant::now();
+                    let start = Instant::now();
 
-                        let handles: Vec<_> = (0..num_producers)
-                            .map(|_| {
-                                let p = producer.clone();
-                                thread::spawn(move || {
-                                    for i in 0..ITEMS_PER_PRODUCER {
-                                        while p.push(black_box(i)).is_err() {
-                                            std::hint::spin_loop();
-                                        }
+                    let handles: Vec<_> = (0..num_producers)
+                        .map(|_| {
+                            let p = producer.clone();
+                            thread::spawn(move || {
+                                for i in 0..ITEMS_PER_PRODUCER {
+                                    while p.push(black_box(i)).is_err() {
+                                        std::hint::spin_loop();
                                     }
-                                })
+                                }
                             })
-                            .collect();
+                        })
+                        .collect();
 
-                        let mut received = 0u64;
-                        while received < total_items {
-                            if consumer.pop().is_some() {
-                                received += 1;
-                            } else {
-                                std::hint::spin_loop();
-                            }
+                    let mut received = 0u64;
+                    while received < total_items {
+                        if consumer.pop().is_some() {
+                            received += 1;
+                        } else {
+                            std::hint::spin_loop();
                         }
-
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                        total += start.elapsed();
                     }
-                    total
-                });
-            },
-        );
+
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
     }
     group.finish();
 }
@@ -480,11 +469,10 @@ fn bench_consumer_drain_strategy(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
-                    quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                        quetzalcoatl::capacity::Capacity::at_least(cap),
-                    )
-                    .split();
+                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                    quetzalcoatl::capacity::Capacity::at_least(cap),
+                )
+                .split();
 
                 let start = Instant::now();
 
@@ -524,11 +512,10 @@ fn bench_consumer_drain_strategy(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let (producer, mut consumer) =
-                    quetzalcoatl::mpsc::RingBuffer::<u64>::new(
-                        quetzalcoatl::capacity::Capacity::at_least(cap),
-                    )
-                    .split();
+                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                    quetzalcoatl::capacity::Capacity::at_least(cap),
+                )
+                .split();
 
                 let start = Instant::now();
 

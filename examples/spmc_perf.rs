@@ -9,8 +9,6 @@
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spmc::RingBuffer;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 
 fn main() {
@@ -25,7 +23,6 @@ fn main() {
         .expect("usage: spmc_perf <num_consumers> <total_items>");
 
     let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(8192)).split();
-    let remaining = Arc::new(AtomicUsize::new(total_items as usize));
 
     let start;
 
@@ -41,18 +38,39 @@ fn main() {
         }
         while c.pop().is_some() {}
     } else {
-        let handles: Vec<_> = (0..num_consumers)
-            .map(|_| {
+        // Per-consumer quotas: each consumer counts its own pops, no
+        // shared atomic counter on the hot path. Consumers loop until
+        // they observe a `None` after the producer is closed (which
+        // signals "no more items will ever arrive"). Total work is
+        // distributed dynamically — fast consumers will pop more, slow
+        // consumers fewer; we just need the sum to match total_items.
+        let popped_counters: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>> = (0..num_consumers)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .collect();
+
+        let handles: Vec<_> = popped_counters
+            .iter()
+            .cloned()
+            .map(|popped| {
                 let c = consumer.clone();
-                let rem = remaining.clone();
                 thread::spawn(move || {
-                    while rem.load(Ordering::Relaxed) > 0 {
+                    let mut local: u64 = 0;
+                    loop {
                         if c.pop().is_some() {
-                            rem.fetch_sub(1, Ordering::Relaxed);
+                            local += 1;
+                        } else if c.is_closed() {
+                            // Producer is gone. Drain any remaining items
+                            // (the producer may have published items the
+                            // consumer hasn't seen yet), then exit.
+                            while c.pop().is_some() {
+                                local += 1;
+                            }
+                            break;
                         } else {
                             std::hint::spin_loop();
                         }
                     }
+                    popped.store(local, std::sync::atomic::Ordering::Relaxed);
                 })
             })
             .collect();
@@ -70,6 +88,14 @@ fn main() {
         for h in handles {
             h.join().unwrap();
         }
+        let total_popped: u64 = popped_counters
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        assert_eq!(
+            total_popped, total_items,
+            "consumers must pop exactly the items the producer pushed"
+        );
     }
 
     let elapsed = start.elapsed();

@@ -9,27 +9,44 @@ use super::RingBuffer;
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
 /// — each clone shares the same underlying buffer and competes for items
-/// via **fetch-and-add** on the head pointer.
+/// via batched bounded-CAS claim on the head pointer.
+///
+/// # Claim protocol
+///
+/// Each consumer maintains a private cursor over a locally-claimed batch
+/// of positions. `pop()` first tries to advance the private cursor; only
+/// when the batch is exhausted does it claim a fresh batch via a single
+/// CAS on the shared `head`. The CAS is bounded by the producer's
+/// published `tail`, so a consumer never claims a position the producer
+/// has not yet reached — eliminating the post-claim wait that earlier
+/// FAA-based designs spent in the spin loop.
+///
+/// Concretely: when our private batch is exhausted, we load `head`,
+/// observe (or refresh) `tail`, take `K = min(BATCH_SIZE, tail - head)`,
+/// and CAS `head` from `h` to `h + K`. On success, positions `[h, h+K)`
+/// are ours to drain; on conflict we retry with backoff. Other consumers
+/// can be claiming non-overlapping batches concurrently.
+///
+/// This amortizes the cost of head-line invalidation across `K` items
+/// (typically 32) and is the principal driver of SPMC scalability under
+/// many-consumer contention.
 ///
 /// # Synchronization (split-plane)
 ///
-/// The consumer reads `ready[s]` to wait for the producer's publish and
-/// writes `done[s]` to signal slot reuse. These are on **different cache
-/// lines**, so the consumer's release-store does not invalidate the line
-/// the producer needs to write next. The producer reads `done[s]` (a line
-/// last touched by some consumer) and writes `ready[s]` (a line last
-/// touched by itself, so its writes hit M-state without a coherence stall).
+/// The consumer reads `ready[s]` only when the producer is genuinely
+/// behind (not used in the common batched path) and writes `done[s]` to
+/// signal slot reuse. These are on **different cache lines**, so the
+/// consumer's release-store does not invalidate the line the producer
+/// needs to write next. The producer reads `done[s]` (a line last touched
+/// by some consumer) and writes `ready[s]` (a line last touched by
+/// itself, so its writes hit M-state without a coherence stall).
 ///
-/// # Overshoot
+/// # Closure
 ///
-/// In the rare race where multiple consumers peek "non-empty" and FAA
-/// in parallel, a consumer may obtain a head ticket `h >= tail`. Since
-/// the queue is lossless, the consumer must wait for the producer to
-/// publish at `h` rather than abandon the ticket. This is bounded by
-/// producer push latency.
-///
-/// If the producer is dropped (sets the `closed` flag), consumers
-/// spinning on overshoot return `None` rather than hanging.
+/// If the producer is dropped, the `closed` flag is set. Consumers can
+/// distinguish "transiently empty" from "permanently drained" via
+/// [`is_closed`](Self::is_closed); this lets a worker exit cleanly
+/// instead of spinning forever on an empty queue.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Local snapshot of the producer's `tail`. Avoids an Acquire-load
@@ -41,13 +58,27 @@ pub struct Consumer<T> {
     ///
     /// `Cell` makes Consumer `!Sync` — share via `clone()` instead.
     cached_tail: Cell<usize>,
+    /// Next position in our locally-claimed batch `[batch_next, batch_end)`.
+    /// When `batch_next == batch_end`, claim a new batch via bounded FAA
+    /// on `head`. Batched claim amortizes head-line invalidation across
+    /// up to `BATCH_SIZE` items.
+    batch_next: Cell<usize>,
+    batch_end: Cell<usize>,
 }
+
+/// Maximum positions claimed in one head FAA. Larger = fewer atomics on
+/// the contended head line, but greater work-imbalance between consumers
+/// and longer worst-case post-claim wait if the producer has not yet
+/// published all `K` positions.
+const BATCH_SIZE: usize = 32;
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         Self {
             queue: Arc::clone(&self.queue),
             cached_tail: Cell::new(0),
+            batch_next: Cell::new(0),
+            batch_end: Cell::new(0),
         }
     }
 }
@@ -61,74 +92,109 @@ impl<T> Consumer<T> {
         Self {
             queue,
             cached_tail: Cell::new(0),
+            batch_next: Cell::new(0),
+            batch_end: Cell::new(0),
         }
     }
 
-    /// Claims the next slot via FAA on `head`, then waits for the
-    /// producer to publish data at the claimed position.
+    /// Claims the next position from our local batch, or claims a new
+    /// batch from `head` via bounded CAS.
     ///
-    /// Returns `(data_ptr, done_ptr, h)` on success. Returns `None`
-    /// if the queue was observed empty before the FAA, or if the
-    /// consumer overshot and the producer is closed.
+    /// Batched claim: we advance `head` by up to `BATCH_SIZE` positions
+    /// in one CAS, then pop from the local cursor without touching `head`
+    /// for the next K-1 calls. This amortizes head-line invalidation.
+    ///
+    /// Returns `(data_ptr, done_ptr, h)` on success. Returns `None` if
+    /// the queue is empty (and producer not closed-and-drained).
     #[inline]
     fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
         let q = &*self.queue;
-        let data = &q.data;
-        let ready = &q.ready;
-        let done = &q.done;
         let mask = q.mask;
 
-        // Pre-FAA peek using the cached tail.
-        let head = q.head.load(Ordering::Relaxed);
-        let mut tail = self.cached_tail.get();
-        if head >= tail {
-            tail = q.tail.load(Ordering::Acquire);
-            self.cached_tail.set(tail);
-            if head >= tail {
-                if q.closed.0.load(Ordering::Acquire) {
-                    let tail2 = q.tail.load(Ordering::Acquire);
-                    self.cached_tail.set(tail2);
-                    let head2 = q.head.load(Ordering::Relaxed);
-                    if head2 >= tail2 {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            }
+        // Fast path: we have positions left in our local batch.
+        let next = self.batch_next.get();
+        let end = self.batch_end.get();
+        if next < end {
+            self.batch_next.set(next + 1);
+            return Some(self.bind_pos(next, mask));
         }
 
-        // Commit: FAA gives us a unique seqid. Always succeeds.
-        let h = q.head.fetch_add(1, Ordering::Relaxed);
-        let s = h & mask;
-        // SAFETY: `s` is always < cap by construction.
-        let slot_ready = unsafe { ready.get_unchecked(s) };
-        let slot_done = unsafe { done.get_unchecked(s) };
+        // Slow path: claim a new batch from `head`.
+        self.claim_batch(mask)
+    }
 
-        // Wait for the producer to publish at logical position h.
-        // ready[s] == h + 1 means data is there. Common case (we peeked
-        // non-empty and h < tail): immediate. Overshoot case: spin until
-        // producer reaches h, OR until producer is closed and won't.
+    /// Slow path: claim a new batch. Bounded CAS on `head` clamped by
+    /// `tail`, so we never claim a position the producer hasn't reached.
+    /// Returns the first position of the new batch (and stashes the rest
+    /// in our local cursor for subsequent `claim_slot` calls).
+    #[cold]
+    #[inline(never)]
+    fn claim_batch(
+        &self,
+        mask: usize,
+    ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
+        let q = &*self.queue;
+
         let mut backoff = 0u32;
         loop {
-            if slot_ready.0.load(Ordering::Acquire) == h + 1 {
-                let data_ptr = unsafe { data.get_unchecked(s) }.get().cast_const();
-                return Some((data_ptr, &raw const slot_done.0, h));
-            }
-
-            if q.closed.0.load(Ordering::Acquire) {
-                let tail_now = q.tail.load(Ordering::Acquire);
-                if h >= tail_now {
-                    // Producer is gone and never reached h. Mark slot
-                    // consumed via `done` so RingBuffer::Drop sees the
-                    // slot as released (no double-drop, no leak).
-                    slot_done.0.store(h + q.cap, Ordering::Release);
+            let head = q.head.load(Ordering::Relaxed);
+            let mut tail = self.cached_tail.get();
+            if head >= tail {
+                tail = q.tail.load(Ordering::Acquire);
+                self.cached_tail.set(tail);
+                if head >= tail {
+                    // Empty under our cached view.
+                    if q.closed.0.load(Ordering::Acquire) {
+                        let tail2 = q.tail.load(Ordering::Acquire);
+                        self.cached_tail.set(tail2);
+                        let head2 = q.head.load(Ordering::Relaxed);
+                        if head2 >= tail2 {
+                            return None;
+                        }
+                        continue;
+                    }
                     return None;
                 }
             }
 
+            // Bounded batch: claim up to BATCH_SIZE positions, but never
+            // past the producer's current tail.
+            let avail = tail - head;
+            let take = avail.min(BATCH_SIZE);
+            let new_head = head + take;
+            if q.head
+                .compare_exchange_weak(head, new_head, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Batch claimed: positions [head, new_head). Use first,
+                // stash rest.
+                self.batch_next.set(head + 1);
+                self.batch_end.set(new_head);
+                return Some(self.bind_pos(head, mask));
+            }
             crate::common::cas_backoff(&mut backoff);
         }
+    }
+
+    /// Resolve `(data_ptr, done_ptr, h)` for a position we have claimed.
+    ///
+    /// The position is guaranteed `< tail` (bounded CAS), and the
+    /// producer Release-stores `ready[s] = h+1` *before* Release-storing
+    /// `tail >= h+1`. Our Acquire on tail therefore happens-after the
+    /// ready store, so the slot's data is already initialized and
+    /// observable; no spin needed.
+    #[inline]
+    fn bind_pos(
+        &self,
+        h: usize,
+        mask: usize,
+    ) -> (*const MaybeUninit<T>, *const AtomicUsize, usize) {
+        let q = &*self.queue;
+        let s = h & mask;
+        // SAFETY: `s` is always < cap by construction.
+        let data_ptr = unsafe { q.data.get_unchecked(s) }.get().cast_const();
+        let slot_done = unsafe { q.done.get_unchecked(s) };
+        (data_ptr, &raw const slot_done.0, h)
     }
 
     /// Pops an item from the ring buffer.
@@ -183,6 +249,48 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.queue.is_full()
+    }
+
+    /// Returns `true` if the producer has been dropped.
+    ///
+    /// Once true, no more items will ever be pushed; a subsequent `pop`
+    /// returning `None` is therefore terminal and signals the queue is
+    /// permanently drained.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.queue.closed.0.load(Ordering::Acquire)
+    }
+}
+
+impl<T> Drop for Consumer<T> {
+    fn drop(&mut self) {
+        // Release any positions we claimed but never popped. The producer
+        // gates slot reuse on `done[s] == pos + cap`, so without this
+        // release the producer would permanently stall on those slots.
+        //
+        // Each unconsumed slot has live data (producer published before
+        // we claimed via bounded CAS), so we must drop the value too.
+        let q = &*self.queue;
+        let mask = q.mask;
+        let cap = q.cap;
+        let next = self.batch_next.get();
+        let end = self.batch_end.get();
+        for pos in next..end {
+            let s = pos & mask;
+            // SAFETY: bounded CAS guaranteed pos < tail at claim time, so
+            // `ready[s] == pos+1` is observable and data is initialized.
+            // We are the unique owner of this position.
+            unsafe {
+                q.data.get_unchecked(s).get().cast::<T>().drop_in_place();
+            }
+            // SAFETY: `s` < cap.
+            unsafe {
+                q.done
+                    .get_unchecked(s)
+                    .0
+                    .store(pos + cap, Ordering::Release);
+            }
+        }
     }
 }
 
