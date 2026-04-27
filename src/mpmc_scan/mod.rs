@@ -103,6 +103,14 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     /// Producer claim cursor. FAA'd to assign unique logical positions.
     pub(crate) claim: CachePadded<AtomicUsize>,
+    /// Coarse "consumed" watermark — a lower bound on the number of
+    /// items consumers have popped. Consumers buffer local counts and
+    /// flush to this counter every `CONSUMED_FLUSH` pops. Producers
+    /// use it (loosely) to bound batched FAA on `claim` so a single
+    /// FAA never claims more positions than the ring can hold.
+    /// Flushing is rare and the producer's batch sizing only needs an
+    /// approximate bound, so the line stays mostly cool.
+    pub(crate) consumed: CachePadded<AtomicUsize>,
     /// Number of live producers; last-drop sets `closed`.
     pub(crate) producer_count: CachePadded<AtomicUsize>,
     /// Monotonic counter incremented on each Consumer clone. Each
@@ -154,6 +162,7 @@ impl<T> RingBuffer<T> {
             ready,
             done,
             claim: CachePadded(AtomicUsize::new(0)),
+            consumed: CachePadded(AtomicUsize::new(0)),
             producer_count: CachePadded(AtomicUsize::new(1)),
             clone_counter: CachePadded(AtomicUsize::new(0)),
             closed: CachePadded(AtomicBool::new(false)),
@@ -200,7 +209,7 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        let producer = Producer { queue: arc.clone() };
+        let producer = Producer::new(arc.clone());
         let consumer = Consumer::new(arc);
         (producer, consumer)
     }

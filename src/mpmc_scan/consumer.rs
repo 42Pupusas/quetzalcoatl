@@ -16,12 +16,24 @@ use super::RingBuffer;
 /// No shared `head` cursor exists. Consumers contend per-slot, not on
 /// a global atomic, so contention is naturally distributed across the
 /// ring's `cap` cachelines.
+/// Number of pops between flushes of the local consumed counter to
+/// the shared `consumed` atomic. Producers use the shared counter to
+/// bound batched FAA on `claim`, so a flushed value that lags the
+/// real consumed count just makes producers underestimate free space
+/// (safe direction). Larger = lower flush frequency = less hot-line
+/// contention but staler bound (smaller producer batches when the
+/// queue is empty-ish). 64 matches the test harness's batch size.
+const CONSUMED_FLUSH: usize = 64;
+
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Private scan cursor. Logical position to start the next scan
     /// from. On each `pop`, the consumer walks at most `cap` slots
     /// forward from here, looking for a published slot it can claim.
     next_scan: Cell<usize>,
+    /// Local count of pops since the last flush to the shared
+    /// `consumed` atomic. Flushed every `CONSUMED_FLUSH` pops.
+    local_consumed: Cell<usize>,
 }
 
 impl<T> Clone for Consumer<T> {
@@ -51,6 +63,7 @@ impl<T> Clone for Consumer<T> {
         Self {
             queue: Arc::clone(&self.queue),
             next_scan: Cell::new(stagger),
+            local_consumed: Cell::new(0),
         }
     }
 }
@@ -64,6 +77,7 @@ impl<T> Consumer<T> {
         Self {
             queue,
             next_scan: Cell::new(0),
+            local_consumed: Cell::new(0),
         }
     }
 
@@ -128,6 +142,20 @@ impl<T> Consumer<T> {
                     // slot doesn't make us skip back; max() with
                     // start_scan + 1 keeps us moving forward.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
+
+                    // Flush local consumed count to the shared
+                    // `consumed` watermark every CONSUMED_FLUSH pops.
+                    // Producers use this to bound batched FAA on
+                    // `claim`. The `+ 1` covers the pop we're about
+                    // to return.
+                    let lc = self.local_consumed.get() + 1;
+                    if lc >= CONSUMED_FLUSH {
+                        q.consumed.fetch_add(lc, Ordering::Relaxed);
+                        self.local_consumed.set(0);
+                    } else {
+                        self.local_consumed.set(lc);
+                    }
+
                     return Some(val);
                 }
                 // CAS failed: another consumer claimed it. Move on.
@@ -175,6 +203,14 @@ impl<T> Drop for Consumer<T> {
         // No claimed-but-unread positions to release: in this design,
         // claim and read happen atomically (CAS to claimed → read →
         // store done). There's no "batch" of held positions to
-        // release. So nothing to do here.
+        // release.
+        //
+        // But: flush any unflushed `local_consumed` count to the
+        // shared watermark so producers don't permanently
+        // under-estimate free space after this consumer goes away.
+        let lc = self.local_consumed.get();
+        if lc > 0 {
+            self.queue.consumed.fetch_add(lc, Ordering::Relaxed);
+        }
     }
 }
