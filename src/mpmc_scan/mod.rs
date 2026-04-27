@@ -44,10 +44,14 @@
 //!
 //! # Trade-offs vs strict-FIFO MPMC
 //!
-//! - **No global FIFO across consumers.** A consumer scanning forward
-//!   may find slot 5 published before slot 3 (if producer for slot 3 is
-//!   slow), and claim it. Per-producer FIFO (within one producer's
-//!   pushes) is preserved.
+//! - **No FIFO of any kind.** Consumers find published items by
+//!   scanning the ring, so cross-producer order is lost. Within a
+//!   single producer's stream, push order is also not preserved:
+//!   each producer reserves a batch of positions and publishes
+//!   *out of order* into them — picking whichever position has its
+//!   slot already free, falling back to spinning on the lowest only
+//!   if no slot is ready. This converts producer-spin time into
+//!   productive publishing under contention.
 //! - **Empty-queue cost is O(scan bound) per `pop`,** vs O(1) for the
 //!   FIFO variant's tail check. Workloads with frequent empty polls
 //!   pay more here.

@@ -158,7 +158,16 @@ impl<T> Consumer<T> {
 
                     return Some(val);
                 }
-                // CAS failed: another consumer claimed it. Move on.
+                // CAS failed: another consumer claimed it. Skip ahead
+                // by a full cacheline of slots (8) instead of just 1.
+                // The slot we lost is on a cacheline that just got
+                // invalidated by the winner's CAS-write; the next 7
+                // slots on that line will also be hot. Jumping past
+                // the line gets us to fresh, less-contended state
+                // and significantly reduces the CAS-fail rate at
+                // higher consumer counts.
+                scan += 7; // +1 below makes it 8.
+                iters += 7;
             }
 
             scan += 1;
