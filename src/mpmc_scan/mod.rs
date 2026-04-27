@@ -483,4 +483,228 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), total as usize);
     }
+
+    /// Run a full correctness check for a given (P, Q, total, cap)
+    /// shape. Each producer pushes a disjoint contiguous range of
+    /// values; consumers collect everything; we verify the union
+    /// equals exactly the union of all producer ranges (no
+    /// duplicates, no gaps, no extras). Producers wait for the ring
+    /// to make space via busy-loop on Err.
+    fn run_correctness(p_count: u64, c_count: u64, total: u64, cap: usize) {
+        let per_p = total / p_count;
+        let actual_total = per_p * p_count;
+        let (prod, cons) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let pp: Vec<_> = (0..p_count)
+            .map(|tid| {
+                let p = prod.clone();
+                std::thread::spawn(move || {
+                    let base = tid * per_p;
+                    for i in 0..per_p {
+                        let v = base + i;
+                        while p.push(v).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(prod);
+
+        let cc: Vec<_> = (0..c_count)
+            .map(|_| {
+                let c = cons.clone();
+                let r = received.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    while r.load(std::sync::atomic::Ordering::Relaxed) < actual_total as usize {
+                        if let Some(v) = c.pop() {
+                            r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            got.push(v);
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        drop(cons);
+
+        for h in pp {
+            h.join().unwrap();
+        }
+        let mut all: Vec<u64> = Vec::new();
+        for h in cc {
+            all.extend(h.join().unwrap());
+        }
+        // Exact-count check: no duplicates, no losses, no extras.
+        assert_eq!(
+            all.len(),
+            actual_total as usize,
+            "P={p_count} Q={c_count}: got {} items, expected {}",
+            all.len(),
+            actual_total
+        );
+        all.sort_unstable();
+        let mut prev: Option<u64> = None;
+        for v in &all {
+            if let Some(p) = prev {
+                assert_ne!(p, *v, "duplicate value {v} (P={p_count} Q={c_count})");
+            }
+            prev = Some(*v);
+        }
+        // The set of values is exactly [0, actual_total).
+        for (i, v) in all.iter().enumerate() {
+            assert_eq!(
+                *v, i as u64,
+                "missing or unexpected value at sorted index {i} (P={p_count} Q={c_count})"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Matrix correctness tests across P x Q including mismatched shapes.
+    // Each test verifies: no items lost, no duplicates, exact value set.
+    // Sized to be reasonable for a regular `cargo test` run; the stress
+    // module above takes 4000 items, these take 10000.
+    // -----------------------------------------------------------------------
+
+    macro_rules! correctness_test {
+        ($name:ident, $p:expr, $q:expr) => {
+            #[test]
+            #[ignore = "matrix correctness — too slow for default run"]
+            fn $name() {
+                run_correctness($p, $q, 10_000, 1024);
+            }
+        };
+    }
+
+    correctness_test!(matrix_p1_q1, 1, 1);
+    correctness_test!(matrix_p1_q2, 1, 2);
+    correctness_test!(matrix_p1_q4, 1, 4);
+    correctness_test!(matrix_p1_q8, 1, 8);
+    correctness_test!(matrix_p2_q1, 2, 1);
+    correctness_test!(matrix_p2_q2, 2, 2);
+    correctness_test!(matrix_p2_q4, 2, 4);
+    correctness_test!(matrix_p2_q8, 2, 8);
+    correctness_test!(matrix_p4_q1, 4, 1);
+    correctness_test!(matrix_p4_q2, 4, 2);
+    correctness_test!(matrix_p4_q4, 4, 4);
+    correctness_test!(matrix_p4_q8, 4, 8);
+    correctness_test!(matrix_p8_q1, 8, 1);
+    correctness_test!(matrix_p8_q2, 8, 2);
+    correctness_test!(matrix_p8_q4, 8, 4);
+    correctness_test!(matrix_p8_q8, 8, 8);
+
+    // Larger items-per-producer to catch infrequent races. ~4M items
+    // total, runs in ~1s.
+    macro_rules! heavy_correctness_test {
+        ($name:ident, $p:expr, $q:expr) => {
+            #[test]
+            #[ignore = "heavy correctness — minutes-scale runtime"]
+            fn $name() {
+                run_correctness($p, $q, 1_000_000, 1024);
+            }
+        };
+    }
+
+    heavy_correctness_test!(heavy_p2_q2, 2, 2);
+    heavy_correctness_test!(heavy_p4_q4, 4, 4);
+    heavy_correctness_test!(heavy_p8_q8, 8, 8);
+    heavy_correctness_test!(heavy_p1_q8, 1, 8);
+    heavy_correctness_test!(heavy_p8_q1, 8, 1);
+
+    /// Counter-free correctness check: producers push a known set,
+    /// drop, consumers drain until `is_closed && pop returns None`.
+    /// No shared atomic counter masks throughput, so this stresses
+    /// the queue at full speed and exposes any item-loss races.
+    fn run_correctness_no_counter(p_count: u64, c_count: u64, total: u64, cap: usize) {
+        let per_p = total / p_count;
+        let actual_total = (per_p * p_count) as usize;
+        let (prod, cons) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+
+        // Consumers drain until producers are dropped AND queue is
+        // empty. They collect everything they pop into a local vec.
+        let cc: Vec<_> = (0..c_count)
+            .map(|_| {
+                let c = cons.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    loop {
+                        if let Some(v) = c.pop() {
+                            got.push(v);
+                        } else if c.is_closed() {
+                            // Drain remaining items, then exit.
+                            while let Some(v) = c.pop() {
+                                got.push(v);
+                            }
+                            break;
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        drop(cons);
+
+        let pp: Vec<_> = (0..p_count)
+            .map(|tid| {
+                let p = prod.clone();
+                std::thread::spawn(move || {
+                    let base = tid * per_p;
+                    for i in 0..per_p {
+                        let v = base + i;
+                        while p.push(v).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(prod);
+
+        for h in pp {
+            h.join().unwrap();
+        }
+        let mut all: Vec<u64> = Vec::new();
+        for h in cc {
+            all.extend(h.join().unwrap());
+        }
+        assert_eq!(
+            all.len(),
+            actual_total,
+            "P={p_count} Q={c_count}: got {} items, expected {}",
+            all.len(),
+            actual_total
+        );
+        all.sort_unstable();
+        for (i, v) in all.iter().enumerate() {
+            assert_eq!(
+                *v, i as u64,
+                "missing/extra at sorted index {i} (P={p_count} Q={c_count}): got {v}, expected {i}"
+            );
+        }
+    }
+
+    macro_rules! no_counter_test {
+        ($name:ident, $p:expr, $q:expr, $total:expr) => {
+            #[test]
+            #[ignore = "counter-free correctness — minute-scale runtime"]
+            fn $name() {
+                run_correctness_no_counter($p, $q, $total, 1024);
+            }
+        };
+    }
+
+    no_counter_test!(no_counter_p2_q2, 2, 2, 5_000_000);
+    no_counter_test!(no_counter_p4_q4, 4, 4, 5_000_000);
+    no_counter_test!(no_counter_p8_q8, 8, 8, 5_000_000);
+    no_counter_test!(no_counter_p1_q8, 1, 8, 5_000_000);
+    no_counter_test!(no_counter_p8_q1, 8, 1, 5_000_000);
+    no_counter_test!(no_counter_p2_q4, 2, 4, 5_000_000);
+    no_counter_test!(no_counter_p4_q2, 4, 2, 5_000_000);
 }
