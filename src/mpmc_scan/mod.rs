@@ -206,7 +206,7 @@ impl<T> Drop for RingBuffer<T> {
             let d = *self.done[s].0.get_mut();
             // Decode: r = s + R*cap + state, where state ∈ {0,1,2}.
             let delta = r.wrapping_sub(s);
-            let state = delta % cap;
+            let state = delta & self.mask;
             let round = delta / cap;
             let round_pos = s + round * cap;
             if state == 1 {

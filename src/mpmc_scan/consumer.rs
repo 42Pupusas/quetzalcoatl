@@ -91,7 +91,10 @@ impl<T> Consumer<T> {
             let s = scan & mask;
             let r = q.ready_slot(scan).0.load(Ordering::Acquire);
             let delta = r.wrapping_sub(s);
-            let state = delta % cap;
+            // `delta % cap` — `cap` is power-of-two so equivalent to
+            // `& mask`. Compiler can't infer this from the runtime
+            // `cap`; the explicit `& mask` saves a `div`.
+            let state = delta & mask;
             let round_pos = r.wrapping_sub(state); // s + R*cap
 
             if state == 1 {
