@@ -1,1 +1,9 @@
 /target
+
+# Editor / tooling local config
+/.claude/
+
+# Profiling artifacts (perf record + flamegraph output)
+perf*.data
+perf*.data.old
+flamegraph*.svg
