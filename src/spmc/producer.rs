@@ -27,7 +27,7 @@ impl<T> Producer<T> {
     /// consumer at logical position `tail - cap` released it for us
     /// (or, for the first lap, this is the slot's initial state, since
     /// `done[s]` is initialized to `s`).
-    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let pos = self.write_pos.get();
 
         let done = self.queue.done_slot(pos);
@@ -39,7 +39,7 @@ impl<T> Producer<T> {
         let data_ptr = self.queue.data_slot(pos).get();
 
         self.write_pos.set(pos + 1);
-        Some((data_ptr, &raw const ready.0, pos))
+        Some((data_ptr, &ready.0, pos))
     }
 
     /// Pushes a value into the ring buffer.
@@ -48,15 +48,12 @@ impl<T> Producer<T> {
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.try_claim() {
-            Some((data_ptr, ready_ptr, pos)) => {
+            Some((data_ptr, slot_ready, pos)) => {
                 // SAFETY: We are the sole producer and the slot is free.
                 unsafe { (*data_ptr).write(val) };
                 // Publish: ready[s] = pos + 1 tells the consumer at
                 // logical position `pos` that data is available.
-                // SAFETY: ready_ptr points into the RingBuffer kept alive by Arc.
-                unsafe {
-                    (*ready_ptr).store(pos + 1, Ordering::Release);
-                }
+                slot_ready.store(pos + 1, Ordering::Release);
                 // Consumers Acquire-load `tail` in their pre-FAA peek;
                 // Release ensures they see published slot data.
                 self.queue
@@ -77,10 +74,9 @@ impl<T> Producer<T> {
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.try_claim()
-            .map(|(data_ptr, ready_ptr, pos)| SlotWriter {
+            .map(|(data_ptr, slot_ready, pos)| SlotWriter {
                 slot_data: data_ptr,
-                // SAFETY: ready_ptr points into the RingBuffer kept alive by our Arc.
-                slot_ready: unsafe { &*ready_ptr },
+                slot_ready,
                 tail: &self.queue.tail,
                 write_pos: &self.write_pos,
                 pos,

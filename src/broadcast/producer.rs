@@ -26,7 +26,7 @@ impl<T> Clone for Producer<T> {
 
 impl<T> Producer<T> {
     #[inline]
-    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         // Pre-check with L1/L2/L3 min_head cache: avoid a wasted FAA
         // when the buffer is clearly full.
         let current_tail = self.queue.tail.load(Ordering::Relaxed);
@@ -85,7 +85,7 @@ impl<T> Producer<T> {
             slot.sequence.store(0, Ordering::Relaxed);
         }
 
-        Some((slot.data.get(), &raw const slot.sequence, pos))
+        Some((slot.data.get(), &slot.sequence, pos))
     }
 
     /// Pushes a value into the broadcast ring buffer.
@@ -95,13 +95,10 @@ impl<T> Producer<T> {
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
-            Some((data_ptr, seq_ptr, pos)) => {
+            Some((data_ptr, slot_seq, pos)) => {
                 // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
-                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
-                unsafe {
-                    (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
-                }
+                slot_seq.store(pos * 2 + 1, Ordering::Release);
                 Ok(())
             }
             None => Err(val),
@@ -117,10 +114,9 @@ impl<T> Producer<T> {
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot()
-            .map(|(data_ptr, seq_ptr, pos)| SlotWriter {
+            .map(|(data_ptr, slot_sequence, pos)| SlotWriter {
                 slot_data: data_ptr,
-                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
-                slot_sequence: unsafe { &*seq_ptr },
+                slot_sequence,
                 pos,
             })
     }

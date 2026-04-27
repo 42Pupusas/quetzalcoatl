@@ -27,7 +27,7 @@ impl<T> Clone for Producer<T> {
 
 impl<T> Producer<T> {
     #[inline]
-    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         // Pre-check: is there room? Uses cached head as a fast-path to avoid
         // an atomic load. Since head only increases, a stale cache just makes
         // the buffer look fuller than it is — safe to refresh on demand.
@@ -61,7 +61,7 @@ impl<T> Producer<T> {
             }
         }
 
-        Some((slot.data.get(), &raw const slot.sequence, pos))
+        Some((slot.data.get(), &slot.sequence, pos))
     }
 
     /// Pushes a value into the ring buffer.
@@ -70,13 +70,10 @@ impl<T> Producer<T> {
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
-            Some((data_ptr, seq_ptr, pos)) => {
+            Some((data_ptr, slot_seq, pos)) => {
                 // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
-                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
-                unsafe {
-                    (*seq_ptr).store(pos * 2 + 1, Ordering::Release);
-                }
+                slot_seq.store(pos * 2 + 1, Ordering::Release);
                 Ok(())
             }
             None => Err(val),
@@ -92,10 +89,9 @@ impl<T> Producer<T> {
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.claim_slot()
-            .map(|(data_ptr, seq_ptr, pos)| SlotWriter {
+            .map(|(data_ptr, slot_seq, pos)| SlotWriter {
                 slot_data: data_ptr,
-                // SAFETY: seq_ptr points into the RingBuffer kept alive by Arc.
-                slot_seq: unsafe { &*seq_ptr },
+                slot_seq,
                 pos,
             })
     }

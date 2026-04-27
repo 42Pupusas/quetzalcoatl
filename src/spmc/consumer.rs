@@ -104,10 +104,10 @@ impl<T> Consumer<T> {
     /// in one CAS, then pop from the local cursor without touching `head`
     /// for the next K-1 calls. This amortizes head-line invalidation.
     ///
-    /// Returns `(data_ptr, done_ptr, h)` on success. Returns `None` if
+    /// Returns `(data_ptr, done_ref, h)` on success. Returns `None` if
     /// the queue is empty (and producer not closed-and-drained).
     #[inline]
-    fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
         let q = &*self.queue;
         let mask = q.mask;
 
@@ -129,10 +129,7 @@ impl<T> Consumer<T> {
     /// in our local cursor for subsequent `claim_slot` calls).
     #[cold]
     #[inline(never)]
-    fn claim_batch(
-        &self,
-        mask: usize,
-    ) -> Option<(*const MaybeUninit<T>, *const AtomicUsize, usize)> {
+    fn claim_batch(&self, mask: usize) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
         let q = &*self.queue;
 
         let mut backoff = 0u32;
@@ -184,22 +181,18 @@ impl<T> Consumer<T> {
     /// ready store, so the slot's data is already initialized and
     /// observable; no spin needed.
     #[inline]
-    fn bind_pos(
-        &self,
-        h: usize,
-        _mask: usize,
-    ) -> (*const MaybeUninit<T>, *const AtomicUsize, usize) {
+    fn bind_pos(&self, h: usize, _mask: usize) -> (*const MaybeUninit<T>, &AtomicUsize, usize) {
         let q = &*self.queue;
         let data_ptr = q.data_slot(h).get().cast_const();
         let slot_done = q.done_slot(h);
-        (data_ptr, &raw const slot_done.0, h)
+        (data_ptr, &slot_done.0, h)
     }
 
     /// Pops an item from the ring buffer.
     #[inline]
     #[must_use]
     pub fn pop(&self) -> Option<T> {
-        let (data_ptr, done_ptr, head) = self.claim_slot()?;
+        let (data_ptr, slot_done, head) = self.claim_slot()?;
 
         // SAFETY: ready[s] == head+1 was verified, so data is initialized
         // and exclusively ours (FAA gave us a unique head ticket).
@@ -208,10 +201,7 @@ impl<T> Consumer<T> {
         // Release the slot via the consumer-write `done` line. The
         // producer at logical position head + cap will Acquire-load
         // done[s] == head + cap and proceed to overwrite the slot.
-        // SAFETY: done_ptr points into the RingBuffer kept alive by Arc.
-        unsafe {
-            (*done_ptr).store(head + self.queue.cap, Ordering::Release);
-        }
+        slot_done.store(head + self.queue.cap, Ordering::Release);
 
         Some(val)
     }
@@ -220,7 +210,10 @@ impl<T> Consumer<T> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
-        let (data_ptr, done_ptr, head) = self.claim_slot()?;
+        let (data_ptr, slot_done, head) = self.claim_slot()?;
+        // Cast to raw pointer because SlotReader is self-referential
+        // (holds &mut Consumer alongside this borrow into the same Arc).
+        let done_ptr: *const AtomicUsize = slot_done;
 
         Some(SlotReader {
             data_ptr,
