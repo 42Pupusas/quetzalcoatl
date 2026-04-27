@@ -756,7 +756,7 @@ mod tests {
                 .unwrap();
         }
 
-        let count = consumer.drain(|v| drop(v));
+        let count = consumer.drain(drop);
         assert_eq!(count, 3);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }

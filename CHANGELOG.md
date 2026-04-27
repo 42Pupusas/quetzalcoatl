@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-27
+
+### Fixed
+- Clippy: `Consumer::new` (SPMC) is now `const fn` (clippy::missing_const_for_fn).
+- Clippy: replaced `|v| drop(v)` with `drop` in MPSC drain test
+  (clippy::redundant_closure).
+
 ## [0.7.0] - 2026-04-27
 
 ### Changed
@@ -70,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.6.0...v0.7.0
 [0.1.0]: https://github.com/42Pupusas/quetzalcoatl/releases/tag/v0.1.0

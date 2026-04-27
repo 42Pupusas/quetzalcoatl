@@ -88,7 +88,7 @@ impl<T> Clone for Consumer<T> {
 unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T> Consumer<T> {
-    pub(super) fn new(queue: Arc<RingBuffer<T>>) -> Self {
+    pub(super) const fn new(queue: Arc<RingBuffer<T>>) -> Self {
         Self {
             queue,
             cached_tail: Cell::new(0),
