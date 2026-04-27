@@ -25,6 +25,25 @@ use super::RingBuffer;
 /// queue is empty-ish). 64 matches the test harness's batch size.
 const CONSUMED_FLUSH: usize = 64;
 
+/// On CAS-failure during pop, the loser advances `scan` by this many
+/// slots before retrying. A large skip dramatically reduces
+/// re-collisions because the contended slot's cacheline (and several
+/// adjacent ones touched by the winning consumer's recent activity)
+/// stays hot for ~hundreds of cycles after the CAS-write. Empirically
+/// 128 peaks throughput at cap=1024:
+///
+///   skip=8:    P2/Q2  93 M/s   P4/Q4  67 M/s
+///   skip=16:   P2/Q2 159 M/s   P4/Q4 114 M/s
+///   skip=32:   P2/Q2 195 M/s   P4/Q4 171 M/s
+///   skip=64:   P2/Q2 212 M/s   P4/Q4 236 M/s
+///   skip=128:  P2/Q2 237 M/s   P4/Q4 220 M/s
+///   skip=256:  P2/Q2 224 M/s   P4/Q4 175 M/s
+///
+/// Liveness: each pop walks `cap` slot indices (via `iters >=
+/// max_iters`), so any orphan is visited within `cap / CAS_FAIL_SKIP`
+/// pop attempts at worst.
+const CAS_FAIL_SKIP: usize = 128;
+
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     /// Private scan cursor. Logical position to start the next scan
@@ -158,16 +177,12 @@ impl<T> Consumer<T> {
 
                     return Some(val);
                 }
-                // CAS failed: another consumer claimed it. Skip ahead
-                // by a full cacheline of slots (8) instead of just 1.
-                // The slot we lost is on a cacheline that just got
-                // invalidated by the winner's CAS-write; the next 7
-                // slots on that line will also be hot. Jumping past
-                // the line gets us to fresh, less-contended state
-                // and significantly reduces the CAS-fail rate at
-                // higher consumer counts.
-                scan += 7; // +1 below makes it 8.
-                iters += 7;
+                // CAS failed: another consumer claimed it. Jump
+                // ahead by CAS_FAIL_SKIP slots (see const docs at
+                // module top) to avoid re-fighting on the contended
+                // line.
+                scan += CAS_FAIL_SKIP - 1;
+                iters += CAS_FAIL_SKIP - 1;
             }
 
             scan += 1;
