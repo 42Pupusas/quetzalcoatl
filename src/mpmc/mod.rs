@@ -96,7 +96,15 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Number of live producers. The last producer to drop sets `closed`.
     pub(crate) producer_count: CachePadded<AtomicUsize>,
+    /// Number of live consumers. Read by `claim_batch` (under
+    /// `mpmc-instrument`) to compute the FAA safety threshold.
+    pub(crate) consumer_count: CachePadded<AtomicUsize>,
     pub(crate) closed: CachePadded<AtomicBool>,
+
+    #[cfg(feature = "mpmc-instrument")]
+    pub(crate) instr_faa_eligible: CachePadded<AtomicUsize>,
+    #[cfg(feature = "mpmc-instrument")]
+    pub(crate) instr_cas_fallback: CachePadded<AtomicUsize>,
 }
 
 // SAFETY: Multi-producer claim via FAA on `claim` and split-plane
@@ -127,10 +135,26 @@ impl<T> RingBuffer<T> {
             claim: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
             producer_count: CachePadded(AtomicUsize::new(1)),
+            consumer_count: CachePadded(AtomicUsize::new(1)),
             closed: CachePadded(AtomicBool::new(false)),
+            #[cfg(feature = "mpmc-instrument")]
+            instr_faa_eligible: CachePadded(AtomicUsize::new(0)),
+            #[cfg(feature = "mpmc-instrument")]
+            instr_cas_fallback: CachePadded(AtomicUsize::new(0)),
             cap,
             mask: capacity.mask,
         }
+    }
+
+    /// Snapshot of the FAA-eligibility instrumentation counters.
+    /// Returns `(faa_eligible, cas_fallback)`.
+    #[cfg(feature = "mpmc-instrument")]
+    #[must_use]
+    pub fn instrument_counts(&self) -> (usize, usize) {
+        (
+            self.instr_faa_eligible.0.load(Ordering::Relaxed),
+            self.instr_cas_fallback.0.load(Ordering::Relaxed),
+        )
     }
 
     #[must_use]

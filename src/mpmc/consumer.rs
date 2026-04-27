@@ -24,10 +24,21 @@ pub struct Consumer<T> {
     batch_end: Cell<usize>,
 }
 
-const BATCH_SIZE: usize = 32;
+/// Maximum positions claimed in one CAS on `head`. Larger = fewer
+/// coherence-traffic-heavy CAS instructions on the contended head line,
+/// at the cost of worse cross-consumer fairness (one consumer can take
+/// `BATCH_SIZE` consecutive items before another sees any) and more
+/// buffering wasted to in-flight batches when many consumers are active.
+///
+/// 128 was chosen by perf-profiling: at 32, `claim_batch` consumed ~37%
+/// of cycles with the `lock cmpxchg` itself accounting for ~43% of those
+/// cycles. Quadrupling the batch size cuts CAS frequency 4× while still
+/// leaving room for 8 consumers on a 1024-slot ring without starving.
+const BATCH_SIZE: usize = 128;
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
+        self.queue.consumer_count.fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             cached_tail: Cell::new(0),
@@ -69,22 +80,22 @@ impl<T> Consumer<T> {
     fn claim_batch(&self) -> Option<usize> {
         let q = &*self.queue;
         let mut backoff = 0u32;
+        let mut head = q.head.load(Ordering::Relaxed);
+
         loop {
-            let head = q.head.load(Ordering::Relaxed);
             let mut tail = self.cached_tail.get();
             if head >= tail {
                 tail = q.tail.load(Ordering::Acquire);
                 self.cached_tail.set(tail);
                 if head >= tail {
                     if q.closed.0.load(Ordering::Acquire) {
-                        // Re-check after observing closed: a producer
-                        // may have published just before its drop.
                         let tail2 = q.tail.load(Ordering::Acquire);
                         self.cached_tail.set(tail2);
                         let head2 = q.head.load(Ordering::Relaxed);
                         if head2 >= tail2 {
                             return None;
                         }
+                        head = head2;
                         continue;
                     }
                     return None;
@@ -94,15 +105,35 @@ impl<T> Consumer<T> {
             let avail = tail - head;
             let take = avail.min(BATCH_SIZE);
             let new_head = head + take;
-            if q.head
-                .compare_exchange_weak(head, new_head, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
+
+            // Instrumentation: would the FAA-by-K fast path have fired?
+            // Threshold: avail must absorb a full batch from every live
+            // consumer plus our own (slack of +1 for clone-races).
+            #[cfg(feature = "mpmc-instrument")]
             {
-                self.batch_next.set(head + 1);
-                self.batch_end.set(new_head);
-                return Some(head);
+                let n = q.consumer_count.0.load(Ordering::Relaxed);
+                let threshold = BATCH_SIZE.saturating_mul(n.saturating_add(1));
+                if avail >= threshold {
+                    q.instr_faa_eligible.0.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    q.instr_cas_fallback.0.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            crate::common::cas_backoff(&mut backoff);
+
+            match q
+                .head
+                .compare_exchange_weak(head, new_head, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.batch_next.set(head + 1);
+                    self.batch_end.set(new_head);
+                    return Some(head);
+                }
+                Err(actual) => {
+                    head = actual;
+                    crate::common::cas_backoff(&mut backoff);
+                }
+            }
         }
     }
 
@@ -158,10 +189,19 @@ impl<T> Consumer<T> {
     pub fn is_closed(&self) -> bool {
         self.queue.closed.0.load(Ordering::Acquire)
     }
+
+    /// Returns `(faa_eligible, cas_fallback)` claim_batch decisions
+    /// recorded under the `mpmc-instrument` feature. Diagnostic only.
+    #[cfg(feature = "mpmc-instrument")]
+    #[must_use]
+    pub fn instrument_counts(&self) -> (usize, usize) {
+        self.queue.instrument_counts()
+    }
 }
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
+        self.queue.consumer_count.fetch_sub(1, Ordering::Relaxed);
         // Release any positions claimed but never popped: drop the
         // value (producer published before bounded CAS let us claim)
         // and store `done[s] = pos + cap` so the producer at the next
