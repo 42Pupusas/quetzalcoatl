@@ -104,6 +104,14 @@ unsafe impl<T: Sync> Sync for AlignedBuf<T> {}
 /// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
 /// keep the hot CAS loop's instruction footprint small — this code only
 /// matters under real contention.
+///
+/// Schedule:
+/// - calls 1-2: no spin (counter ramp-up only)
+/// - calls 3-7: 4, 8, 16, 32, 64 pauses (~17μs total)
+/// - calls 8+: 64 pauses (capped) + `yield_now` once we've spun
+///   long enough (~17μs) that the holder is more likely preempted
+///   than just slow. The yield is sparse — once the counter
+///   saturates — so it doesn't fire on contention bursts.
 #[inline(never)]
 pub fn cas_backoff(failures: &mut u32) {
     // Under Miri, spin_loop() is an interleaving point. Exponential
@@ -117,11 +125,17 @@ pub fn cas_backoff(failures: &mut u32) {
     {
         let f = *failures;
         if f > 1 {
-            for _ in 0..1u32 << f {
+            for _ in 0..1u32 << f.min(6) {
                 std::hint::spin_loop();
             }
         }
-        *failures = f.saturating_add(1).min(6);
+        // After we've saturated at f=6 and called again, we've spun
+        // 64 pauses repeatedly. Yield to give the holder a chance to
+        // run if it was preempted.
+        if f >= 8 {
+            std::thread::yield_now();
+        }
+        *failures = f.saturating_add(1).min(12);
     }
 }
 
