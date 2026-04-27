@@ -44,7 +44,7 @@ impl<T> Producer<T> {
         // (no atomic fence between this and the FAA), but avoids a
         // wasted FAA in the common "full" case.
         let next = q.claim.load(Ordering::Relaxed);
-        let next_done = q.done_slot(next).0.load(Ordering::Acquire);
+        let next_done = q.done_slot(next).load(Ordering::Acquire);
         if next_done != next {
             return Err(val);
         }
@@ -56,7 +56,7 @@ impl<T> Producer<T> {
         // cap) released this slot. Different producers spin on
         // different slots, no inter-producer contention here.
         let mut backoff = 0u32;
-        while done.0.load(Ordering::Acquire) != pos {
+        while done.load(Ordering::Acquire) != pos {
             crate::common::cas_backoff(&mut backoff);
         }
 
@@ -66,7 +66,7 @@ impl<T> Producer<T> {
         unsafe { (*data_ptr).write(val) };
 
         // Publish: ready[s] = pos + 1 → "published, available."
-        q.ready_slot(pos).0.store(pos + 1, Ordering::Release);
+        q.ready_slot(pos).store(pos + 1, Ordering::Release);
         Ok(())
     }
 }

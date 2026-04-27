@@ -89,7 +89,7 @@ impl<T> Consumer<T> {
         loop {
             // Read the slot. Decode (state, round_pos) from the value.
             let s = scan & mask;
-            let r = q.ready_slot(scan).0.load(Ordering::Acquire);
+            let r = q.ready_slot(scan).load(Ordering::Acquire);
             let delta = r.wrapping_sub(s);
             // `delta % cap` — `cap` is power-of-two so equivalent to
             // `& mask`. Compiler can't infer this from the runtime
@@ -105,7 +105,6 @@ impl<T> Consumer<T> {
                 // item.
                 let claimed_marker = round_pos + 2;
                 if q.ready_slot(scan)
-                    .0
                     .compare_exchange(r, claimed_marker, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
@@ -115,9 +114,7 @@ impl<T> Consumer<T> {
                     let val = unsafe { q.data_slot(scan).get().cast::<T>().read() };
                     // Release: done[s] = round_pos + cap → "free for
                     // the next round at logical pos round_pos + cap."
-                    q.done_slot(scan)
-                        .0
-                        .store(round_pos + cap, Ordering::Release);
+                    q.done_slot(scan).store(round_pos + cap, Ordering::Release);
                     // Advance scan to just past the consumed slot's
                     // round. We use round_pos + 1 (rather than
                     // scan + 1) so a successful claim of a "future"

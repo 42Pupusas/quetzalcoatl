@@ -51,17 +51,30 @@ fn main() {
         .into_iter()
         .map(|c| {
             let r = received.clone();
-            thread::spawn(move || loop {
-                if let Some(v) = c.pop() {
-                    black_box(v);
-                    r.fetch_add(1, Ordering::Relaxed);
-                } else if r.load(Ordering::Relaxed) >= target
-                    || (c.is_closed() && c.pop().is_none())
-                {
-                    while c.pop().is_some() {}
-                    break;
-                } else {
-                    std::hint::spin_loop();
+            thread::spawn(move || {
+                const FLUSH_EVERY: usize = 64;
+                let mut local = 0usize;
+                loop {
+                    if let Some(v) = c.pop() {
+                        black_box(v);
+                        local += 1;
+                        if local == FLUSH_EVERY {
+                            r.fetch_add(local, Ordering::Relaxed);
+                            local = 0;
+                        }
+                    } else {
+                        if local > 0 {
+                            r.fetch_add(local, Ordering::Relaxed);
+                            local = 0;
+                        }
+                        if r.load(Ordering::Relaxed) >= target
+                            || (c.is_closed() && c.pop().is_none())
+                        {
+                            while c.pop().is_some() {}
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
                 }
             })
         })

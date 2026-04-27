@@ -84,10 +84,21 @@ use std::sync::Arc;
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     /// Per-slot tri-state with round encoding. See module docs.
-    pub(crate) ready: AlignedBuf<CachePadded<AtomicUsize>>,
+    ///
+    /// **Not** `CachePadded` — slots are packed 8 per cacheline
+    /// (64-byte line / 8-byte `AtomicUsize`). The scan-based consumer
+    /// benefits from spatial locality: walking 8 consecutive slots is
+    /// 1 line load instead of 8. The cost is producer invalidating
+    /// nearby slots' lines on publish, but in steady-state (consumers
+    /// keeping up), producers move linearly through the ring and
+    /// touch each line exactly 8× before moving to the next, vs the
+    /// `CachePadded` layout where they touch each line 1× — same
+    /// total invalidations, just spread differently.
+    pub(crate) ready: AlignedBuf<AtomicUsize>,
     /// Per-slot "consumer released" marker. Producer for logical `pos`
-    /// spins on `done[s] == pos`.
-    pub(crate) done: AlignedBuf<CachePadded<AtomicUsize>>,
+    /// spins on `done[s] == pos`. Same packed layout as `ready` — the
+    /// access pattern is symmetric.
+    pub(crate) done: AlignedBuf<AtomicUsize>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     /// Producer claim cursor. FAA'd to assign unique logical positions.
@@ -118,7 +129,7 @@ impl<T> RingBuffer<T> {
         // ready[s] = s → "free for round 0" (logical pos s).
         let mut ridx = 0usize;
         let ready = AlignedBuf::new_with(cap, || {
-            let r = CachePadded(AtomicUsize::new(ridx));
+            let r = AtomicUsize::new(ridx);
             ridx += 1;
             r
         });
@@ -127,7 +138,7 @@ impl<T> RingBuffer<T> {
         // checks done[s] == s, which holds.
         let mut didx = 0usize;
         let done = AlignedBuf::new_with(cap, || {
-            let d = CachePadded(AtomicUsize::new(didx));
+            let d = AtomicUsize::new(didx);
             didx += 1;
             d
         });
@@ -153,14 +164,14 @@ impl<T> RingBuffer<T> {
     }
 
     #[inline]
-    pub(crate) fn ready_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
+    pub(crate) fn ready_slot(&self, pos: usize) -> &AtomicUsize {
         let idx = pos & self.mask;
         unsafe { std::hint::assert_unchecked(idx < self.ready.len()) };
         &self.ready[idx]
     }
 
     #[inline]
-    pub(crate) fn done_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
+    pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
         let idx = pos & self.mask;
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
         &self.done[idx]
@@ -171,10 +182,10 @@ impl<T> RingBuffer<T> {
     pub fn debug_snapshot(&self) -> (usize, Vec<usize>, Vec<usize>) {
         let claim = self.claim.load(Ordering::Acquire);
         let r: Vec<usize> = (0..self.cap)
-            .map(|s| self.ready[s].0.load(Ordering::Acquire))
+            .map(|s| self.ready[s].load(Ordering::Acquire))
             .collect();
         let d: Vec<usize> = (0..self.cap)
-            .map(|s| self.done[s].0.load(Ordering::Acquire))
+            .map(|s| self.done[s].load(Ordering::Acquire))
             .collect();
         (claim, r, d)
     }
@@ -202,8 +213,8 @@ impl<T> Drop for RingBuffer<T> {
         let cap = self.cap;
         let _ = self.mask;
         for s in 0..cap {
-            let r = *self.ready[s].0.get_mut();
-            let d = *self.done[s].0.get_mut();
+            let r = *self.ready[s].get_mut();
+            let d = *self.done[s].get_mut();
             // Decode: r = s + R*cap + state, where state ∈ {0,1,2}.
             let delta = r.wrapping_sub(s);
             let state = delta & self.mask;
