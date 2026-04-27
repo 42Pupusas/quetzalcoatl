@@ -12,6 +12,13 @@ use super::RingBuffer;
 /// bitmap below.
 const PRODUCER_BATCH: usize = 32;
 
+/// On the primary slot's `done` not being ready, how many tight-spin
+/// iterations before falling back to scanning other unused bits in
+/// the batch for a ready slot. Short enough to not waste cycles when
+/// the primary is about to release; long enough to amortize the
+/// bitmap-scan cost.
+const PRIMARY_SHORT_SPIN: u32 = 4;
+
 /// Producer for the relaxed-FIFO scan-based MPMC ring.
 ///
 /// Cloneable. Each producer reserves a *batch* of logical positions
@@ -128,16 +135,58 @@ impl<T> Producer<T> {
             self.batch_start.get()
         };
 
-        // Pick the lowest-index unused position. Spin on its `done`
-        // until ready.
-        let bit = unused.trailing_zeros();
-        let pos = start + bit as usize;
-        let done = q.done_slot(pos);
-        let mut backoff = 0u32;
-        while done.load(Ordering::Acquire) != pos {
-            crate::common::cas_backoff(&mut backoff);
+        // Pick the lowest-index unused position. Spin briefly on its
+        // `done`; if it's still held after a few iterations, try
+        // other unused positions in our batch — one of them might be
+        // ready while this one is stuck behind a slow consumer.
+        // (Out-of-order publishing within a batch.)
+        let primary_bit = unused.trailing_zeros();
+        let primary_pos = start + primary_bit as usize;
+        let mut bit = primary_bit;
+        let mut pos = primary_pos;
+
+        // First: a short spin on the primary. If consumer is just
+        // about to release, we save the cost of the bitmap scan.
+        let mut found_ready = false;
+        for _ in 0..PRIMARY_SHORT_SPIN {
+            if q.done_slot(primary_pos).load(Ordering::Acquire) == primary_pos {
+                found_ready = true;
+                break;
+            }
+            std::hint::spin_loop();
         }
-        // Clear the bit — this position is now consumed-by-us.
+
+        if !found_ready {
+            // Primary still blocked. Scan other unused bits for one
+            // whose slot IS ready right now.
+            let mut bits = unused & !(1u32 << primary_bit);
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                let p = start + b as usize;
+                if q.done_slot(p).load(Ordering::Acquire) == p {
+                    bit = b;
+                    pos = p;
+                    found_ready = true;
+                    break;
+                }
+                bits &= bits - 1;
+            }
+        }
+
+        if !found_ready {
+            // No ready slot anywhere; keep spinning on the primary
+            // with exponential backoff.
+            let done = q.done_slot(primary_pos);
+            let mut backoff = 0u32;
+            while done.load(Ordering::Acquire) != primary_pos {
+                crate::common::cas_backoff(&mut backoff);
+            }
+            // Use the primary.
+            bit = primary_bit;
+            pos = primary_pos;
+        }
+
+        // Clear the chosen bit — this position is now consumed-by-us.
         self.batch_unused.set(unused & !(1u32 << bit));
 
         // SAFETY: we own this position (batch reservation), and
