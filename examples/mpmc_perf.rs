@@ -1,13 +1,10 @@
-// Standalone driver for perf-profiling the MPMC hot path.
+// Standalone driver for perf-profiling the relaxed-FIFO MPMC scan
+// design. Mirror of mpmc_perf.rs for direct comparison.
 //
-// Usage: mpmc_perf <P> <Q> <total_items>
-//
-// Runs the same workload as the bench's mpmc/quick variant, but in a
-// single long-running process so `perf stat` / `perf record` can sample
-// meaningfully.
+// Usage: mpmc_scan_perf <P> <Q> <total_items>
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc::RingBuffer;
+use quetzalcoatl::mpmc_scan::RingBuffer;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,18 +14,9 @@ const TOTAL_CAPACITY: usize = 1024;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let p: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .expect("usage: mpmc_perf <P> <Q> <total_items>");
-    let q: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .expect("usage: mpmc_perf <P> <Q> <total_items>");
-    let total_items: u64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .expect("usage: mpmc_perf <P> <Q> <total_items>");
+    let p: usize = args.next().and_then(|s| s.parse().ok()).expect("P");
+    let q: usize = args.next().and_then(|s| s.parse().ok()).expect("Q");
+    let total_items: u64 = args.next().and_then(|s| s.parse().ok()).expect("total");
 
     let per_producer = total_items / p as u64;
     let actual_total = per_producer * p as u64;
@@ -37,12 +25,18 @@ fn main() {
     let received = Arc::new(AtomicUsize::new(0));
     let target = actual_total as usize;
 
+    // Consumers buffer local counts and only flush to `received` every
+    // FLUSH_EVERY items. This keeps the test-harness counter from
+    // becoming the throughput bottleneck — without batching, both
+    // consumers contend on the shared `received.fetch_add` line on
+    // every pop, masking actual queue performance.
+    const FLUSH_EVERY: usize = 64;
+
     let consumers: Vec<_> = (0..q)
         .map(|_| {
             let c = consumer.clone();
             let r = received.clone();
             thread::spawn(move || {
-                const FLUSH_EVERY: usize = 64;
                 let mut local = 0usize;
                 loop {
                     if let Some(v) = c.pop() {
@@ -53,6 +47,8 @@ fn main() {
                             local = 0;
                         }
                     } else {
+                        // Flush before checking termination so we
+                        // don't undercount near the end.
                         if local > 0 {
                             r.fetch_add(local, Ordering::Relaxed);
                             local = 0;
@@ -66,11 +62,6 @@ fn main() {
             })
         })
         .collect();
-
-    // Keep `consumer` alive past the worker threads so we can read the
-    // instrumentation counters at the end. (Under the
-    // `mpmc-instrument` feature only; harmless otherwise.)
-    let report_consumer = consumer.clone();
     drop(consumer);
 
     let producers: Vec<_> = (0..p)
@@ -98,28 +89,11 @@ fn main() {
     let elapsed = start.elapsed();
 
     eprintln!(
-        "MPMC P={} Q={}: {} items in {:?} ({:.2} M/s)",
+        "MPMC_SCAN P={} Q={}: {} items in {:?} ({:.2} M/s)",
         p,
         q,
         actual_total,
         elapsed,
         actual_total as f64 / elapsed.as_secs_f64() / 1e6
     );
-
-    #[cfg(feature = "mpmc-instrument")]
-    {
-        let (faa, cas) = report_consumer.instrument_counts();
-        let total = faa + cas;
-        let pct = if total == 0 {
-            0.0
-        } else {
-            (faa as f64 / total as f64) * 100.0
-        };
-        eprintln!(
-            "  claim_batch decisions: faa_eligible={faa} cas_fallback={cas} \
-             ({pct:.1}% would have taken FAA fast path)"
-        );
-    }
-    #[cfg(not(feature = "mpmc-instrument"))]
-    drop(report_consumer);
 }

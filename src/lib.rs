@@ -143,7 +143,6 @@ pub mod broadcast;
 pub mod capacity;
 pub(crate) mod common;
 pub mod mpmc;
-pub mod mpmc_scan;
 pub mod mpsc;
 pub mod spmc;
 pub mod spsc;
