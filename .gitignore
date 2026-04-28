@@ -7,6 +7,9 @@
 perf*.data
 perf*.data.old
 flamegraph*.svg
+# Repo-root SVGs are episode-specific diagnostic artifacts
+# (flamegraphs, regardless of naming convention).
+/*.svg
 
 # dhat heap profiles (diagnostic artifacts)
 dhat-*.json
