@@ -1,94 +1,83 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
-use super::RingBuffer;
+use super::{RingBuffer, PARK_MASK};
 
-/// Consumer for the relaxed-FIFO scan-based MPMC ring.
-///
-/// Each consumer keeps a private `next_scan` cursor (its guess at where
-/// to look next). On `pop`, the consumer reads `ready[s]` at the
-/// current scan position; if "published," it CASes the slot to the
-/// "claimed" state, reads the value, and releases via `done[s]`.
-/// Otherwise it scans forward, bounded by the producer's `claim`
-/// cursor.
-///
-/// No shared `head` cursor exists. Consumers contend per-slot, not on
-/// a global atomic, so contention is naturally distributed across the
-/// ring's `cap` cachelines.
-/// Number of pops between flushes of the local consumed counter to
-/// the shared `consumed` atomic. Producers use the shared counter to
-/// bound batched FAA on `claim`, so a flushed value that lags the
-/// real consumed count just makes producers underestimate free space
-/// (safe direction). Larger = lower flush frequency = less hot-line
-/// contention but staler bound (smaller producer batches when the
-/// queue is empty-ish). 64 matches the test harness's batch size.
+/// Pops between flushes of `local_consumed` to the shared
+/// `consumed` watermark. Tunes a tradeoff between watermark
+/// freshness (smaller producer batches when low) and hot-line
+/// traffic on `consumed` (worse when high).
 const CONSUMED_FLUSH: usize = 64;
 
-/// On CAS-failure during pop, the loser advances `scan` by this many
-/// slots before retrying. A large skip dramatically reduces
-/// re-collisions because the contended slot's cacheline (and several
-/// adjacent ones touched by the winning consumer's recent activity)
-/// stays hot for ~hundreds of cycles after the CAS-write. Empirically
-/// 128 peaks throughput at cap=1024:
+/// On CAS-failure during pop, advance `scan` by this many slots
+/// before retrying. A large skip dramatically reduces re-collisions
+/// because the contended slot's line stays hot for hundreds of
+/// cycles after a successful CAS.
 ///
-///   skip=8:    P2/Q2  93 M/s   P4/Q4  67 M/s
-///   skip=16:   P2/Q2 159 M/s   P4/Q4 114 M/s
-///   skip=32:   P2/Q2 195 M/s   P4/Q4 171 M/s
-///   skip=64:   P2/Q2 212 M/s   P4/Q4 236 M/s
-///   skip=128:  P2/Q2 237 M/s   P4/Q4 220 M/s
-///   skip=256:  P2/Q2 224 M/s   P4/Q4 175 M/s
+/// Empirical sweep at cap=1024:
 ///
-/// Liveness: each pop walks `cap` slot indices (via `iters >=
-/// max_iters`), so any orphan is visited within `cap / CAS_FAIL_SKIP`
-/// pop attempts at worst.
+/// | skip | P2/Q2 | P4/Q4 |
+/// |---|---|---|
+/// | 8   |  93 M/s |  67 M/s |
+/// | 64  | 212 M/s | 236 M/s |
+/// | 128 | 237 M/s | 220 M/s |
+/// | 256 | 224 M/s | 175 M/s |
+///
+/// Liveness: the iteration counter advances by the same amount,
+/// so a pop still terminates in `cap / CAS_FAIL_SKIP` retries
+/// regardless of skip size.
 const CAS_FAIL_SKIP: usize = 128;
 
+/// Cloneable consumer for an MPMC ring.
+///
+/// Each consumer keeps a private `next_scan` cursor and walks the
+/// ring looking for `published` slots, CAS-claiming the first one
+/// it finds. No shared head cursor — contention is distributed
+/// across the `cap` per-slot atomics.
 pub struct Consumer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
-    /// Private scan cursor. Logical position to start the next scan
-    /// from. On each `pop`, the consumer walks at most `cap` slots
-    /// forward from here, looking for a published slot it can claim.
+    /// Private scan cursor (logical position).
     next_scan: Cell<usize>,
-    /// Local count of pops since the last flush to the shared
-    /// `consumed` atomic. Flushed every `CONSUMED_FLUSH` pops.
+    /// Pops since the last `consumed` flush.
     local_consumed: Cell<usize>,
+    /// Stable park slot for this consumer (mod `PARK_SLOTS`).
+    park_slot: usize,
 }
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
-        // Stagger this consumer's starting scan position by one
-        // cap-fraction per clone. With N consumers, this distributes
-        // them at offsets 0, cap/N, 2*cap/N, ... so they scan
-        // different regions of the ring on the first pop instead of
-        // all racing slot 0.
-        //
-        // Safety: each consumer's pop walks `cap` slot indices per
-        // call, so any starting position visits the whole ring within
-        // one pop — orphan slots can't be stranded by the offset.
+        // Stagger starting scan position by `cap/8` per clone so
+        // new consumers don't all race slot 0 on the first pop.
         let n = self
             .queue
             .clone_counter
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        // Spread across the ring assuming ≤ 8 typical consumers.
-        // With more consumers, the modulo wraps and pairs of
-        // consumers share a starting region — but they still diverge
-        // over time as each advances locally. Using `cap / 8` is a
-        // compromise: large enough that small consumer counts get
-        // wide separation, small enough that 16-32 consumers don't
-        // need to wrap immediately.
         let stagger = (n * (self.queue.cap / 8).max(1)) & self.queue.mask;
+        // Distinct park slot per clone, mod PARK_SLOTS.
+        let park_idx = self
+            .queue
+            .consumer_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        // Bump the live-consumer count so producers can detect
+        // "all consumers gone" via consumer_closed.
+        self.queue
+            .consumer_count_live
+            .fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             next_scan: Cell::new(stagger),
             local_consumed: Cell::new(0),
+            park_slot: park_idx & PARK_MASK,
         }
     }
 }
 
-// SAFETY: Cell is !Sync, but Consumer is Send (each clone is single-
-// threaded). The queue Arc keeps the RingBuffer alive.
+// SAFETY: Cell is !Sync, but Consumer is Send because each handle
+// is single-threaded by contract. The Arc keeps the RingBuffer alive.
 unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T> Consumer<T> {
@@ -97,18 +86,16 @@ impl<T> Consumer<T> {
             queue,
             next_scan: Cell::new(0),
             local_consumed: Cell::new(0),
+            park_slot: 0,
         }
     }
 
-    /// Pops an item via scan. Returns the first published slot found at
-    /// or after `next_scan`, bounded by the producer's claim cursor.
+    /// Pops the first published slot found at or after `next_scan`,
+    /// returning `None` after one full lap of the ring without
+    /// finding any published item.
     ///
-    /// **Order:** within a single consumer's stream, items are returned
-    /// in the order their slots become published. Since multi-producer
-    /// publishing is out-of-order with claim order, the per-consumer
-    /// stream is *not* strict-FIFO of the original push order. Across
-    /// consumers, ordering is best-effort (each consumer follows its
-    /// own scan).
+    /// Items are returned in the order slots become published, not
+    /// in producer push order — see the module docs.
     #[inline]
     #[must_use]
     pub fn pop(&self) -> Option<T> {
@@ -118,64 +105,41 @@ impl<T> Consumer<T> {
 
         let start_scan = self.next_scan.get();
         let mut scan = start_scan;
-        // Walk at most `cap` distinct slot indices before declaring
-        // empty. Any published-unclaimed item lives at exactly one
-        // slot index `pos & mask`; one full lap of slots is sufficient
-        // to find it. We may revisit a slot index if `start_scan`
-        // happens to wrap past `claim`, but that's bounded.
         let max_iters = cap;
         let mut iters = 0usize;
 
         loop {
-            // Read the slot. Decode (state, round_pos) from the value.
+            // Decode `ready[s] = s + R*cap + state`, state ∈ {0,1,2}.
             let s = scan & mask;
             let r = q.ready_slot(scan).load(Ordering::Acquire);
             let delta = r.wrapping_sub(s);
-            // `delta % cap` — `cap` is power-of-two so equivalent to
-            // `& mask`. Compiler can't infer this from the runtime
-            // `cap`; the explicit `& mask` saves a `div`.
+            // delta % cap == delta & mask, since cap is a power of two.
             let state = delta & mask;
-            let round_pos = r.wrapping_sub(state); // s + R*cap
+            let round_pos = r.wrapping_sub(state);
 
             if state == 1 {
-                // Published. Try to claim. Note: we no longer require
-                // `round_pos <= scan` — we'll claim any published slot
-                // we find. Producer-side ordering already ensures the
-                // round in `ready[s]` corresponds to a real produced
-                // item.
                 let claimed_marker = round_pos + 2;
                 if q.ready_slot(scan)
                     .compare_exchange(r, claimed_marker, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    // SAFETY: producer wrote slot `s` for logical
-                    // position `round_pos`. Our successful CAS gives us
-                    // unique ownership.
+                    // SAFETY: the successful CAS gives us unique
+                    // ownership of slot `s` for round R, and the
+                    // producer for that round had committed the
+                    // value before storing state=1.
                     let val = unsafe { q.data_slot(scan).get().cast::<T>().read() };
-                    // Release: done[s] = round_pos + cap → "free for
-                    // the next round at logical pos round_pos + cap."
                     q.done_slot(scan).store(round_pos + cap, Ordering::Release);
-                    // Wake one parked producer if any. Single
-                    // u64 load on the fast path — Relaxed is OK
-                    // because any missed wake is bounded by the
-                    // producer's 200μs park timeout, while a
-                    // SeqCst load here would cost a full barrier
-                    // per pop and tank low-contention throughput.
-                    if q.wake_state.load(Ordering::Relaxed) != 0 {
-                        super::wake_one_parked(q);
+                    // Relaxed wake gate: a missed wake here is
+                    // covered by the producer's 200μs park timeout,
+                    // while a SeqCst load would tax every pop with
+                    // a full barrier.
+                    if q.producer_wake.load(Ordering::Relaxed) != 0 {
+                        super::wake_one_producer(q);
                     }
-                    // Advance scan to just past the consumed slot's
-                    // round. We use round_pos + 1 (rather than
-                    // scan + 1) so a successful claim of a "future"
-                    // slot doesn't make us skip back; max() with
-                    // start_scan + 1 keeps us moving forward.
+                    // Advance scan past the consumed slot, keeping
+                    // it monotonic in case we claimed a future slot.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
 
-                    // Flush local consumed count to the shared
-                    // `consumed` watermark every CONSUMED_FLUSH pops.
-                    // Producers use this to bound batched FAA on
-                    // `claim`. The `+ 1` covers the pop we're about
-                    // to return.
                     let lc = self.local_consumed.get() + 1;
                     if lc >= CONSUMED_FLUSH {
                         q.consumed.fetch_add(lc, Ordering::Relaxed);
@@ -186,10 +150,8 @@ impl<T> Consumer<T> {
 
                     return Some(val);
                 }
-                // CAS failed: another consumer claimed it. Jump
-                // ahead by CAS_FAIL_SKIP slots (see const docs at
-                // module top) to avoid re-fighting on the contended
-                // line.
+                // CAS lost — skip far enough that the contended
+                // line cools before our next attempt.
                 scan += CAS_FAIL_SKIP - 1;
                 iters += CAS_FAIL_SKIP - 1;
             }
@@ -197,33 +159,83 @@ impl<T> Consumer<T> {
             scan += 1;
             iters += 1;
             if iters >= max_iters {
-                // Walked through all `cap` slots; no published item
-                // found. Persist scan position so we resume from here
-                // next time.
                 self.next_scan.set(scan);
                 return None;
             }
         }
     }
 
-    /// Best-effort length: producers' claim cursor minus a coarse
-    /// estimate of consumed positions. Not precise.
+    /// Pops the next item, blocking the calling thread when the
+    /// ring is empty until a producer publishes one. Returns
+    /// `None` only when the ring is closed AND empty (no live
+    /// producers, nothing left to drain).
+    ///
+    /// Uses the same futex-style wake bitmap as the producer slow
+    /// path: spins briefly first, then sets a wake bit and parks.
+    /// Producers signal after every `ready[s].store(Release)`,
+    /// gated on a single `Relaxed` load so the no-park hot path
+    /// stays cheap.
+    #[must_use]
+    pub fn pop_block(&self) -> Option<T> {
+        let q = &*self.queue;
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if let Some(v) = self.pop() {
+                return Some(v);
+            }
+            // Empty AND closed AND really nothing left → done.
+            if q.closed.0.load(Ordering::Acquire) {
+                if let Some(v) = self.pop() {
+                    return Some(v);
+                }
+                return None;
+            }
+            // Spin until cas_backoff fully escalates (~tens of μs
+            // including yields) before paying for park.
+            if backoff < 12 {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            ensure_consumer_handle_installed(q, self.park_slot);
+            // SeqCst pairs with producer's `consumer_wake.load`
+            // after `ready.store(Release)`: either we see a
+            // published slot in the re-check below, or the
+            // producer sees our bit and unparks us.
+            q.consumer_wake.fetch_or(bit_mask, Ordering::SeqCst);
+
+            if let Some(v) = self.pop() {
+                q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return Some(v);
+            }
+            if q.closed.0.load(Ordering::Acquire) {
+                q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.pop();
+            }
+
+            std::thread::park_timeout(Duration::from_micros(200));
+            q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+        }
+    }
+
+    /// Best-effort approximate queue length. Not precise — this
+    /// design doesn't maintain a cheap exact `len`.
     #[must_use]
     pub fn approx_len(&self) -> usize {
         let claim = self.queue.claim.load(Ordering::Relaxed);
-        // We don't track total consumed; approximate by cap as upper
-        // bound. Honest answer: this design doesn't have a cheap len.
         let scan = self.next_scan.get();
         claim.wrapping_sub(scan).min(self.queue.cap)
     }
 
+    /// Returns `true` once the last [`Producer`](super::Producer)
+    /// has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.queue.closed.0.load(Ordering::Acquire)
     }
 
-    /// Diagnostic: returns `(my_next_scan, claim, ready_snapshot,
-    /// done_snapshot)`.
+    /// Diagnostic snapshot: `(next_scan, claim, ready[..], done[..])`.
     #[doc(hidden)]
     pub fn debug_snapshot(&self) -> (usize, usize, Vec<usize>, Vec<usize>) {
         let (claim, r, d) = self.queue.debug_snapshot();
@@ -233,17 +245,38 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
-        // No claimed-but-unread positions to release: in this design,
-        // claim and read happen atomically (CAS to claimed → read →
-        // store done). There's no "batch" of held positions to
-        // release.
-        //
-        // But: flush any unflushed `local_consumed` count to the
-        // shared watermark so producers don't permanently
-        // under-estimate free space after this consumer goes away.
+        // Flush the per-consumer count so producers' free-space
+        // estimate doesn't permanently lag this consumer's work.
         let lc = self.local_consumed.get();
         if lc > 0 {
             self.queue.consumed.fetch_add(lc, Ordering::Relaxed);
         }
+
+        // Last-consumer drop: flag `consumer_closed` and wake any
+        // producers parked in `push_block` so they can observe it
+        // and return Err.
+        if self
+            .queue
+            .consumer_count_live
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.queue.consumer_closed.0.store(true, Ordering::Release);
+            let mut bits = self.queue.producer_wake.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                if let Some(handle) = self.queue.producer_parkers[b].get() {
+                    handle.unpark();
+                }
+                bits &= bits - 1;
+            }
+        }
     }
+}
+
+/// Idempotently installs the current thread's `Thread` handle in
+/// `q.consumer_parkers[slot]`. See producer-side analogue.
+#[inline]
+fn ensure_consumer_handle_installed<T>(q: &RingBuffer<T>, slot: usize) {
+    let _ = q.consumer_parkers[slot].set(std::thread::current());
 }

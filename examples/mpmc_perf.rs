@@ -1,10 +1,10 @@
 // Standalone driver for perf-profiling the relaxed-FIFO MPMC scan
 // design. Mirror of mpmc_perf.rs for direct comparison.
 //
-// Usage: mpmc_scan_perf <P> <Q> <total_items>
+// Usage: mpmc_perf <P> <Q> <total_items>
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc_scan::RingBuffer;
+use quetzalcoatl::mpmc::RingBuffer;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,11 +1,11 @@
-// Stacked-iteration version of mpmc_scan_perf for flamegraph capture.
+// Stacked-iteration version of mpmc_perf for flamegraph capture.
 // Runs the scenario `iters` times back-to-back so the profile spans
 // long enough to be statistically representative.
 //
-// Usage: mpmc_scan_long <P> <Q> <total_items> <iters>
+// Usage: mpmc_long <P> <Q> <total_items> <iters>
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc_scan::RingBuffer;
+use quetzalcoatl::mpmc::RingBuffer;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

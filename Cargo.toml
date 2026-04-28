@@ -16,6 +16,18 @@ readme = "README.md"
 # CAS/FAA path would fire on a given workload before committing to the
 # implementation. Not for production use.
 mpmc-instrument = []
+# Enables `dhat` heap profiling in examples that opt in (currently
+# `mpmc_vs_nspmc_dhat`). Run with:
+#   cargo run --release --example mpmc_vs_nspmc_dhat --features dhat-heap
+# Output is `dhat-heap.json`, loadable in https://nnethercote.github.io/dh_view/dh_view.html
+# Note: `dhat` is declared under `[dependencies]` rather than
+# `[dev-dependencies]` because Cargo disallows optional
+# dev-dependencies, but it's only pulled in when this feature is
+# enabled — production builds are unaffected.
+dhat-heap = ["dep:dhat"]
+
+[dependencies]
+dhat = { version = "0.3", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

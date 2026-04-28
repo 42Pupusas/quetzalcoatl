@@ -1,7 +1,7 @@
-// Pinned-thread version of mpmc_scan_perf for testing whether
+// Pinned-thread version of mpmc_perf for testing whether
 // scheduling/SMT placement explains the p8_q8 variance.
 //
-// Usage: mpmc_scan_pinned <P> <Q> <total_items> <iters> <strategy>
+// Usage: mpmc_pinned <P> <Q> <total_items> <iters> <strategy>
 //
 // Strategies:
 //   spread     — pin to even cpus (one per physical core); will oversubscribe at p+q>8
@@ -10,7 +10,7 @@
 //   none       — no pinning (baseline)
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc_scan::RingBuffer;
+use quetzalcoatl::mpmc::RingBuffer;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,74 +1,57 @@
-//! Multi-producer, multi-consumer ring with relaxed-FIFO scan-based
-//! consumer claim. Trades strict cross-consumer FIFO for elimination of
-//! the shared `head` cursor and its M-way CAS contention.
+//! Multi-producer, multi-consumer ring with relaxed-FIFO ordering.
 //!
-//! # Design
+//! Producers reserve batches of logical positions via FAA on a shared
+//! `claim` cursor, then publish out-of-order into whichever slot in
+//! their batch becomes free first. Consumers scan the ring from a
+//! private cursor and CAS-claim the first published slot they see.
+//! No shared consumer-side cursor exists — contention is distributed
+//! across `cap` per-slot atomics rather than concentrated on a single
+//! `head` line.
 //!
-//! No shared consumer-side cursor. Each consumer maintains a private
-//! `next_scan` position and walks the ring looking for slots in the
-//! "published" state, claiming via CAS on the per-slot `ready` atomic.
-//! Consumers naturally drift apart over time (each one only advances
-//! its private cursor on successful claim), so contention on any
-//! individual slot's `ready` line is rare — typically just the producer
-//! handoff to the first consumer to find it.
+//! # Ordering guarantees
 //!
-//! The shared cacheline traffic shifts from "M consumers fighting over
-//! one `head` line" to "one producer + at most one consumer per slot,
-//! distributed across `cap` independent lines." That's the contention
-//! profile modern CPUs are best at.
+//! - **No FIFO** across producers, across consumers, or even within
+//!   a single producer's own stream. Items are returned in the order
+//!   their slots become published (which depends on consumer release
+//!   order, scheduling, and contention).
+//! - Use [`spsc`](crate::spsc) or [`spmc`](crate::spmc) if strict
+//!   ordering matters.
 //!
-//! # Per-slot state encoding
+//! # Capacity
 //!
-//! `ready[s]` cycles through three states per round, encoded so the
-//! state and round are both recoverable from the value alone:
+//! Requires `cap >= 4` (the per-slot tri-state encoding aliases at
+//! `cap < 3`). [`RingBuffer::new`] panics on smaller capacities.
 //!
-//! | State | Value | Meaning |
-//! |---|---|---|
-//! | Free | `s + R*cap` | producer for round R may fill |
-//! | Published | `s + R*cap + 1` | available for any consumer |
-//! | Claimed | `s + R*cap + 2` | a consumer owns this position |
+//! # Thread-count guidance
 //!
-//! Detecting the state from `ready[s] = v`:
-//! - `(v - s) % cap == 0` → free
-//! - `(v - s) % cap == 1` → published
-//! - `(v - s) % cap == 2` → claimed
+//! Producers fall back to OS-level park (futex-style wake bitmap)
+//! when their batch's slots aren't yet released by consumers. This
+//! lets the kernel reschedule the core to a runnable consumer
+//! instead of burning cycles on a spin loop.
 //!
-//! Wraparound aliasing: round R "claimed" (`s + R*cap + 2`) and round
-//! R+1 "free" (`s + R*cap + cap`) are distinct iff `cap >= 3`. We
-//! require `cap >= 4` as a safety margin (and to avoid degenerate
-//! single-slot semantics).
+//! Even so, throughput becomes **highly variable** when the total
+//! thread count (P producers + Q consumers) saturates the machine.
+//! On an N-physical-core SMT machine you have 2N logical CPUs; once
+//! P + Q approaches 2N, every spinning thread shares decode
+//! bandwidth with its SMT sibling and OS scheduling decisions
+//! dominate run-to-run variance.
 //!
-//! `done[s]` is unchanged from the FIFO MPMC: cycles `s, s+cap,
-//! s+2*cap, ...`. Producer for logical `pos` waits for `done[s] ==
-//! pos`; consumer at logical `pos` stores `done[s] = pos + cap`.
+//! Rules of thumb:
+//! - **P + Q ≤ N (physical cores)**: tight, predictable throughput.
+//! - **N < P + Q < 2N**: still good, mild SMT-pairing variance.
+//! - **P + Q ≈ 2N**: bimodal — peak throughput is high, but worst
+//!   case can be 5–10× slower depending on how the scheduler maps
+//!   threads onto SMT-paired cores. The futex park/unpark mitigates
+//!   this but doesn't eliminate it.
+//! - **P + Q > 2N**: oversubscription — threads time-slice on
+//!   spin loops and throughput collapses. Avoid this regime.
 //!
-//! # Trade-offs vs strict-FIFO MPMC
-//!
-//! - **No FIFO of any kind.** Consumers find published items by
-//!   scanning the ring, so cross-producer order is lost. Within a
-//!   single producer's stream, push order is also not preserved:
-//!   each producer reserves a batch of positions and publishes
-//!   *out of order* into them — picking whichever position has its
-//!   slot already free, falling back to spinning on the lowest only
-//!   if no slot is ready. This converts producer-spin time into
-//!   productive publishing under contention.
-//! - **Empty-queue cost is O(scan bound) per `pop`,** vs O(1) for the
-//!   FIFO variant's tail check. Workloads with frequent empty polls
-//!   pay more here.
-//! - **No `tail` watermark** for `is_empty`/`is_full`/`len` — these
-//!   become approximate or scan-based. We expose them as best-effort.
-//!
-//! # When to choose this variant
-//!
-//! Use when:
-//! - You have many consumers (≥4) all draining the same logical work.
-//! - Throughput matters more than strict ordering.
-//! - The queue is rarely empty (sustained producer pressure).
-//!
-//! Use the strict-FIFO `mpmc` variant when:
-//! - You need cross-consumer ordering guarantees.
-//! - Empty-queue polling is frequent.
-//! - Capacity is small (< 4) or consumer count is low (≤ 2).
+//! In practice, size your producer + consumer pool to leave at
+//! least a few logical CPUs idle for the OS and any background
+//! work. Benchmark the specific (P, Q) shape you intend to deploy;
+//! mismatched shapes (e.g. P=8, Q=4) often outperform balanced
+//! ones at the same total thread count because there's scheduling
+//! slack.
 
 mod consumer;
 mod producer;
@@ -85,88 +68,66 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 
-/// Number of producer park slots. Each producer takes a stable
-/// slot index (modulo this) at clone time; bit `i` of `wake_state`
-/// signals "producer in slot `i` is parked."
-///
-/// 64 fits a single `AtomicU64` for the wake bitmap, capping the
-/// number of distinct concurrently-parking producers we can wake
-/// individually. Beyond 64 producers, slot indices alias and a
-/// wake on bit `i` rouses every producer mapped to `i` (correct
-/// but slightly wasteful).
+/// Park-slot count. Each producer takes a stable slot at clone
+/// time; bit `i` of `producer_wake` flags "slot `i` parked." 64 fits
+/// in a single `AtomicU64`. Beyond 64 producers, slots alias and
+/// a wake on bit `i` rouses any producer mapped there (benign
+/// false wake; the woken producer re-checks and re-parks).
 pub(crate) const PARK_SLOTS: usize = 64;
 pub(crate) const PARK_MASK: usize = PARK_SLOTS - 1;
 
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
-    /// Per-slot tri-state with round encoding. See module docs.
-    ///
-    /// **Not** `CachePadded` — slots are packed 8 per cacheline
-    /// (64-byte line / 8-byte `AtomicUsize`). The scan-based consumer
-    /// benefits from spatial locality: walking 8 consecutive slots is
-    /// 1 line load instead of 8. The cost is producer invalidating
-    /// nearby slots' lines on publish, but in steady-state (consumers
-    /// keeping up), producers move linearly through the ring and
-    /// touch each line exactly 8× before moving to the next, vs the
-    /// `CachePadded` layout where they touch each line 1× — same
-    /// total invalidations, just spread differently.
+    /// Per-slot tri-state with round encoding (free / published /
+    /// claimed). Packed 8 per cacheline (not `CachePadded`) so a
+    /// consumer scan amortizes one line load across 8 slots.
     pub(crate) ready: AlignedBuf<AtomicUsize>,
-    /// Per-slot "consumer released" marker. Producer for logical `pos`
-    /// spins on `done[s] == pos`. Same packed layout as `ready` — the
-    /// access pattern is symmetric.
+    /// Per-slot "consumer released" marker. Producer for logical
+    /// `pos` waits on `done[s] == pos`; consumer for `pos` stores
+    /// `done[s] = pos + cap`.
     pub(crate) done: AlignedBuf<AtomicUsize>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
-    /// Producer claim cursor. FAA'd to assign unique logical positions.
+    /// Producer claim cursor. FAA'd to reserve batches of positions.
     pub(crate) claim: CachePadded<AtomicUsize>,
-    /// Coarse "consumed" watermark — a lower bound on the number of
-    /// items consumers have popped. Consumers buffer local counts and
-    /// flush to this counter every `CONSUMED_FLUSH` pops. Producers
-    /// use it (loosely) to bound batched FAA on `claim` so a single
-    /// FAA never claims more positions than the ring can hold.
-    /// Flushing is rare and the producer's batch sizing only needs an
-    /// approximate bound, so the line stays mostly cool.
+    /// Coarse "items consumed" watermark — a lower bound, flushed
+    /// from per-consumer locals every `CONSUMED_FLUSH` pops.
+    /// Producers use it to bound their per-batch FAA on `claim`.
     pub(crate) consumed: CachePadded<AtomicUsize>,
-    /// Number of live producers; last-drop sets `closed`.
+    /// Live producer count; last-drop sets `producer_closed`.
     pub(crate) producer_count: CachePadded<AtomicUsize>,
-    /// Monotonic counter incremented on each Consumer clone. Each
-    /// new consumer derives a starting `next_scan` offset from this
-    /// to spread consumers across the ring instead of stacking them
-    /// all at scan=0. Touched only at clone time, so it doesn't
-    /// affect the hot path.
+    /// Live consumer count; last-drop sets `consumer_closed`.
+    pub(crate) consumer_count_live: CachePadded<AtomicUsize>,
+    /// Set by the last `Consumer` drop. `Producer::push_block`
+    /// observes this and returns `Err(val)` instead of hanging
+    /// (no consumer left to drain).
+    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    /// Monotonic counter, bumped on each `Consumer::clone`. Used
+    /// to stagger new consumers' starting scan offsets.
     pub(crate) clone_counter: CachePadded<AtomicUsize>,
     pub(crate) closed: CachePadded<AtomicBool>,
-    /// Futex-style wake bitmap: bit `i` set ↔ producer in park slot
-    /// `i` is currently parked, awaiting a `done[s]` release.
-    ///
-    /// Producer parks: `parkers[i] = thread_handle`; then
-    /// `wake_state.fetch_or(1 << i, SeqCst)`; then re-check `done`;
-    /// then `park`.
-    /// Consumer wakes: after `done[s].store(Release)`, load
-    /// `wake_state` (Relaxed). If non-zero, pick a set bit, atomic
-    /// `fetch_and(!(1 << i))` to claim it; if our `fetch_and`
-    /// actually cleared the bit, read `parkers[i]` and `unpark`.
-    ///
-    /// Single 64-bit line — far cheaper than walking a parker
-    /// pointer ring on every pop.
-    pub(crate) wake_state: CachePadded<AtomicU64>,
-    /// Stable per-park-slot `Thread` handle storage. Producer at
-    /// slot `i` initializes its handle here on first park; the
-    /// handle stays for the lifetime of the queue (idempotent
-    /// `OnceLock::set`). Consumers obtain a `&Thread` reference
-    /// via `OnceLock::get`, valid for as long as `&self` (i.e.
-    /// the queue) is live — no raw pointers, no manual lifetime
-    /// reasoning.
-    ///
-    /// Slot aliasing (when more than `PARK_SLOTS` producers ever
-    /// existed) means the `OnceLock` is set by the first producer
-    /// to claim that slot, and subsequent producers' `set()`
-    /// calls return `Err` and are no-ops. A wake on a shared bit
-    /// then `unpark`s the first installer — possibly the wrong
-    /// producer (false wake — benign; the woken producer just
-    /// re-checks and re-parks).
-    pub(crate) parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Producer-side futex-style wake bitmap. Bit `i` set ↔ a
+    /// producer in park slot `i` is parked waiting for a `done[s]`
+    /// release. Consumers read this `Relaxed` after each release
+    /// and wake one parked producer if non-zero.
+    pub(crate) producer_wake: CachePadded<AtomicU64>,
+    /// Producer-side `Thread` handle table. Idempotently set by
+    /// the first producer that parks at each slot; readers
+    /// (consumers issuing wakes) obtain a `&Thread` via
+    /// `OnceLock::get`.
+    pub(crate) producer_parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Consumer-side futex-style wake bitmap. Bit `i` set ↔ a
+    /// consumer in park slot `i` is parked waiting for any
+    /// `ready[s]` publish. Producers read this `Relaxed` after
+    /// each publish and wake one parked consumer if non-zero.
+    pub(crate) consumer_wake: CachePadded<AtomicU64>,
+    /// Consumer-side `Thread` handle table. Mirror of
+    /// [`producer_parkers`].
+    pub(crate) consumer_parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Monotonic counter for assigning stable park-slot indices to
+    /// `Consumer` clones. Bumped at clone time only.
+    pub(crate) consumer_count: CachePadded<AtomicUsize>,
 }
 
 // SAFETY: All shared state is atomic; per-slot CAS gives unique
@@ -175,28 +136,26 @@ unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
+    /// Creates a new MPMC ring buffer.
+    ///
     /// # Panics
-    /// Panics if `capacity.get() < 4`. The encoding requires `cap >= 3`
-    /// for correctness; we require `>= 4` (the smallest power of two
-    /// satisfying that) to keep round arithmetic non-degenerate.
+    ///
+    /// Panics if `capacity.get() < 4`. The per-slot tri-state
+    /// encoding aliases at smaller capacities.
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
-        assert!(
-            cap >= 4,
-            "mpmc_scan requires capacity >= 4; use mpmc for smaller rings"
-        );
+        assert!(cap >= 4, "mpmc requires capacity >= 4");
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
-        // ready[s] = s → "free for round 0" (logical pos s).
+        // ready[s] = s → free for round 0 at logical pos s.
         let mut ridx = 0usize;
         let ready = AlignedBuf::new_with(cap, || {
             let r = AtomicUsize::new(ridx);
             ridx += 1;
             r
         });
-        // done[s] = s → "previous round (-1) consumer at logical pos s
-        // - cap released this slot." For round 0, producer at logical s
-        // checks done[s] == s, which holds.
+        // done[s] = s → previous round (-1) released this slot, so
+        // the round-0 producer's check `done[s] == s` holds.
         let mut didx = 0usize;
         let done = AlignedBuf::new_with(cap, || {
             let d = AtomicUsize::new(didx);
@@ -211,12 +170,17 @@ impl<T> RingBuffer<T> {
             claim: CachePadded(AtomicUsize::new(0)),
             consumed: CachePadded(AtomicUsize::new(0)),
             producer_count: CachePadded(AtomicUsize::new(1)),
+            consumer_count_live: CachePadded(AtomicUsize::new(1)),
             clone_counter: CachePadded(AtomicUsize::new(0)),
             closed: CachePadded(AtomicBool::new(false)),
+            consumer_closed: CachePadded(AtomicBool::new(false)),
             cap,
             mask: capacity.mask,
-            wake_state: CachePadded(AtomicU64::new(0)),
-            parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            producer_wake: CachePadded(AtomicU64::new(0)),
+            producer_parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            consumer_wake: CachePadded(AtomicU64::new(0)),
+            consumer_parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            consumer_count: CachePadded(AtomicUsize::new(0)),
         }
     }
 
@@ -242,7 +206,7 @@ impl<T> RingBuffer<T> {
         &self.done[idx]
     }
 
-    /// Diagnostic: returns `(claim, snapshot of ready[..], snapshot of done[..])`.
+    /// Diagnostic snapshot: `(claim, ready[..], done[..])`.
     #[doc(hidden)]
     pub fn debug_snapshot(&self) -> (usize, Vec<usize>, Vec<usize>) {
         let claim = self.claim.load(Ordering::Acquire);
@@ -255,6 +219,9 @@ impl<T> RingBuffer<T> {
         (claim, r, d)
     }
 
+    /// Splits the ring into a [`Producer`] and a [`Consumer`].
+    /// Both handles are cloneable for additional producer/consumer
+    /// threads.
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
@@ -266,94 +233,76 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        // At drop time, all Producer/Consumer handles are gone (we
-        // hold &mut self). So no consumer is mid-pop. A slot has
-        // live data iff:
-        //   - state == 1 (published), and consumer never claimed it
-        //   - state == 2 (claimed) where the claiming consumer's read
-        //     completed but never released done[s]. In our protocol,
-        //     consumer always reads-then-stores done in the same call,
-        //     so post-release done[s] == round_pos + cap and the value
-        //     has already been moved out. We detect this via done[s].
+        // All Producer/Consumer handles are gone (we hold &mut self),
+        // so we can read state non-atomically. A slot holds live
+        // data when ready[s] is `published` (state 1) or `claimed
+        // but not released` (state 2 with done[s] != round_pos+cap).
         let cap = self.cap;
-        let _ = self.mask;
         for s in 0..cap {
             let r = *self.ready[s].get_mut();
             let d = *self.done[s].get_mut();
-            // Decode: r = s + R*cap + state, where state ∈ {0,1,2}.
             let delta = r.wrapping_sub(s);
             let state = delta & self.mask;
             let round = delta / cap;
             let round_pos = s + round * cap;
             if state == 1 {
-                // Published. Consumer never claimed → value is live.
-                // (If consumer had claimed, ready would be at state 2.)
-                // Sanity: done[s] should equal round_pos (producer's
-                // round, not yet released). Either way, value is live.
-                let _ = d;
                 // SAFETY: published, never claimed → initialized,
                 // never moved.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();
                 }
-            } else if state == 2 {
-                // Claimed. Consumer either fully completed (read +
-                // released done) or aborted before reading. Distinguish
-                // via done[s]: if done[s] == round_pos + cap, the
-                // consumer released after reading → value moved out,
-                // do NOT drop. Otherwise the value is still in the
-                // slot (consumer claimed but never read; in our
-                // protocol that doesn't happen, but be defensive).
-                if d != round_pos + cap {
-                    // SAFETY: claimed but not released → producer
-                    // wrote, consumer never moved out.
-                    unsafe {
-                        self.data[s].get().cast::<T>().drop_in_place();
-                    }
+            } else if state == 2 && d != round_pos + cap {
+                // SAFETY: claimed but consumer never released
+                // done[s], so the value is still in the slot.
+                unsafe {
+                    self.data[s].get().cast::<T>().drop_in_place();
                 }
             }
-            // state == 0 → free, no live data.
         }
-
-        // OnceLock<Thread> in `parkers` cleans itself up — no
-        // manual reclamation needed.
+        // OnceLock<Thread> entries in `producer_parkers` clean themselves up.
     }
 }
 
-/// Wakes one parked producer (if any).
+/// Wakes one peer parked on a wake bitmap. Caller must gate this
+/// on `wake.load(Relaxed) != 0` for the fast-path no-cost case.
 ///
-/// Reads `wake_state`, picks a set bit, atomically clears it, and
-/// `unpark`s the corresponding `parkers[i]` thread. Caller MUST
-/// gate this on `wake_state.load(Relaxed) != 0` so the no-park-no-cost
-/// fast path stays cheap.
+/// Used twice: by the consumer hot path to wake a producer parked
+/// in `push`, and by the producer hot path to wake a consumer
+/// parked in `pop_block`. The two sides have independent wake
+/// bitmaps (`producer_wake` / `consumer_wake`) and parker tables.
 ///
-/// Concurrent consumers racing on the same set bit: only one's
-/// `fetch_and` actually clears the bit (the other sees the bit
-/// already clear in the returned old value). The winner unparks;
-/// losers do nothing.
+/// Concurrent peers racing on the same set bit: only one's
+/// `fetch_and` actually clears it; the loser observes the bit
+/// already clear and skips the unpark.
 #[inline]
-pub(crate) fn wake_one_parked<T>(q: &RingBuffer<T>) {
-    let ws = q.wake_state.load(Ordering::Relaxed);
+fn wake_one(wake: &AtomicU64, parkers: &[OnceLock<Thread>]) {
+    let ws = wake.load(Ordering::Relaxed);
     if ws == 0 {
         return;
     }
-    // Pick the lowest set bit. Doesn't matter which — every bit
-    // represents an interchangeable parked producer.
     let bit = ws.trailing_zeros();
     let mask = 1u64 << bit;
-    // Atomic clear: only one consumer wins per bit. `prev & mask`
-    // tells us if WE cleared it.
-    let prev = q.wake_state.fetch_and(!mask, Ordering::Relaxed);
+    let prev = wake.fetch_and(!mask, Ordering::Relaxed);
     if prev & mask == 0 {
-        // Some other consumer beat us to it; nothing to do.
         return;
     }
-    if let Some(handle) = q.parkers[bit as usize].get() {
+    if let Some(handle) = parkers[bit as usize].get() {
         handle.unpark();
     }
-    // None case: producer set its wake bit before installing its
-    // handle. Benign — that producer's own re-check after install
-    // will catch the missed wake.
+    // OnceLock None: peer set its bit before installing its handle.
+    // Benign — its own re-check after install catches the wake.
+}
+
+/// Wakes one parked producer. Mirror of [`wake_one_consumer`].
+#[inline]
+pub(crate) fn wake_one_producer<T>(q: &RingBuffer<T>) {
+    wake_one(&q.producer_wake, &q.producer_parkers);
+}
+
+/// Wakes one parked consumer. Mirror of [`wake_one_producer`].
+#[inline]
+pub(crate) fn wake_one_consumer<T>(q: &RingBuffer<T>) {
+    wake_one(&q.consumer_wake, &q.consumer_parkers);
 }
 
 #[cfg(test)]
@@ -362,7 +311,7 @@ mod tests {
     use crate::capacity::Capacity;
 
     #[test]
-    #[should_panic(expected = "mpmc_scan requires capacity >= 4")]
+    #[should_panic(expected = "mpmc requires capacity >= 4")]
     fn rejects_small_capacity() {
         let _ = RingBuffer::<u8>::new(Capacity::exact(2));
     }
@@ -409,6 +358,76 @@ mod tests {
     fn empty_returns_none() {
         let (_p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
         assert_eq!(c.pop(), None);
+    }
+
+    #[test]
+    fn pop_block_wakes_on_push() {
+        // Producer publishes after consumer is parked; consumer
+        // must wake and observe the value.
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(7).unwrap();
+        assert_eq!(h.join().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn pop_block_returns_none_on_close() {
+        // After all producers drop and the queue is empty,
+        // pop_block must return None instead of hanging.
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(p);
+        assert_eq!(h.join().unwrap(), None);
+    }
+
+    #[test]
+    fn push_block_unblocks_on_pop() {
+        // Fill the ring, then verify push_block waits for a pop
+        // and then succeeds.
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let p2 = p.clone();
+        let h = std::thread::spawn(move || p2.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let v = c.pop().unwrap();
+        assert!(v < 4);
+        assert_eq!(h.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn push_block_returns_err_on_consumer_close() {
+        // Drop the consumer; push_block should observe close and
+        // return Err, returning the value back to the caller.
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let p2 = p.clone();
+        let h = std::thread::spawn(move || p2.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(c);
+        assert_eq!(h.join().unwrap(), Err(99));
+    }
+
+    #[test]
+    fn pop_block_drains_before_close() {
+        // Items pushed before the producer drops must still be
+        // returned, even when the producer drops between push
+        // and pop_block.
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        drop(p);
+        let mut got = vec![c.pop_block().unwrap(), c.pop_block().unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+        assert_eq!(c.pop_block(), None);
     }
 
     #[test]
@@ -514,7 +533,7 @@ mod tests {
 
     #[test]
     #[ignore = "stress test — slow under Miri"]
-    fn stress_mpmc_scan() {
+    fn stress_mpmc() {
         let total: u64 = 4000;
         let p_count: u64 = 4;
         let c_count: u64 = 4;
