@@ -3,32 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{RingBuffer, PARK_MASK};
-
-/// Pops between flushes of `local_consumed` to the shared
-/// `consumed` watermark. Tunes a tradeoff between watermark
-/// freshness (smaller producer batches when low) and hot-line
-/// traffic on `consumed` (worse when high).
-const CONSUMED_FLUSH: usize = 64;
-
-/// On CAS-failure during pop, advance `scan` by this many slots
-/// before retrying. A large skip dramatically reduces re-collisions
-/// because the contended slot's line stays hot for hundreds of
-/// cycles after a successful CAS.
-///
-/// Empirical sweep at cap=1024:
-///
-/// | skip | P2/Q2 | P4/Q4 |
-/// |---|---|---|
-/// | 8   |  93 M/s |  67 M/s |
-/// | 64  | 212 M/s | 236 M/s |
-/// | 128 | 237 M/s | 220 M/s |
-/// | 256 | 224 M/s | 175 M/s |
-///
-/// Liveness: the iteration counter advances by the same amount,
-/// so a pop still terminates in `cap / CAS_FAIL_SKIP` retries
-/// regardless of skip size.
-const CAS_FAIL_SKIP: usize = 128;
+use super::{Config, DefaultConfig, RingBuffer, PARK_MASK};
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -36,8 +11,8 @@ const CAS_FAIL_SKIP: usize = 128;
 /// ring looking for `published` slots, CAS-claiming the first one
 /// it finds. No shared head cursor — contention is distributed
 /// across the `cap` per-slot atomics.
-pub struct Consumer<T> {
-    pub(super) queue: Arc<RingBuffer<T>>,
+pub struct Consumer<T, C: Config = DefaultConfig> {
+    pub(super) queue: Arc<RingBuffer<T, C>>,
     /// Private scan cursor (logical position).
     next_scan: Cell<usize>,
     /// Pops since the last `consumed` flush.
@@ -46,7 +21,7 @@ pub struct Consumer<T> {
     park_slot: usize,
 }
 
-impl<T> Clone for Consumer<T> {
+impl<T, C: Config> Clone for Consumer<T, C> {
     fn clone(&self) -> Self {
         // Stagger starting scan position by `cap/8` per clone so
         // new consumers don't all race slot 0 on the first pop.
@@ -78,10 +53,10 @@ impl<T> Clone for Consumer<T> {
 
 // SAFETY: Cell is !Sync, but Consumer is Send because each handle
 // is single-threaded by contract. The Arc keeps the RingBuffer alive.
-unsafe impl<T: Send> Send for Consumer<T> {}
+unsafe impl<T: Send, C: Config> Send for Consumer<T, C> {}
 
-impl<T> Consumer<T> {
-    pub(super) const fn new(queue: Arc<RingBuffer<T>>) -> Self {
+impl<T, C: Config> Consumer<T, C> {
+    pub(super) const fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
         Self {
             queue,
             next_scan: Cell::new(0),
@@ -141,7 +116,7 @@ impl<T> Consumer<T> {
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
 
                     let lc = self.local_consumed.get() + 1;
-                    if lc >= CONSUMED_FLUSH {
+                    if lc >= C::CONSUMED_FLUSH {
                         q.consumed.fetch_add(lc, Ordering::Relaxed);
                         self.local_consumed.set(0);
                     } else {
@@ -152,8 +127,8 @@ impl<T> Consumer<T> {
                 }
                 // CAS lost — skip far enough that the contended
                 // line cools before our next attempt.
-                scan += CAS_FAIL_SKIP - 1;
-                iters += CAS_FAIL_SKIP - 1;
+                scan += C::CAS_FAIL_SKIP - 1;
+                iters += C::CAS_FAIL_SKIP - 1;
             }
 
             scan += 1;
@@ -243,7 +218,7 @@ impl<T> Consumer<T> {
     }
 }
 
-impl<T> Drop for Consumer<T> {
+impl<T, C: Config> Drop for Consumer<T, C> {
     fn drop(&mut self) {
         // Flush the per-consumer count so producers' free-space
         // estimate doesn't permanently lag this consumer's work.
@@ -277,6 +252,6 @@ impl<T> Drop for Consumer<T> {
 /// Idempotently installs the current thread's `Thread` handle in
 /// `q.consumer_parkers[slot]`. See producer-side analogue.
 #[inline]
-fn ensure_consumer_handle_installed<T>(q: &RingBuffer<T>, slot: usize) {
+fn ensure_consumer_handle_installed<T, C: Config>(q: &RingBuffer<T, C>, slot: usize) {
     let _ = q.consumer_parkers[slot].set(std::thread::current());
 }

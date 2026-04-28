@@ -76,8 +76,76 @@ use std::thread::Thread;
 pub(crate) const PARK_SLOTS: usize = 64;
 pub(crate) const PARK_MASK: usize = PARK_SLOTS - 1;
 
+/// Tunable parameters baked into a [`RingBuffer`]'s type. Implement
+/// this on a zero-sized type to customize batching / scan behavior
+/// at compile time; the default values live in [`DefaultConfig`].
+///
+/// All values must satisfy:
+/// - `PRODUCER_BATCH` in `1..=32` (bounded by the producer's
+///   `u32` per-batch bitmap).
+/// - `CAS_FAIL_SKIP > 0` and `CONSUMED_FLUSH > 0`.
+///
+/// Bounds are checked at monomorphization via `const _ = assert!`.
+pub trait Config: 'static {
+    /// Positions reserved per FAA on `claim`. Caps the per-batch
+    /// `u32` bitmap; must be in `1..=32`. Larger values reduce
+    /// `claim`-line traffic at the cost of producer-progress
+    /// imbalance (a slow producer holds more positions out of
+    /// reach of others).
+    const PRODUCER_BATCH: usize;
+
+    /// On CAS-failure during `pop`, advance the scan cursor by
+    /// this many slots before retrying. A larger skip dramatically
+    /// reduces CAS re-collisions because the contended slot's
+    /// cacheline stays hot for hundreds of cycles. Empirical
+    /// peaks land near 64–128 at `cap=1024`.
+    const CAS_FAIL_SKIP: usize;
+
+    /// Pops between flushes of each consumer's local count to the
+    /// shared `consumed` watermark. Producers use the watermark
+    /// to bound their batch FAA, so a stale flush only forces
+    /// smaller producer batches (safe direction). Larger values
+    /// reduce hot-line traffic on `consumed` at the cost of more
+    /// pessimistic producer batching.
+    const CONSUMED_FLUSH: usize;
+}
+
+/// Default tuning for [`RingBuffer`].
+///
+/// `PRODUCER_BATCH = 32`, `CAS_FAIL_SKIP = 128`,
+/// `CONSUMED_FLUSH = 64`. These were chosen by sweeping at
+/// `cap = 1024` across `(P, Q)` shapes from `(2, 2)` through
+/// `(8, 8)`; see the empirical table in [`Config::CAS_FAIL_SKIP`]
+/// docs.
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultConfig;
+
+impl Config for DefaultConfig {
+    const PRODUCER_BATCH: usize = 32;
+    const CAS_FAIL_SKIP: usize = 128;
+    const CONSUMED_FLUSH: usize = 64;
+}
+
+/// Inline-customization helper. Lets callers tune a ring without
+/// declaring a named config type:
+///
+/// ```ignore
+/// use quetzalcoatl::mpmc::{Cfg, RingBuffer};
+/// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(cap).split();
+/// ```
+///
+/// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH>`.
+#[derive(Debug, Clone, Copy)]
+pub struct Cfg<const B: usize, const S: usize, const F: usize>;
+
+impl<const B: usize, const S: usize, const F: usize> Config for Cfg<B, S, F> {
+    const PRODUCER_BATCH: usize = B;
+    const CAS_FAIL_SKIP: usize = S;
+    const CONSUMED_FLUSH: usize = F;
+}
+
 #[repr(C)]
-pub struct RingBuffer<T> {
+pub struct RingBuffer<T, C: Config = DefaultConfig> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     /// Per-slot tri-state with round encoding (free / published /
     /// claimed). Packed 8 per cacheline (not `CachePadded`) so a
@@ -128,22 +196,52 @@ pub struct RingBuffer<T> {
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Consumer` clones. Bumped at clone time only.
     pub(crate) consumer_count: CachePadded<AtomicUsize>,
+    pub(crate) _config: std::marker::PhantomData<fn() -> C>,
 }
 
 // SAFETY: All shared state is atomic; per-slot CAS gives unique
 // ownership of each (slot, round) pair to exactly one consumer.
-unsafe impl<T: Send> Send for RingBuffer<T> {}
-unsafe impl<T: Send> Sync for RingBuffer<T> {}
+// `C` is a ZST type marker — its Send/Sync are irrelevant.
+unsafe impl<T: Send, C: Config> Send for RingBuffer<T, C> {}
+unsafe impl<T: Send, C: Config> Sync for RingBuffer<T, C> {}
 
-impl<T> RingBuffer<T> {
+/// Compile-time-validated bounds for a [`Config`]. Forces a
+/// monomorphization-time error when `C` violates one of:
+/// - `PRODUCER_BATCH` in `1..=32` (capped by the producer's `u32`
+///   per-batch bitmap),
+/// - `CAS_FAIL_SKIP > 0`,
+/// - `CONSUMED_FLUSH > 0`.
+struct ConfigBounds<C: Config>(std::marker::PhantomData<C>);
+
+impl<C: Config> ConfigBounds<C> {
+    const VALIDATE: () = {
+        assert!(
+            C::PRODUCER_BATCH >= 1 && C::PRODUCER_BATCH <= 32,
+            "Config::PRODUCER_BATCH must be in 1..=32 (bounded by the u32 per-batch bitmap)",
+        );
+        assert!(C::CAS_FAIL_SKIP >= 1, "Config::CAS_FAIL_SKIP must be >= 1",);
+        assert!(
+            C::CONSUMED_FLUSH >= 1,
+            "Config::CONSUMED_FLUSH must be >= 1",
+        );
+    };
+}
+
+impl<T, C: Config> RingBuffer<T, C> {
     /// Creates a new MPMC ring buffer.
     ///
     /// # Panics
     ///
     /// Panics if `capacity.get() < 4`. The per-slot tri-state
     /// encoding aliases at smaller capacities.
+    ///
+    /// `C`'s tunables are validated at monomorphization via
+    /// [`ConfigBounds`]: `PRODUCER_BATCH` must be in `1..=32`,
+    /// the others must be `>= 1`.
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
+        // Force monomorphization-time evaluation of the bounds.
+        let () = ConfigBounds::<C>::VALIDATE;
         let cap = capacity.get();
         assert!(cap >= 4, "mpmc requires capacity >= 4");
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
@@ -181,6 +279,7 @@ impl<T> RingBuffer<T> {
             consumer_wake: CachePadded(AtomicU64::new(0)),
             consumer_parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
             consumer_count: CachePadded(AtomicUsize::new(0)),
+            _config: std::marker::PhantomData,
         }
     }
 
@@ -223,7 +322,7 @@ impl<T> RingBuffer<T> {
     /// Both handles are cloneable for additional producer/consumer
     /// threads.
     #[must_use]
-    pub fn split(self) -> (Producer<T>, Consumer<T>) {
+    pub fn split(self) -> (Producer<T, C>, Consumer<T, C>) {
         let arc = Arc::new(self);
         let producer = Producer::new(arc.clone());
         let consumer = Consumer::new(arc);
@@ -231,7 +330,7 @@ impl<T> RingBuffer<T> {
     }
 }
 
-impl<T> Drop for RingBuffer<T> {
+impl<T, C: Config> Drop for RingBuffer<T, C> {
     fn drop(&mut self) {
         // All Producer/Consumer handles are gone (we hold &mut self),
         // so we can read state non-atomically. A slot holds live
@@ -295,13 +394,13 @@ fn wake_one(wake: &AtomicU64, parkers: &[OnceLock<Thread>]) {
 
 /// Wakes one parked producer. Mirror of [`wake_one_consumer`].
 #[inline]
-pub(crate) fn wake_one_producer<T>(q: &RingBuffer<T>) {
+pub(crate) fn wake_one_producer<T, C: Config>(q: &RingBuffer<T, C>) {
     wake_one(&q.producer_wake, &q.producer_parkers);
 }
 
 /// Wakes one parked consumer. Mirror of [`wake_one_producer`].
 #[inline]
-pub(crate) fn wake_one_consumer<T>(q: &RingBuffer<T>) {
+pub(crate) fn wake_one_consumer<T, C: Config>(q: &RingBuffer<T, C>) {
     wake_one(&q.consumer_wake, &q.consumer_parkers);
 }
 
@@ -486,7 +585,7 @@ mod tests {
     fn drop_left_in_buffer() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let (p, _c) = RingBuffer::new(Capacity::exact(4)).split();
+            let (p, _c) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
             for _ in 0..4 {
                 p.push(DropCounter {
                     counter: counter.clone(),
@@ -502,7 +601,7 @@ mod tests {
     fn drop_after_partial_drain() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let (p, c) = RingBuffer::new(Capacity::exact(4)).split();
+            let (p, c) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
             for _ in 0..4 {
                 p.push(DropCounter {
                     counter: counter.clone(),

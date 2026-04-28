@@ -3,11 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{RingBuffer, PARK_MASK};
-
-/// Positions reserved per FAA on `claim`. Caps the per-batch
-/// bitmap (a `u32`).
-const PRODUCER_BATCH: usize = 32;
+use super::{Config, DefaultConfig, RingBuffer, PARK_MASK};
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
@@ -19,20 +15,20 @@ const PRIMARY_SHORT_SPIN: u32 = 4;
 /// shared `claim` cursor, then publishes into them out of order —
 /// using whichever batch slot's `done[s]` releases first, rather
 /// than waiting on a particular slot.
-pub struct Producer<T> {
-    pub(super) queue: Arc<RingBuffer<T>>,
+pub struct Producer<T, C: Config = DefaultConfig> {
+    pub(super) queue: Arc<RingBuffer<T, C>>,
     /// Start position of the current batch.
     batch_start: Cell<usize>,
     /// Bitmap of reserved-but-unpublished positions in the current
     /// batch. Bit `i` set ↔ `batch_start + i` is available to use.
     batch_unused: Cell<u32>,
-    /// Original batch size (≤ `PRODUCER_BATCH`); diagnostic.
+    /// Original batch size (≤ `C::PRODUCER_BATCH`); diagnostic.
     batch_size: Cell<u32>,
     /// Stable park slot for this producer (mod `PARK_SLOTS`).
     park_slot: usize,
 }
 
-impl<T> Clone for Producer<T> {
+impl<T, C: Config> Clone for Producer<T, C> {
     fn clone(&self) -> Self {
         let n = self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -47,10 +43,10 @@ impl<T> Clone for Producer<T> {
 
 // SAFETY: Cell is !Sync, but Producer is Send because each handle
 // is single-threaded by contract. The Arc keeps the RingBuffer alive.
-unsafe impl<T: Send> Send for Producer<T> {}
+unsafe impl<T: Send, C: Config> Send for Producer<T, C> {}
 
-impl<T> Producer<T> {
-    pub(super) const fn new(queue: Arc<RingBuffer<T>>) -> Self {
+impl<T, C: Config> Producer<T, C> {
+    pub(super) const fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
         Self {
             queue,
             batch_start: Cell::new(0),
@@ -85,7 +81,7 @@ impl<T> Producer<T> {
             } else {
                 q.cap - in_flight
             };
-            let batch = PRODUCER_BATCH.min(free);
+            let batch = C::PRODUCER_BATCH.min(free);
 
             let start = q.claim.fetch_add(batch, Ordering::Relaxed);
             unused = if batch >= 32 {
@@ -264,7 +260,7 @@ impl<T> Producer<T> {
     }
 }
 
-impl<T> Drop for Producer<T> {
+impl<T, C: Config> Drop for Producer<T, C> {
     fn drop(&mut self) {
         // Tombstone any reserved-but-unpublished batch positions:
         // mark them as already-claimed-and-released so the
@@ -321,6 +317,6 @@ fn flush_wake_bitmap(
 /// the first installer wins; later wakes on that bit may unpark
 /// the wrong producer (benign — it just re-checks and re-parks).
 #[inline]
-fn ensure_handle_installed<T>(q: &RingBuffer<T>, slot: usize) {
+fn ensure_handle_installed<T, C: Config>(q: &RingBuffer<T, C>, slot: usize) {
     let _ = q.producer_parkers[slot].set(std::thread::current());
 }
