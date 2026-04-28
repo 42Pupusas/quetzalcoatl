@@ -9,9 +9,12 @@ use std::thread;
 
 fn bench_mpsc_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("mpsc_scaling");
-    let items_per_producer = 50_000u64;
+    let items_per_producer = 5_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
-    for num_producers in [1, 2, 4, 8, 12, 16] {
+    // Boundary cases only — 2, 4, 12 produced redundant scaling info.
+    for num_producers in [1, 8, 16] {
         let total_items = items_per_producer * num_producers as u64;
         group.throughput(Throughput::Elements(total_items));
         group.bench_with_input(
@@ -67,6 +70,8 @@ fn bench_mpsc_scaling(c: &mut Criterion) {
 
 fn bench_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("contention");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let items_per_producer = 10_000u64;
     let num_producers = 8u64;
     let total_items = items_per_producer * num_producers;
@@ -134,6 +139,8 @@ impl LargeStruct {
 
 fn bench_large_struct_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_mpsc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let items_per_producer = 2_500u64;
 
     for num_producers in [1, 2, 4] {
@@ -197,6 +204,8 @@ fn bench_large_struct_mpsc(c: &mut Criterion) {
 
 fn bench_large_struct_mpsc_zero_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_mpsc_zero_copy");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let items_per_producer = 2_500u64;
 
     for num_producers in [1, 2, 4] {

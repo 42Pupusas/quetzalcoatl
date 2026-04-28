@@ -19,7 +19,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ITEMS_PER_PRODUCER: u64 = 50_000;
+const ITEMS_PER_PRODUCER: u64 = 5_000;
 /// Per-ring capacity for SPSC fan-in. MPSC total = PER_RING_CAP * N.
 const PER_RING_CAP: usize = 1024;
 
@@ -36,8 +36,14 @@ fn total_cap(num_producers: u64) -> usize {
 
 fn bench_fanin_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanin");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
-    for num_producers in [4u64, 8, 12, 16] {
+    // Boundary cases only — 8 / 12 produced redundant scaling info on
+    // top of (4, 16). Drop them to halve runtime; widen the matrix
+    // back if we ever need to chase non-monotonic regressions in the
+    // 8-12 producer range.
+    for num_producers in [4u64, 16] {
         let total_items = ITEMS_PER_PRODUCER * num_producers;
         let mpsc_cap = total_cap(num_producers);
         group.throughput(Throughput::Elements(total_items));
@@ -402,6 +408,8 @@ fn bench_fanin_throughput(c: &mut Criterion) {
 
 fn bench_fanin_capacity_impact(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanin_capacity");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let num_producers = 12u64;
     let total_items = ITEMS_PER_PRODUCER * num_producers;
 
@@ -459,6 +467,8 @@ fn bench_fanin_capacity_impact(c: &mut Criterion) {
 
 fn bench_consumer_drain_strategy(c: &mut Criterion) {
     let mut group = c.benchmark_group("drain_strategy");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let num_producers = 12u64;
     let total_items = ITEMS_PER_PRODUCER * num_producers;
     let cap = total_cap(num_producers);

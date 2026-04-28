@@ -10,7 +10,9 @@ use std::thread;
 
 fn bench_consumer_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("broadcast_consumer_scaling");
-    let total_items = 100_000u64;
+    let total_items = 10_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [1, 2, 4, 8] {
         group.throughput(Throughput::Elements(total_items));
@@ -74,7 +76,9 @@ fn bench_consumer_scaling(c: &mut Criterion) {
 
 fn bench_producer_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("broadcast_producer_scaling");
-    let items_per_producer = 50_000u64;
+    let items_per_producer = 5_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_producers in [1, 2, 4, 8] {
         let total_items = items_per_producer * num_producers as u64;
@@ -158,6 +162,8 @@ impl LargeStruct {
 
 fn bench_large_struct_clone_vs_ref(c: &mut Criterion) {
     let mut group = c.benchmark_group("broadcast_large_struct");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let total_items = 10_000u64;
 
     group.throughput(Throughput::Elements(total_items));
@@ -244,6 +250,8 @@ fn bench_large_struct_clone_vs_ref(c: &mut Criterion) {
 
 fn bench_arc_large_struct(c: &mut Criterion) {
     let mut group = c.benchmark_group("broadcast_arc_large_struct");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let total_items = 10_000u64;
     let num_consumers = 4usize;
 

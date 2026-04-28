@@ -12,9 +12,14 @@ use std::thread;
 
 fn bench_spmc_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("spmc_scaling");
-    let total_items = 200_000u64;
+    let total_items = 20_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
-    for num_consumers in [1, 2, 4, 8, 12, 16] {
+    // Boundary cases only — 2, 4, 12 produced redundant scaling info
+    // on top of (1, 8, 16). Restore them if you ever need to chase
+    // non-monotonic regressions in the middle of the range.
+    for num_consumers in [1, 8, 16] {
         group.throughput(Throughput::Elements(total_items));
         group.bench_with_input(
             BenchmarkId::new("consumers", num_consumers),
@@ -79,7 +84,7 @@ fn bench_spmc_scaling(c: &mut Criterion) {
 
 fn bench_spmc_producer_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("spmc_producer_only");
-    let total_items = 1_000_000u64;
+    let total_items = 100_000u64;
     group.throughput(Throughput::Elements(total_items));
 
     group.bench_function("push_drain", |b| {
@@ -114,8 +119,10 @@ fn bench_spmc_producer_only(c: &mut Criterion) {
 
 fn bench_spmc_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("spmc_contention");
-    let total_items = 80_000u64;
+    let total_items = 10_000u64;
     let num_consumers = 8usize;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for cap in [64, 256, 1024] {
         group.throughput(Throughput::Elements(total_items));
@@ -181,6 +188,8 @@ impl LargeStruct {
 fn bench_large_struct_spmc(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_spmc");
     let total_items = 10_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [1, 2, 4] {
         group.throughput(Throughput::Elements(total_items));
@@ -239,6 +248,8 @@ fn bench_large_struct_spmc(c: &mut Criterion) {
 fn bench_large_struct_spmc_zero_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_spmc_zero_copy");
     let total_items = 10_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [1, 2, 4] {
         group.throughput(Throughput::Elements(total_items));
@@ -319,7 +330,9 @@ fn bench_large_struct_spmc_zero_copy(c: &mut Criterion) {
 
 fn bench_work_distribution(c: &mut Criterion) {
     let mut group = c.benchmark_group("work_distribution");
-    let total_items = 200_000u64;
+    let total_items = 20_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [2, 4, 8] {
         group.throughput(Throughput::Elements(total_items));
@@ -475,7 +488,7 @@ fn busy_work(iters: u64) {
 
 fn bench_slow_work_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("slow_work_scaling");
-    let total_items = 5_000u64;
+    let total_items = 1_000u64;
     // Per-item work: ~50µs (Schnorr-verify scale).
     let consumer_work_iters = calibrate_spin_iters(50_000);
     // Producer cadence: ~10µs between pushes — fast enough that the queue
@@ -484,7 +497,7 @@ fn bench_slow_work_scaling(c: &mut Criterion) {
     let producer_gap_iters = calibrate_spin_iters(10_000);
 
     group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(15));
+    group.measurement_time(std::time::Duration::from_secs(5));
 
     for num_consumers in [1usize, 2, 4, 8] {
         group.throughput(Throughput::Elements(total_items));
@@ -623,7 +636,7 @@ fn bench_slow_work_scaling(c: &mut Criterion) {
 
 fn bench_burst_producer_slow_work(c: &mut Criterion) {
     let mut group = c.benchmark_group("burst_producer_slow_work");
-    let total_items = 4_096u64; // multiple of all burst sizes & consumer counts
+    let total_items = 1_024u64; // multiple of all burst sizes & consumer counts
     let consumer_work_iters = calibrate_spin_iters(50_000);
     // After each burst, idle long enough for ~1 consumer to drain it. With
     // a burst of 8 items × 50µs = 400µs, idle 350µs (intentionally a bit
@@ -632,13 +645,15 @@ fn bench_burst_producer_slow_work(c: &mut Criterion) {
     let idle_iters = calibrate_spin_iters(350_000);
 
     group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(15));
+    group.measurement_time(std::time::Duration::from_secs(5));
 
     // Bursts ≤ BATCH_SIZE (32) are the regime where one consumer can
     // monopolize the whole burst in a single CAS. Burst=64 should let a
-    // second consumer get a fair claim.
-    for burst in [8usize, 32, 64] {
-        for num_consumers in [2usize, 4, 8] {
+    // second consumer get a fair claim. We keep the boundary cases (8,
+    // 64) and the low/high consumer counts (2, 8) — the middle points
+    // were redundant.
+    for burst in [8usize, 64] {
+        for num_consumers in [2usize, 8] {
             group.throughput(Throughput::Elements(total_items));
 
             let label = format!("burst{}_c{}", burst, num_consumers);

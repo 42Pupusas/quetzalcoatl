@@ -9,6 +9,8 @@ use std::thread;
 
 fn bench_push_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_only");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for cap in [1024, 4096, 65536] {
         group.throughput(Throughput::Elements(cap as u64));
@@ -37,6 +39,8 @@ fn bench_push_only(c: &mut Criterion) {
 
 fn bench_pop_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("pop_only");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for cap in [1024, 4096, 65536] {
         group.throughput(Throughput::Elements(cap as u64));
@@ -66,6 +70,8 @@ fn bench_pop_only(c: &mut Criterion) {
 
 fn bench_push_pop_alternating(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_pop_alternating");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let ops = 10_000u64;
 
     group.throughput(Throughput::Elements(ops));
@@ -93,6 +99,8 @@ fn bench_push_pop_alternating(c: &mut Criterion) {
 
 fn bench_spsc_concurrent(c: &mut Criterion) {
     let mut group = c.benchmark_group("spsc_concurrent");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for total_items in [10_000u64, 100_000, 1_000_000] {
         group.throughput(Throughput::Elements(total_items));
@@ -142,6 +150,8 @@ fn bench_spsc_concurrent(c: &mut Criterion) {
 
 fn bench_capacity_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("capacity_impact");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let ops = 50_000u64;
 
     for cap in [1000, 1024, 4000, 4096] {
@@ -187,6 +197,8 @@ impl LargeStruct {
 
 fn bench_large_struct_spsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_spsc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let total_items = 10_000u64;
 
     group.throughput(Throughput::Elements(total_items));
@@ -231,6 +243,8 @@ fn bench_large_struct_spsc(c: &mut Criterion) {
 
 fn bench_large_struct_spsc_zero_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("large_struct_spsc_zero_copy");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     let total_items = 10_000u64;
 
     group.throughput(Throughput::Elements(total_items));

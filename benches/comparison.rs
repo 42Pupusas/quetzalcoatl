@@ -9,6 +9,8 @@ use std::thread;
 
 fn bench_spsc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_spsc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for total_items in [100_000u64, 1_000_000] {
         group.throughput(Throughput::Elements(total_items));
@@ -95,7 +97,9 @@ fn bench_spsc_comparison(c: &mut Criterion) {
 
 fn bench_mpsc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_mpsc");
-    let items_per_producer = 50_000u64;
+    let items_per_producer = 5_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_producers in [1u64, 2, 4, 8, 12, 16] {
         let total_items = items_per_producer * num_producers;
@@ -250,7 +254,9 @@ fn bench_mpsc_comparison(c: &mut Criterion) {
 
 fn bench_spmc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_spmc");
-    let total_items = 200_000u64;
+    let total_items = 20_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [1u64, 2, 4, 8] {
         group.throughput(Throughput::Elements(total_items));
@@ -376,7 +382,9 @@ fn bench_spmc_comparison(c: &mut Criterion) {
 
 fn bench_broadcast_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_broadcast");
-    let total_items = 100_000u64;
+    let total_items = 10_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [1u64, 2, 4, 8] {
         group.throughput(Throughput::Elements(total_items));
@@ -527,7 +535,9 @@ impl LargeStruct {
 
 fn bench_large_spsc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_large_spsc");
-    let total_items = 50_000u64;
+    let total_items = 5_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
     group.throughput(Throughput::Elements(total_items));
 
     // --- quetzalcoatl push/pop (copies both ways) ---
@@ -646,7 +656,9 @@ fn bench_large_spsc_comparison(c: &mut Criterion) {
 
 fn bench_large_mpsc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_large_mpsc");
-    let items_per_producer = 10_000u64;
+    let items_per_producer = 1_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_producers in [2u64, 4] {
         let total_items = items_per_producer * num_producers;
@@ -865,7 +877,9 @@ fn bench_large_mpsc_comparison(c: &mut Criterion) {
 
 fn bench_large_spmc_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("cmp_large_spmc");
-    let total_items = 20_000u64;
+    let total_items = 2_000u64;
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
 
     for num_consumers in [2u64, 4] {
         group.throughput(Throughput::Elements(total_items));

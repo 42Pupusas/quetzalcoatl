@@ -260,6 +260,8 @@ fn bench_mpmc_vs_n_spmc(c: &mut Criterion) {
         let total_items = (p as u64) * ITEMS_PER_PRODUCER;
 
         let mut group = c.benchmark_group(format!("mpmc_vs_nspmc/{label}"));
+        group.sample_size(20);
+        group.measurement_time(Duration::from_secs(3));
         group.throughput(Throughput::Elements(total_items));
 
         group.bench_with_input(BenchmarkId::new("mpmc", "quick"), &(p, q), |b, &(p, q)| {
