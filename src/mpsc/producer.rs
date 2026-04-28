@@ -1,8 +1,10 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::RingBuffer;
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
 use crate::common::TOMBSTONE;
 
 /// The producer side of an MPSC ring buffer.
@@ -14,13 +16,23 @@ use crate::common::TOMBSTONE;
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_head: std::cell::Cell<usize>,
+    /// Stable park slot for this producer (mod `PARK_SLOTS`). Used by
+    /// [`Producer::push_block`] to register on the wake bitmap.
+    pub(super) park_slot: usize,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
+        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        let park_idx = self
+            .queue
+            .producer_park_idx
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         Self {
             queue: Arc::clone(&self.queue),
             cached_head: std::cell::Cell::new(0),
+            park_slot: park_idx & PARK_MASK,
         }
     }
 }
@@ -74,9 +86,66 @@ impl<T> Producer<T> {
                 // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
                 slot_seq.store(pos * 2 + 1, Ordering::Release);
+                // Wake the consumer if it's parked in pop_block.
+                // Relaxed gate keeps the no-park hot path free.
+                self.queue.wake_consumer();
                 Ok(())
             }
             None => Err(val),
+        }
+    }
+
+    /// Pushes a value, blocking the calling thread when the ring is
+    /// full until the consumer makes space. Returns `Err(val)` only
+    /// when the [`Consumer`](super::Consumer) has been dropped (no
+    /// consumer left to drain).
+    ///
+    /// Spins via the shared backoff schedule first, then sets a wake
+    /// bit in the producer wake bitmap and parks. The consumer
+    /// signals after every pop (or batched at end of `drain`) gated
+    /// on a single `Relaxed` load.
+    pub fn push_block(&self, mut val: T) -> Result<(), T> {
+        let q = &*self.queue;
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            // Check consumer_closed *before* attempting push. Once
+            // the consumer drops it sets `consumer_closed = true`
+            // before draining; any free space we'd find afterward is
+            // about to be reclaimed and must not be filled.
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => return Ok(()),
+                Err(returned) => val = returned,
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            q.producer_park.ensure_handle_installed(self.park_slot);
+            // SeqCst pairs with the consumer's `producer_park.wake.load`
+            // after `head.store(Release)`: either we succeed in the
+            // re-check below, or the consumer sees our bit and unparks
+            // us.
+            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => {
+                    q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(returned) => val = returned,
+            }
+
+            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
 
@@ -88,11 +157,13 @@ impl<T> Producer<T> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
+        let queue = &*self.queue;
         self.claim_slot()
             .map(|(data_ptr, slot_seq, pos)| SlotWriter {
                 slot_data: data_ptr,
                 slot_seq,
                 pos,
+                queue,
             })
     }
 
@@ -115,6 +186,18 @@ impl<T> Producer<T> {
     }
 }
 
+impl<T> Drop for Producer<T> {
+    fn drop(&mut self) {
+        if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last producer gone — flag the queue closed and wake the
+            // consumer if it's parked in pop_block so it can drain
+            // remaining items and exit.
+            self.queue.closed.0.store(true, Ordering::Release);
+            self.queue.wake_consumer();
+        }
+    }
+}
+
 /// A write-reservation into an MPSC ring buffer slot.
 ///
 /// Call [`write`](Self::write) to initialize and get a [`WrittenSlot`].
@@ -126,6 +209,7 @@ pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_seq: &'a AtomicUsize,
     pos: usize,
+    queue: &'a RingBuffer<T>,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
@@ -153,6 +237,7 @@ impl<'a, T> SlotWriter<'a, T> {
             slot_data: this.slot_data,
             slot_seq: this.slot_seq,
             pos: this.pos,
+            queue: this.queue,
             committed: false,
         }
     }
@@ -166,6 +251,7 @@ impl<'a, T> SlotWriter<'a, T> {
     #[inline]
     pub unsafe fn commit_unchecked(self) {
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
+        self.queue.wake_consumer();
         std::mem::forget(self);
     }
 }
@@ -173,6 +259,9 @@ impl<'a, T> SlotWriter<'a, T> {
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
         self.slot_seq.store(TOMBSTONE, Ordering::Release);
+        // Wake the consumer: it must observe the tombstone and skip
+        // past it, otherwise pop_block could hang on a stale slot.
+        self.queue.wake_consumer();
     }
 }
 
@@ -184,6 +273,7 @@ pub struct WrittenSlot<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_seq: &'a AtomicUsize,
     pos: usize,
+    queue: &'a RingBuffer<T>,
     committed: bool,
 }
 
@@ -197,6 +287,7 @@ impl<T> WrittenSlot<'_, T> {
     pub fn commit(mut self) {
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;
+        self.queue.wake_consumer();
     }
 }
 
@@ -208,6 +299,7 @@ impl<T> Drop for WrittenSlot<'_, T> {
                 self.slot_data.cast::<T>().drop_in_place();
             }
             self.slot_seq.store(TOMBSTONE, Ordering::Release);
+            self.queue.wake_consumer();
         }
     }
 }

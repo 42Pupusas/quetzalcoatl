@@ -35,12 +35,14 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+use crate::common::park::WakeSet;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 
 /// A lock-free MPSC ring buffer.
 ///
@@ -56,6 +58,30 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// Live producer count; last-drop sets [`closed`].
+    pub(crate) producer_count: CachePadded<AtomicUsize>,
+    /// Set by the last [`Producer`] drop. [`Consumer::pop_block`]
+    /// observes this and returns `None` once the queue drains.
+    pub(crate) closed: CachePadded<AtomicBool>,
+    /// Set when the [`Consumer`] is dropped. [`Producer::push_block`]
+    /// observes this and returns `Err(val)` instead of hanging.
+    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    /// Producer-side park state. Bit `i` of `producer_park.wake` is
+    /// set ↔ a producer in slot `i` is parked waiting for free
+    /// space. The consumer wakes one parked producer after each pop
+    /// (gated on the bitmap being non-zero).
+    pub(crate) producer_park: WakeSet,
+    /// Monotonic counter for assigning stable park-slot indices to
+    /// `Producer` clones. Bumped at clone time only.
+    pub(crate) producer_park_idx: CachePadded<AtomicUsize>,
+    /// Single-consumer park handle. Idempotently set by the consumer
+    /// the first time it parks; producers `OnceLock::get` it to
+    /// unpark.
+    pub(crate) consumer_parker: OnceLock<Thread>,
+    /// `true` ↔ the consumer is currently parked on `consumer_parker`.
+    /// Producers gate their unpark on this `Relaxed` load to keep the
+    /// no-park hot path free.
+    pub(crate) consumer_parked: CachePadded<AtomicBool>,
 }
 
 // Safety: Multiple producers use FAA to atomically claim tail slots.
@@ -84,6 +110,13 @@ impl<T> RingBuffer<T> {
             tail: CachePadded(AtomicUsize::new(0)),
             cap,
             mask: capacity.mask,
+            producer_count: CachePadded(AtomicUsize::new(1)),
+            closed: CachePadded(AtomicBool::new(false)),
+            consumer_closed: CachePadded(AtomicBool::new(false)),
+            producer_park: WakeSet::new(),
+            producer_park_idx: CachePadded(AtomicUsize::new(0)),
+            consumer_parker: OnceLock::new(),
+            consumer_parked: CachePadded(AtomicBool::new(false)),
         }
     }
 
@@ -130,9 +163,34 @@ impl<T> RingBuffer<T> {
         let producer = Producer {
             queue: arc.clone(),
             cached_head: std::cell::Cell::new(0),
+            park_slot: 0,
         };
         let consumer = Consumer { queue: arc };
         (producer, consumer)
+    }
+}
+
+impl<T> RingBuffer<T> {
+    /// Wakes the single parked consumer, if any. Gated internally on
+    /// `consumer_parked.load(Relaxed) != 0` for the no-cost fast
+    /// path.
+    ///
+    /// Idempotent: clearing the flag means any racing producer that
+    /// observes it already cleared simply skips the unpark. The
+    /// post-clear unpark is still issued by the winner — a stale
+    /// `unpark()` after the consumer rechecks is benign (it makes
+    /// the next park return immediately, which is fine because the
+    /// consumer re-checks the queue after every wake).
+    #[inline]
+    pub(crate) fn wake_consumer(&self) {
+        if !self.consumer_parked.0.load(Ordering::Relaxed) {
+            return;
+        }
+        // Clear the flag first so concurrent producers all skip past it.
+        self.consumer_parked.0.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.consumer_parker.get() {
+            handle.unpark();
+        }
     }
 }
 
@@ -963,7 +1021,7 @@ mod tests {
         });
 
         let mut got = Vec::new();
-        while got.len() < n as usize {
+        while got.len() < usize::try_from(n).unwrap() {
             if let Some(v) = consumer.pop() {
                 got.push(v);
             } else {
@@ -972,5 +1030,105 @@ mod tests {
         }
         h.join().unwrap();
         assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocking-API tests (push_block / pop_block).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pop_block_wakes_on_push() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(7).unwrap();
+        assert_eq!(h.join().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn pop_block_returns_none_on_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(p);
+        assert_eq!(h.join().unwrap(), None);
+    }
+
+    #[test]
+    fn push_block_unblocks_on_pop() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let p2 = p.clone();
+        let h = std::thread::spawn(move || p2.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let v = c.pop().unwrap();
+        assert!(v < 4);
+        assert_eq!(h.join().unwrap(), Ok(()));
+        // Keep `p` alive past the join so the ring isn't closed
+        // while `push_block` is racing to publish.
+        drop(p);
+    }
+
+    #[test]
+    fn push_block_returns_err_on_consumer_close() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let p2 = p.clone();
+        let h = std::thread::spawn(move || p2.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(c);
+        assert_eq!(h.join().unwrap(), Err(99));
+        drop(p);
+    }
+
+    #[test]
+    fn pop_block_drains_before_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        drop(p);
+        let mut got = vec![c.pop_block().unwrap(), c.pop_block().unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+        assert_eq!(c.pop_block(), None);
+    }
+
+    #[test]
+    fn push_block_two_producers_serialize_through_capacity_one() {
+        // Two producers contending for a single slot. Each takes its
+        // park slot; the consumer drains slowly. All values must
+        // eventually arrive.
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(1)).split();
+        let p2 = p.clone();
+        let h1 = std::thread::spawn(move || {
+            for i in 0..16u32 {
+                p.push_block(i).unwrap();
+            }
+        });
+        let h2 = std::thread::spawn(move || {
+            for i in 0..16u32 {
+                p2.push_block(100 + i).unwrap();
+            }
+        });
+        let mut got = Vec::new();
+        while got.len() < 32 {
+            if let Some(v) = c.pop_block() {
+                got.push(v);
+            } else {
+                break;
+            }
+        }
+        h1.join().unwrap();
+        h2.join().unwrap();
+        assert_eq!(got.len(), 32);
+        got.sort_unstable();
+        let expected: Vec<u32> = (0..16u32).chain(100..116u32).collect();
+        assert_eq!(got, expected);
     }
 }

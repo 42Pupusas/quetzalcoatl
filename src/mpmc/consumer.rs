@@ -3,9 +3,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    Config, DefaultConfig, RingBuffer, BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS,
-};
+use super::{Config, DefaultConfig, RingBuffer};
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -106,13 +105,12 @@ impl<T, C: Config> Consumer<T, C> {
                     // value before storing state=1.
                     let val = unsafe { q.data_slot(scan).get().cast::<T>().read() };
                     q.done_slot(scan).store(round_pos + cap, Ordering::Release);
-                    // Relaxed wake gate: a missed wake here is
-                    // covered by the producer's 200μs park timeout,
-                    // while a SeqCst load would tax every pop with
-                    // a full barrier.
-                    if q.producer_wake.load(Ordering::Relaxed) != 0 {
-                        super::wake_one_producer(q);
-                    }
+                    // Wake one parked producer if any. `wake_one`
+                    // self-gates on a `Relaxed` load, so this is
+                    // effectively a no-op when nothing is parked;
+                    // a missed wake here is covered by the producer's
+                    // 200μs park timeout backstop.
+                    q.producer_park.wake_one();
                     // Advance scan past the consumed slot, keeping
                     // it monotonic in case we claimed a future slot.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
@@ -175,24 +173,24 @@ impl<T, C: Config> Consumer<T, C> {
                 continue;
             }
 
-            ensure_consumer_handle_installed(q, self.park_slot);
-            // SeqCst pairs with producer's `consumer_wake.load`
+            q.consumer_park.ensure_handle_installed(self.park_slot);
+            // SeqCst pairs with producer's `consumer_park.wake.load`
             // after `ready.store(Release)`: either we see a
             // published slot in the re-check below, or the
             // producer sees our bit and unparks us.
-            q.consumer_wake.fetch_or(bit_mask, Ordering::SeqCst);
+            q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
-                q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Some(v);
             }
             if q.closed.0.load(Ordering::Acquire) {
-                q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return self.pop();
             }
 
             std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
-            q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
 
@@ -239,21 +237,7 @@ impl<T, C: Config> Drop for Consumer<T, C> {
             == 1
         {
             self.queue.consumer_closed.0.store(true, Ordering::Release);
-            let mut bits = self.queue.producer_wake.swap(0, Ordering::AcqRel);
-            while bits != 0 {
-                let b = bits.trailing_zeros() as usize;
-                if let Some(handle) = self.queue.producer_parkers[b].get() {
-                    handle.unpark();
-                }
-                bits &= bits - 1;
-            }
+            self.queue.producer_park.flush();
         }
     }
-}
-
-/// Idempotently installs the current thread's `Thread` handle in
-/// `q.consumer_parkers[slot]`. See producer-side analogue.
-#[inline]
-fn ensure_consumer_handle_installed<T, C: Config>(q: &RingBuffer<T, C>, slot: usize) {
-    let _ = q.consumer_parkers[slot].set(std::thread::current());
 }

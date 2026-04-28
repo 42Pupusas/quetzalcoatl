@@ -611,7 +611,7 @@ mod tests {
         });
 
         let mut got = Vec::new();
-        while got.len() < n as usize {
+        while got.len() < usize::try_from(n).unwrap() {
             if let Some(v) = consumer.pop() {
                 got.push(v);
             } else {

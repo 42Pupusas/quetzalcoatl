@@ -955,7 +955,7 @@ mod tests {
         });
 
         let mut got = Vec::new();
-        while got.len() < n as usize {
+        while got.len() < usize::try_from(n).unwrap() {
             if let Some(v) = consumer.pop() {
                 got.push(v);
             } else {
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(got, (0..n).collect::<Vec<_>>());
     }
 
-    /// ZST that has Drop glue. ZSTs use a dangling pointer in AlignedBuf;
+    /// ZST that has Drop glue. ZSTs use a dangling pointer in `AlignedBuf`;
     /// Drop must still run for each slot.
     #[test]
     fn zst_with_drop_glue() {

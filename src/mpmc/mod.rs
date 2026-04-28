@@ -60,35 +60,13 @@ pub use consumer::Consumer;
 pub use producer::Producer;
 
 use crate::capacity::Capacity;
+use crate::common::park::WakeSet;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
-
-/// Park-slot count. Each producer takes a stable slot at clone
-/// time; bit `i` of `producer_wake` flags "slot `i` parked." 64 fits
-/// in a single `AtomicU64`. Beyond 64 producers, slots alias and
-/// a wake on bit `i` rouses any producer mapped there (benign
-/// false wake; the woken producer re-checks and re-parks).
-pub(crate) const PARK_SLOTS: usize = 64;
-pub(crate) const PARK_MASK: usize = PARK_SLOTS - 1;
-
-/// `cas_backoff` failure-counter threshold past which the slow
-/// path stops spinning and parks. The schedule in
-/// [`crate::common::cas_backoff`] saturates at f=12 (64 pauses
-/// per call + sparse `yield_now`); waiting that long means we've
-/// already burned ~tens of microseconds and a futex round-trip
-/// (1–10μs) is amortized.
-pub(crate) const BACKOFF_PARK_THRESHOLD: u32 = 12;
-
-/// Safety-net park timeout (microseconds). The wake protocol's
-/// `SeqCst` pairing should make missed wakes impossible, but this
-/// timeout caps wait latency if a wake is somehow lost — defensive
-/// against future refactors of the ordering invariants.
-pub(crate) const PARK_TIMEOUT_MICROS: u64 = 200;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Tunable parameters baked into a [`RingBuffer`]'s type. Implement
 /// this on a zero-sized type to customize batching / scan behavior
@@ -189,24 +167,16 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// to stagger new consumers' starting scan offsets.
     pub(crate) clone_counter: CachePadded<AtomicUsize>,
     pub(crate) closed: CachePadded<AtomicBool>,
-    /// Producer-side futex-style wake bitmap. Bit `i` set ↔ a
-    /// producer in park slot `i` is parked waiting for a `done[s]`
-    /// release. Consumers read this `Relaxed` after each release
-    /// and wake one parked producer if non-zero.
-    pub(crate) producer_wake: CachePadded<AtomicU64>,
-    /// Producer-side `Thread` handle table. Idempotently set by
-    /// the first producer that parks at each slot; readers
-    /// (consumers issuing wakes) obtain a `&Thread` via
-    /// `OnceLock::get`.
-    pub(crate) producer_parkers: AlignedBuf<OnceLock<Thread>>,
-    /// Consumer-side futex-style wake bitmap. Bit `i` set ↔ a
-    /// consumer in park slot `i` is parked waiting for any
-    /// `ready[s]` publish. Producers read this `Relaxed` after
-    /// each publish and wake one parked consumer if non-zero.
-    pub(crate) consumer_wake: CachePadded<AtomicU64>,
-    /// Consumer-side `Thread` handle table. Mirror of
-    /// [`producer_parkers`].
-    pub(crate) consumer_parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Producer-side park state. Bit `i` of `producer_park.wake` is
+    /// set ↔ a producer in slot `i` is parked waiting for a `done[s]`
+    /// release. Consumers wake one parked producer after each release
+    /// (gated on the bitmap being non-zero).
+    pub(crate) producer_park: WakeSet,
+    /// Consumer-side park state. Bit `i` of `consumer_park.wake` is
+    /// set ↔ a consumer in slot `i` is parked waiting for any
+    /// `ready[s]` publish. Producers wake one parked consumer after
+    /// each publish (gated on the bitmap being non-zero).
+    pub(crate) consumer_park: WakeSet,
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Consumer` clones. Bumped at clone time only.
     pub(crate) consumer_count: CachePadded<AtomicUsize>,
@@ -288,10 +258,8 @@ impl<T, C: Config> RingBuffer<T, C> {
             consumer_closed: CachePadded(AtomicBool::new(false)),
             cap,
             mask: capacity.mask,
-            producer_wake: CachePadded(AtomicU64::new(0)),
-            producer_parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
-            consumer_wake: CachePadded(AtomicU64::new(0)),
-            consumer_parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            producer_park: WakeSet::new(),
+            consumer_park: WakeSet::new(),
             consumer_count: CachePadded(AtomicUsize::new(0)),
             _config: std::marker::PhantomData,
         }
@@ -330,6 +298,24 @@ impl<T, C: Config> RingBuffer<T, C> {
             .map(|s| self.done[s].load(Ordering::Acquire))
             .collect();
         (claim, r, d)
+    }
+
+    /// Scans the bits in `unused` for a slot whose `done[s]`
+    /// indicates it is free for the current round. Returns
+    /// `(bit, pos)` of the first free slot, or `None` if none are
+    /// ready.
+    #[inline]
+    pub(crate) fn scan_unused(&self, start: usize, unused: u32) -> Option<(u32, usize)> {
+        let mut bits = unused;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            let p = start + b as usize;
+            if self.done_slot(p).load(Ordering::Acquire) == p {
+                return Some((b, p));
+            }
+            bits &= bits - 1;
+        }
+        None
     }
 
     /// Splits the ring into a [`Producer`] and a [`Consumer`].
@@ -374,48 +360,6 @@ impl<T, C: Config> Drop for RingBuffer<T, C> {
         }
         // OnceLock<Thread> entries in `producer_parkers` clean themselves up.
     }
-}
-
-/// Wakes one peer parked on a wake bitmap. Caller must gate this
-/// on `wake.load(Relaxed) != 0` for the fast-path no-cost case.
-///
-/// Used twice: by the consumer hot path to wake a producer parked
-/// in `push`, and by the producer hot path to wake a consumer
-/// parked in `pop_block`. The two sides have independent wake
-/// bitmaps (`producer_wake` / `consumer_wake`) and parker tables.
-///
-/// Concurrent peers racing on the same set bit: only one's
-/// `fetch_and` actually clears it; the loser observes the bit
-/// already clear and skips the unpark.
-#[inline]
-fn wake_one(wake: &AtomicU64, parkers: &[OnceLock<Thread>]) {
-    let ws = wake.load(Ordering::Relaxed);
-    if ws == 0 {
-        return;
-    }
-    let bit = ws.trailing_zeros();
-    let mask = 1u64 << bit;
-    let prev = wake.fetch_and(!mask, Ordering::Relaxed);
-    if prev & mask == 0 {
-        return;
-    }
-    if let Some(handle) = parkers[bit as usize].get() {
-        handle.unpark();
-    }
-    // OnceLock None: peer set its bit before installing its handle.
-    // Benign — its own re-check after install catches the wake.
-}
-
-/// Wakes one parked producer. Mirror of [`wake_one_consumer`].
-#[inline]
-pub(crate) fn wake_one_producer<T, C: Config>(q: &RingBuffer<T, C>) {
-    wake_one(&q.producer_wake, &q.producer_parkers);
-}
-
-/// Wakes one parked consumer. Mirror of [`wake_one_producer`].
-#[inline]
-pub(crate) fn wake_one_consumer<T, C: Config>(q: &RingBuffer<T, C>) {
-    wake_one(&q.consumer_wake, &q.consumer_parkers);
 }
 
 #[cfg(test)]
@@ -510,6 +454,9 @@ mod tests {
         let v = c.pop().unwrap();
         assert!(v < 4);
         assert_eq!(h.join().unwrap(), Ok(()));
+        // Keep `p` alive past the join so the ring isn't closed
+        // while `push_block` is racing to publish.
+        drop(p);
     }
 
     #[test]
@@ -526,6 +473,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         drop(c);
         assert_eq!(h.join().unwrap(), Err(99));
+        drop(p);
     }
 
     #[test]
@@ -674,7 +622,9 @@ mod tests {
                 let r = received.clone();
                 std::thread::spawn(move || {
                     let mut got = Vec::new();
-                    while r.load(std::sync::atomic::Ordering::Relaxed) < total as usize {
+                    while r.load(std::sync::atomic::Ordering::Relaxed)
+                        < usize::try_from(total).unwrap()
+                    {
                         if let Some(v) = c.pop() {
                             r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             got.push(v);
@@ -697,7 +647,7 @@ mod tests {
         }
         all.sort_unstable();
         all.dedup();
-        assert_eq!(all.len(), total as usize);
+        assert_eq!(all.len(), usize::try_from(total).unwrap());
     }
 
     /// Run a full correctness check for a given (P, Q, total, cap)
@@ -709,6 +659,7 @@ mod tests {
     fn run_correctness(p_count: u64, c_count: u64, total: u64, cap: usize) {
         let per_p = total / p_count;
         let actual_total = per_p * p_count;
+        let actual_total_us = usize::try_from(actual_total).unwrap();
         let (prod, cons) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
         let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -734,7 +685,7 @@ mod tests {
                 let r = received.clone();
                 std::thread::spawn(move || {
                     let mut got = Vec::new();
-                    while r.load(std::sync::atomic::Ordering::Relaxed) < actual_total as usize {
+                    while r.load(std::sync::atomic::Ordering::Relaxed) < actual_total_us {
                         if let Some(v) = c.pop() {
                             r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             got.push(v);
@@ -758,7 +709,7 @@ mod tests {
         // Exact-count check: no duplicates, no losses, no extras.
         assert_eq!(
             all.len(),
-            actual_total as usize,
+            actual_total_us,
             "P={p_count} Q={c_count}: got {} items, expected {}",
             all.len(),
             actual_total
@@ -838,7 +789,7 @@ mod tests {
     /// the queue at full speed and exposes any item-loss races.
     fn run_correctness_no_counter(p_count: u64, c_count: u64, total: u64, cap: usize) {
         let per_p = total / p_count;
-        let actual_total = (per_p * p_count) as usize;
+        let actual_total = usize::try_from(per_p * p_count).unwrap();
         let (prod, cons) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
 
         // Consumers drain until producers are dropped AND queue is

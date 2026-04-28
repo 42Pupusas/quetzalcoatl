@@ -968,10 +968,11 @@ mod tests {
     /// the producer cannot reclaim that slot, so a fill-then-push fails.
     #[test]
     fn pop_ref_blocks_producer_overwrite() {
-        let cap = 4;
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(cap), 4).split();
+        let cap = 4u32;
+        let (producer, mut consumer) =
+            RingBuffer::<u32>::new(Capacity::exact(cap as usize), 4).split();
 
-        for i in 0..cap as u32 {
+        for i in 0..cap {
             producer.push(i).unwrap();
         }
         assert!(producer.push(99).is_err(), "buffer is full");

@@ -3,9 +3,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{
-    Config, DefaultConfig, RingBuffer, BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS,
-};
+use super::{Config, DefaultConfig, RingBuffer};
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
@@ -58,6 +57,85 @@ impl<T, C: Config> Producer<T, C> {
         }
     }
 
+    /// Refills the per-producer batch from the shared `claim`
+    /// cursor. Returns `Some((start, unused))` on success, or `None`
+    /// if the watermark says full and a per-slot check confirms it.
+    #[inline]
+    fn refill_batch(&self, q: &RingBuffer<T, C>) -> Option<(usize, u32)> {
+        // Bound the batch by free space estimated from the
+        // (lagging) `consumed` watermark — safe to underestimate.
+        let claim = q.claim.load(Ordering::Relaxed);
+        let consumed = q.consumed.load(Ordering::Acquire);
+        let in_flight = claim.wrapping_sub(consumed);
+        let free = if in_flight >= q.cap {
+            // Watermark says full; per-slot check before giving up.
+            let next_done = q.done_slot(claim).load(Ordering::Acquire);
+            if next_done != claim {
+                return None;
+            }
+            1
+        } else {
+            q.cap - in_flight
+        };
+        let batch = C::PRODUCER_BATCH.min(free);
+
+        let start = q.claim.fetch_add(batch, Ordering::Relaxed);
+        let unused = if batch >= 32 {
+            u32::MAX
+        } else {
+            #[allow(clippy::cast_possible_truncation)]
+            let b = batch as u32;
+            (1u32 << b) - 1
+        };
+        self.batch_start.set(start);
+        self.batch_unused.set(unused);
+        #[allow(clippy::cast_possible_truncation)]
+        self.batch_size.set(batch as u32);
+        Some((start, unused))
+    }
+
+    /// Whole-batch blocked: park on the futex-style wake bitmap and
+    /// wait for any of `unused`'s slots to release. Returns the
+    /// `(bit, pos)` of the slot that became free.
+    ///
+    /// The `SeqCst` on `producer_park.wake.fetch_or` pairs with the
+    /// consumer's `producer_park.wake.load` after `done[s].store
+    /// (Release)` to close the missed-wake window; the 200μs timeout
+    /// is a belt-and-braces backstop.
+    #[cold]
+    fn park_until_slot_free(
+        &self,
+        q: &RingBuffer<T, C>,
+        start: usize,
+        unused: u32,
+    ) -> (u32, usize) {
+        q.producer_park.ensure_handle_installed(self.park_slot);
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if let Some(found) = q.scan_unused(start, unused) {
+                return found;
+            }
+            // Spin until cas_backoff fully escalates (~tens of μs
+            // including yields) before paying for park.
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+
+            // Re-check after publishing our wake bit.
+            if let Some(found) = q.scan_unused(start, unused) {
+                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return found;
+            }
+
+            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+        }
+    }
+
     /// Pushes a value. Returns `Err(val)` if the ring is full from
     /// this producer's perspective (approximate — based on the
     /// `consumed` watermark, which lags real consumer progress).
@@ -66,40 +144,14 @@ impl<T, C: Config> Producer<T, C> {
         let q = &*self.queue;
 
         // Refill the batch if exhausted.
-        let mut unused = self.batch_unused.get();
-        let start = if unused == 0 {
-            // Bound the batch by free space estimated from the
-            // (lagging) `consumed` watermark — safe to underestimate.
-            let claim = q.claim.load(Ordering::Relaxed);
-            let consumed = q.consumed.load(Ordering::Acquire);
-            let in_flight = claim.wrapping_sub(consumed);
-            let free = if in_flight >= q.cap {
-                // Watermark says full; per-slot check before giving up.
-                let next_done = q.done_slot(claim).load(Ordering::Acquire);
-                if next_done != claim {
-                    return Err(val);
-                }
-                1
-            } else {
-                q.cap - in_flight
-            };
-            let batch = C::PRODUCER_BATCH.min(free);
-
-            let start = q.claim.fetch_add(batch, Ordering::Relaxed);
-            unused = if batch >= 32 {
-                u32::MAX
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                let b = batch as u32;
-                (1u32 << b) - 1
-            };
-            self.batch_start.set(start);
-            self.batch_unused.set(unused);
-            #[allow(clippy::cast_possible_truncation)]
-            self.batch_size.set(batch as u32);
-            start
+        let unused = self.batch_unused.get();
+        let (start, unused) = if unused == 0 {
+            match self.refill_batch(q) {
+                Some(v) => v,
+                None => return Err(val),
+            }
         } else {
-            self.batch_start.get()
+            (self.batch_start.get(), unused)
         };
 
         let primary_bit = unused.trailing_zeros();
@@ -121,72 +173,17 @@ impl<T, C: Config> Producer<T, C> {
         // Primary blocked? Scan other unused bits for any slot
         // already released — out-of-order publishing within batch.
         if !found_ready {
-            let mut bits = unused & !(1u32 << primary_bit);
-            while bits != 0 {
-                let b = bits.trailing_zeros();
-                let p = start + b as usize;
-                if q.done_slot(p).load(Ordering::Acquire) == p {
-                    bit = b;
-                    pos = p;
-                    found_ready = true;
-                    break;
-                }
-                bits &= bits - 1;
+            if let Some((b, p)) = q.scan_unused(start, unused & !(1u32 << primary_bit)) {
+                bit = b;
+                pos = p;
+                found_ready = true;
             }
         }
 
-        // Whole batch blocked: park on the futex-style wake bitmap.
-        // The SeqCst on `producer_wake.fetch_or` pairs with the
-        // consumer's `producer_wake.load` after `done[s].store(Release)`
-        // to close the missed-wake window; the 200μs timeout is a
-        // belt-and-braces backstop.
         if !found_ready {
-            ensure_handle_installed(q, self.park_slot);
-            let bit_mask = 1u64 << self.park_slot;
-            let mut backoff = 0u32;
-            'outer: loop {
-                let mut bits = unused;
-                while bits != 0 {
-                    let b = bits.trailing_zeros();
-                    let p = start + b as usize;
-                    if q.done_slot(p).load(Ordering::Acquire) == p {
-                        bit = b;
-                        pos = p;
-                        break 'outer;
-                    }
-                    bits &= bits - 1;
-                }
-                // Spin until cas_backoff fully escalates (~tens of
-                // μs including yields) before paying for park.
-                if backoff < BACKOFF_PARK_THRESHOLD {
-                    crate::common::cas_backoff(&mut backoff);
-                    continue;
-                }
-
-                q.producer_wake.fetch_or(bit_mask, Ordering::SeqCst);
-
-                // Re-check after publishing our wake bit.
-                let mut bits = unused;
-                let mut found = None;
-                while bits != 0 {
-                    let b = bits.trailing_zeros();
-                    let p = start + b as usize;
-                    if q.done_slot(p).load(Ordering::Acquire) == p {
-                        found = Some((b, p));
-                        break;
-                    }
-                    bits &= bits - 1;
-                }
-                if let Some((b, p)) = found {
-                    q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
-                    bit = b;
-                    pos = p;
-                    break 'outer;
-                }
-
-                std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
-                q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
-            }
+            let (b, p) = self.park_until_slot_free(q, start, unused);
+            bit = b;
+            pos = p;
         }
 
         self.batch_unused.set(unused & !(1u32 << bit));
@@ -200,12 +197,10 @@ impl<T, C: Config> Producer<T, C> {
         // Publish: ready[s] = pos + 1 (state = published).
         q.ready_slot(pos).store(pos + 1, Ordering::Release);
 
-        // Wake one consumer parked in pop_block, if any. Relaxed
-        // gate keeps the no-park fast path free; missed wakes are
-        // bounded by the consumer's park-timeout backstop.
-        if q.consumer_wake.load(Ordering::Relaxed) != 0 {
-            super::wake_one_consumer(q);
-        }
+        // Wake one consumer parked in pop_block, if any. `wake_one`
+        // self-gates on a `Relaxed` load; missed wakes are bounded
+        // by the consumer's park-timeout backstop.
+        q.consumer_park.wake_one();
         Ok(())
     }
 
@@ -237,27 +232,27 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
-            ensure_handle_installed(q, self.park_slot);
-            // SeqCst pairs with consumer's `producer_wake.load`
+            q.producer_park.ensure_handle_installed(self.park_slot);
+            // SeqCst pairs with consumer's `producer_park.wake.load`
             // after `done.store(Release)`: either we succeed in
             // the re-check below, or the consumer sees our bit
             // and unparks us.
-            q.producer_wake.fetch_or(bit_mask, Ordering::SeqCst);
+            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
 
             match self.push(val) {
                 Ok(()) => {
-                    q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                    q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                     return Ok(());
                 }
                 Err(returned) => val = returned,
             }
             if q.consumer_closed.0.load(Ordering::Acquire) {
-                q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Err(val);
             }
 
             std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
-            q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
 }
@@ -291,34 +286,8 @@ impl<T, C: Config> Drop for Producer<T, C> {
             self.queue.closed.0.store(true, Ordering::Release);
             // Wake every parked producer and consumer so they can
             // observe `closed` and exit. Cold path, last-drop only.
-            flush_wake_bitmap(&self.queue.producer_wake, &self.queue.producer_parkers);
-            flush_wake_bitmap(&self.queue.consumer_wake, &self.queue.consumer_parkers);
+            self.queue.producer_park.flush();
+            self.queue.consumer_park.flush();
         }
     }
-}
-
-/// Wakes every peer parked on the bitmap, swapping it to zero in
-/// the process. Cold-path helper for close-time draining.
-fn flush_wake_bitmap(
-    wake: &std::sync::atomic::AtomicU64,
-    parkers: &[std::sync::OnceLock<std::thread::Thread>],
-) {
-    let mut bits = wake.swap(0, Ordering::AcqRel);
-    while bits != 0 {
-        let b = bits.trailing_zeros() as usize;
-        if let Some(handle) = parkers[b].get() {
-            handle.unpark();
-        }
-        bits &= bits - 1;
-    }
-}
-
-/// Idempotently installs the current thread's `Thread` handle in
-/// `q.producer_parkers[slot]`. Subsequent calls observe the slot already
-/// set and no-op. Slot aliasing (>`PARK_SLOTS` producers) means
-/// the first installer wins; later wakes on that bit may unpark
-/// the wrong producer (benign — it just re-checks and re-parks).
-#[inline]
-fn ensure_handle_installed<T, C: Config>(q: &RingBuffer<T, C>, slot: usize) {
-    let _ = q.producer_parkers[slot].set(std::thread::current());
 }

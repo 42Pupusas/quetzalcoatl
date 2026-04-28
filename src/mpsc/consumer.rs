@@ -1,8 +1,10 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::RingBuffer;
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_TIMEOUT_MICROS};
 use crate::common::TOMBSTONE;
 
 /// The consumer side of an MPSC ring buffer.
@@ -56,6 +58,11 @@ impl<T> Consumer<T> {
 
             // Advance head
             self.queue.head.store(head + 1, Ordering::Release);
+
+            // Wake one parked producer if any. `wake_one` self-gates
+            // on a `Relaxed` load; missed wakes are bounded by the
+            // producer's park-timeout backstop.
+            self.queue.producer_park.wake_one();
 
             return Some(val);
         }
@@ -155,6 +162,11 @@ impl<T> Consumer<T> {
             // optimization. Producers use head for fullness pre-checks,
             // so batching reduces cache-line invalidations from O(n) to O(1).
             self.queue.head.store(head, Ordering::Release);
+            // One wake per drain batch (not per item) — drain produces
+            // up to `cap` of free space at once, and waking more than
+            // one producer per batch buys nothing if they're spinning.
+            // `wake_one` self-gates on a `Relaxed` load.
+            self.queue.producer_park.wake_one();
         }
 
         count
@@ -199,9 +211,69 @@ impl<T> Consumer<T> {
 
         if count > 0 {
             self.queue.head.store(head, Ordering::Release);
+            self.queue.producer_park.wake_one();
         }
 
         count
+    }
+
+    /// Pops the next item, blocking the calling thread when the
+    /// ring is empty until a producer publishes one. Returns `None`
+    /// only after the last [`Producer`](super::Producer) has been
+    /// dropped AND the ring has drained.
+    ///
+    /// Spins via the shared backoff schedule first, then registers
+    /// the consumer parker handle and parks. Producers signal after
+    /// every push (or batched at end of `drain`) gated on a single
+    /// `Relaxed` load so the no-park hot path stays cheap.
+    #[must_use]
+    pub fn pop_block(&mut self) -> Option<T> {
+        let mut backoff = 0u32;
+        loop {
+            if let Some(v) = self.pop() {
+                return Some(v);
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                // Re-check after observing closed: a producer may
+                // have published just before its last drop, and we
+                // must drain that before returning None.
+                if let Some(v) = self.pop() {
+                    return Some(v);
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            // Install our parker handle (idempotent on the OnceLock).
+            let _ = self.queue.consumer_parker.set(std::thread::current());
+            // SeqCst pairs with the producer's `consumer_parked.load`
+            // after `slot_seq.store(Release)`: either we see the
+            // published slot in the re-check below, or the producer
+            // sees our flag and unparks us.
+            self.queue.consumer_parked.0.store(true, Ordering::SeqCst);
+
+            if let Some(v) = self.pop() {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return Some(v);
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return self.pop();
+            }
+
+            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns `true` once the last [`Producer`](super::Producer)
+    /// has been dropped.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.queue.closed.0.load(Ordering::Acquire)
     }
 
     /// Returns the number of items currently in the buffer.
@@ -225,6 +297,14 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
+        // Flag consumer-closed *before* draining so producers parked
+        // in push_block observe it and return Err(val) instead of
+        // racing the drain to push into the slots we're about to
+        // free. Without this, a parked producer can see free space
+        // from drain() and return Ok even though the consumer is on
+        // its way out.
+        self.queue.consumer_closed.0.store(true, Ordering::Release);
+        self.queue.producer_park.flush();
         while self.pop().is_some() {}
     }
 }
@@ -272,5 +352,7 @@ impl<T> Drop for SlotReader<'_, T> {
             .queue
             .head
             .store(self.head + 1, Ordering::Release);
+
+        self.consumer.queue.producer_park.wake_one();
     }
 }
