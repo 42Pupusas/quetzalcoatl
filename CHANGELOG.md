@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-27
+
+### Added
+- **`mpmc` module** — relaxed-FIFO multi-producer multi-consumer ring
+  with no shared head cursor. Producers reserve batches via FAA on a
+  shared `claim` cursor and publish out of order; consumers scan
+  privately and CAS-claim the first published slot they find.
+  Throughput in the scan-based design is 5–8× the prior strict-FIFO
+  MPMC at low contention shapes (p2q2, p4q4) and ~2× at p8q8 median;
+  the trade-off is loss of strict ordering — items are returned in
+  publish order, not push order, and there is no FIFO across
+  producers. Capacity must be `>= 4`.
+- **`mpmc::Producer::push_block`** — blocks the calling thread on
+  full ring instead of returning `Err`, parking via the same
+  futex-style wake bitmap used internally. Returns `Err(val)` only
+  when the last `Consumer` has dropped.
+- **`mpmc::Consumer::pop_block`** — blocks on empty ring, returning
+  `None` only after the last `Producer` drops AND the ring drains.
+- **`mpmc::Config` trait** with `DefaultConfig` and `Cfg<B, S, F>`
+  helper for compile-time tuning of `PRODUCER_BATCH`,
+  `CAS_FAIL_SKIP`, `CONSUMED_FLUSH`. Bounds validated at
+  monomorphization (`PRODUCER_BATCH` in `1..=32`, others `>= 1`).
+- Diagnostic examples in `examples/`: `mpmc_perf` (single-shot
+  throughput), `mpmc_long` (per-iteration distribution),
+  `mpmc_pinned` (CPU-affinity strategies for variance investigation),
+  `mpmc_block` (push/pop × spin/block comparison),
+  `mpmc_vs_nspmc_dhat` (heap profile vs sharded N-SPMC under the
+  optional `dhat-heap` feature).
+
+### Changed
+- **MPMC consolidation**: the prior strict-FIFO `mpmc` variant is
+  removed. The scan-based variant (formerly `mpmc_scan`) is the only
+  MPMC ring shipped, and it now occupies the `mpmc::` module path.
+  Callers using the old MPMC must migrate; the new ring requires
+  `cap >= 4` (the per-slot tri-state encoding aliases at smaller
+  capacities) — workloads with `cap < 4` should switch to `spsc` /
+  `spmc` / `mpsc`.
+- Producer slow path uses futex-style park/unpark on a 64-bit wake
+  bitmap (`std::thread::park_timeout` + `OnceLock<Thread>` parker
+  table) when the spin/yield budget is exhausted. Mitigates the
+  bimodal throughput collapse observed at thread counts saturating
+  the machine — though SMT-pairing variance near `P + Q ≈ 2N`
+  remains a fundamental property of spin-based MPMC; see the
+  module docs for thread-count guidance.
+
+### Removed
+- `mpmc-instrument` cargo feature (the strict-FIFO MPMC it
+  instrumented is gone).
+
 ## [0.7.1] - 2026-04-27
 
 ### Fixed
@@ -77,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.6.0...v0.7.0
 [0.1.0]: https://github.com/42Pupusas/quetzalcoatl/releases/tag/v0.1.0

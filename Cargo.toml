@@ -1,21 +1,16 @@
 [package]
 name = "quetzalcoatl"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 authors = ["quetzalcoatl contributors"]
-description = "Lock-free ring buffers (SPSC, MPSC, SPMC, and broadcast) for high-performance concurrent communication"
+description = "Lock-free ring buffers (SPSC, MPSC, SPMC, MPMC, and broadcast) for high-performance concurrent communication"
 license = "MIT"
 repository = "https://github.com/42Pupusas/quetzalcoatl"
-keywords = ["lock-free", "mpsc", "spmc", "ring-buffer", "broadcast"]
+keywords = ["lock-free", "mpmc", "spmc", "ring-buffer", "broadcast"]
 categories = ["concurrency", "data-structures"]
 readme = "README.md"
 
 [features]
-# Internal: counts FAA-eligible vs CAS-fallback claim_batch decisions
-# in the MPMC consumer hot path. Used to evaluate whether a hybrid
-# CAS/FAA path would fire on a given workload before committing to the
-# implementation. Not for production use.
-mpmc-instrument = []
 # Enables `dhat` heap profiling in examples that opt in (currently
 # `mpmc_vs_nspmc_dhat`). Run with:
 #   cargo run --release --example mpmc_vs_nspmc_dhat --features dhat-heap

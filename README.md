@@ -2,20 +2,29 @@
 
 High-performance, lock-free ring buffers for Rust.
 
-Four variants cover every producer/consumer topology:
+Five variants cover every producer/consumer topology:
 
 | Module | Producers | Consumers | Use case |
 |---|---|---|---|
 | `spsc` | Single | Single | Pipelines, audio, networking |
 | `mpsc` | Multiple | Single | Fan-in from worker threads |
 | `spmc` | Single | Multiple | Work distribution, fan-out |
+| `mpmc` | Multiple | Multiple | High-throughput work queues |
 | `broadcast` | Multiple | Multiple | Pub/sub, event distribution |
+
+`mpmc` is the relaxed-FIFO scan-based design: producers reserve
+batches via FAA, consumers scan privately and CAS-claim individual
+slots. No shared head cursor, contention distributed across
+per-slot atomics, futex-style park/unpark on backpressure. Use
+`spmc` or one of the FIFO variants when ordering matters.
 
 ## Features
 
 - **Lock-free** — no mutexes, only atomic FAA / Acquire-Release
 - **Zero dependencies** — pure `std` implementation
-- **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side
+- **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side (SPSC/MPSC/SPMC/broadcast)
+- **Blocking variants** — `mpmc::Producer::push_block` and `mpmc::Consumer::pop_block` park on backpressure instead of forcing the caller to spin
+- **Compile-time tuning** — `mpmc::Config` trait + `Cfg<B, S, F>` helper let you customize batch / scan / flush behavior at the type level
 - **Sound by construction** — `commit()` is only available on `WrittenSlot` (after `write()`), so safe code cannot cause UB
 - **Miri-tested** — validated under Miri for undefined-behavior and data-race detection
 - **Power-of-two capacity** — fast bitwise-AND indexing, no modulo
@@ -24,7 +33,7 @@ Four variants cover every producer/consumer topology:
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.6"
+quetzalcoatl = "0.8"
 ```
 
 ## Quick start
@@ -113,6 +122,93 @@ drop(producer); // signal no more items
 let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
 assert_eq!(total, 100);
 ```
+
+### MPMC (multiple producers, multiple consumers)
+
+A relaxed-FIFO work queue. Each item goes to exactly one consumer,
+chosen by the scan order — items are returned in publish order, not
+push order, and there is no FIFO guarantee across producers. Trade
+strict ordering for throughput when the workload allows.
+
+```rust
+use quetzalcoatl::mpmc::RingBuffer;
+use quetzalcoatl::capacity::Capacity;
+use std::thread;
+
+let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+
+// Cloneable producer + consumer handles for fan-in / fan-out.
+let producers: Vec<_> = (0..4)
+    .map(|tid| {
+        let p = producer.clone();
+        thread::spawn(move || {
+            for i in 0..1000u64 {
+                while p.push(tid * 1000 + i).is_err() {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+    })
+    .collect();
+
+let consumers: Vec<_> = (0..4)
+    .map(|_| {
+        let c = consumer.clone();
+        thread::spawn(move || {
+            // pop_block parks on empty, returns None only after the
+            // last producer drops AND the ring drains.
+            let mut count = 0u64;
+            while c.pop_block().is_some() {
+                count += 1;
+            }
+            count
+        })
+    })
+    .collect();
+
+drop(producer);
+drop(consumer);
+
+for h in producers { h.join().unwrap(); }
+let total: u64 = consumers.into_iter().map(|h| h.join().unwrap()).sum();
+assert_eq!(total, 4 * 1000);
+```
+
+Capacity must be `>= 4` (the per-slot tri-state encoding requires
+it). For other sizes, use `spsc` / `spmc` / `mpsc`.
+
+#### Tuning
+
+Three knobs are exposed via [`mpmc::Config`]: `PRODUCER_BATCH`
+(positions reserved per FAA on the claim cursor), `CAS_FAIL_SKIP`
+(how far the consumer scan jumps after a lost CAS), and
+`CONSUMED_FLUSH` (pops between watermark flushes). Defaults are
+chosen for `cap=1024` and balanced (P, Q) workloads; tune via the
+inline helper:
+
+```rust
+use quetzalcoatl::mpmc::{Cfg, RingBuffer};
+use quetzalcoatl::capacity::Capacity;
+
+// PRODUCER_BATCH=16, CAS_FAIL_SKIP=64, CONSUMED_FLUSH=32
+let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(256)).split();
+# drop((p, c));
+```
+
+#### Thread-count guidance
+
+`mpmc` parks producers/consumers on a futex-style wake bitmap when
+they can't make forward progress, but it still relies on
+spin-then-park backoff in the common case. On an N-physical-core
+SMT machine (2N logical CPUs) throughput becomes highly variable
+once `P + Q` saturates the machine — peer threads sharing decode
+bandwidth with their SMT siblings causes 5–10× run-to-run swings
+near `P + Q ≈ 2N`.
+
+Rules of thumb: `P + Q ≤ N` is tight and predictable; `P + Q < 2N`
+is good with mild SMT-pairing variance; `P + Q ≈ 2N` is bimodal;
+`P + Q > 2N` collapses on oversubscription. See the module docs
+for details.
 
 ### Broadcast (multiple producers, multiple consumers)
 
