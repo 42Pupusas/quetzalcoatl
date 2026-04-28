@@ -3,7 +3,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Config, DefaultConfig, RingBuffer, PARK_MASK};
+use super::{
+    Config, DefaultConfig, RingBuffer, BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS,
+};
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
@@ -156,7 +158,7 @@ impl<T, C: Config> Producer<T, C> {
                 }
                 // Spin until cas_backoff fully escalates (~tens of
                 // μs including yields) before paying for park.
-                if backoff < 12 {
+                if backoff < BACKOFF_PARK_THRESHOLD {
                     crate::common::cas_backoff(&mut backoff);
                     continue;
                 }
@@ -182,7 +184,7 @@ impl<T, C: Config> Producer<T, C> {
                     break 'outer;
                 }
 
-                std::thread::park_timeout(Duration::from_micros(200));
+                std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
                 q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
             }
         }
@@ -230,7 +232,7 @@ impl<T, C: Config> Producer<T, C> {
             }
             // Spin until cas_backoff fully escalates (~tens of μs
             // including yields) before paying for park.
-            if backoff < 12 {
+            if backoff < BACKOFF_PARK_THRESHOLD {
                 crate::common::cas_backoff(&mut backoff);
                 continue;
             }
@@ -254,7 +256,7 @@ impl<T, C: Config> Producer<T, C> {
                 return Err(val);
             }
 
-            std::thread::park_timeout(Duration::from_micros(200));
+            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
             q.producer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }

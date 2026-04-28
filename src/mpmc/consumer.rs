@@ -3,7 +3,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Config, DefaultConfig, RingBuffer, PARK_MASK};
+use super::{
+    Config, DefaultConfig, RingBuffer, BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS,
+};
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -168,7 +170,7 @@ impl<T, C: Config> Consumer<T, C> {
             }
             // Spin until cas_backoff fully escalates (~tens of μs
             // including yields) before paying for park.
-            if backoff < 12 {
+            if backoff < BACKOFF_PARK_THRESHOLD {
                 crate::common::cas_backoff(&mut backoff);
                 continue;
             }
@@ -189,7 +191,7 @@ impl<T, C: Config> Consumer<T, C> {
                 return self.pop();
             }
 
-            std::thread::park_timeout(Duration::from_micros(200));
+            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
             q.consumer_wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }

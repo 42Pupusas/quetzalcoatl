@@ -76,6 +76,20 @@ use std::thread::Thread;
 pub(crate) const PARK_SLOTS: usize = 64;
 pub(crate) const PARK_MASK: usize = PARK_SLOTS - 1;
 
+/// `cas_backoff` failure-counter threshold past which the slow
+/// path stops spinning and parks. The schedule in
+/// [`crate::common::cas_backoff`] saturates at f=12 (64 pauses
+/// per call + sparse `yield_now`); waiting that long means we've
+/// already burned ~tens of microseconds and a futex round-trip
+/// (1–10μs) is amortized.
+pub(crate) const BACKOFF_PARK_THRESHOLD: u32 = 12;
+
+/// Safety-net park timeout (microseconds). The wake protocol's
+/// `SeqCst` pairing should make missed wakes impossible, but this
+/// timeout caps wait latency if a wake is somehow lost — defensive
+/// against future refactors of the ordering invariants.
+pub(crate) const PARK_TIMEOUT_MICROS: u64 = 200;
+
 /// Tunable parameters baked into a [`RingBuffer`]'s type. Implement
 /// this on a zero-sized type to customize batching / scan behavior
 /// at compile time; the default values live in [`DefaultConfig`].
