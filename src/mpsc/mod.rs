@@ -1099,6 +1099,104 @@ mod tests {
         assert_eq!(c.pop_block(), None);
     }
 
+    /// Regression: `drain` and `drain_up_to` previously called
+    /// `wake_one` after a batch, which only released ONE parked
+    /// producer even when the drain freed many slots. With many
+    /// producers waiting on `push_block`, all but one would stall
+    /// until the next pop or push fired another wake. Fix:
+    /// `wake_n(count)`.
+    ///
+    /// Test design: pre-fill the ring so all `N` producers park on
+    /// their first `push_block`. Drain ONCE (releasing every slot
+    /// in one batch), then DO NOT call drain or pop again — count
+    /// how many producers complete their single push within a
+    /// deadline.
+    ///
+    /// With the fix (`wake_n(N)`): all N parked producers wake,
+    /// each pushes once into the now-empty ring (N <= CAP so they
+    /// all fit), all join.
+    ///
+    /// With the bug (`wake_one`): only one producer wakes. It
+    /// pushes (ring has CAP-1 free). No further wake fires
+    /// because the consumer is silent. The other N-1 producers
+    /// stay parked → test panics on the deadline. Verified by
+    /// temporarily flipping `wake_n(count)` back to `wake_one()`
+    /// during development; this test reliably hangs.
+    #[test]
+    fn drain_wakes_all_parked_producers() {
+        const CAP: u32 = 4;
+        // N == CAP so the post-drain pushes all fit exactly.
+        const N_PRODUCERS: u32 = 4;
+
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(CAP as usize)).split();
+        // Fill the ring so the next push from any producer must park.
+        for i in 0..CAP {
+            p.push(i).unwrap();
+        }
+
+        // Each producer pushes exactly once. Their single push will
+        // initially fail (ring full) → push_block parks. We rely on
+        // drain's wake fan-out to release them.
+        let producers: Vec<_> = (0..N_PRODUCERS)
+            .map(|tid| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    p.push_block(1000 + tid).expect("consumer dropped");
+                })
+            })
+            .collect();
+        drop(p);
+
+        // Give producers time to attempt the push and park. 50ms is
+        // plenty for them to escalate cas_backoff and reach park.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Single drain — frees CAP=4 slots. With wake_n(4) all 4
+        // parked producers wake; with the buggy wake_one(1) only
+        // one does and the test fails on the deadline below.
+        let drained = c.drain(|_| {});
+        assert_eq!(drained, CAP as usize);
+
+        // Wait for all producers to complete WITHOUT calling drain
+        // or pop again — those would each emit additional wakes and
+        // mask the bug.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for (i, h) in producers.into_iter().enumerate() {
+            while !h.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drain woke fewer than {N_PRODUCERS} parked producers — \
+                     producer {i} (and possibly later ones) still parked at deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn drain_block_drains_to_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        let p2 = p.clone();
+        let h = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            c.drain_block(|v| got.push(v));
+            got
+        });
+        for i in 0..3u32 {
+            p.push(i).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 100..103u32 {
+            p2.push(i).unwrap();
+        }
+        drop(p);
+        drop(p2);
+        let mut got = h.join().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 100, 101, 102]);
+    }
+
     #[test]
     fn push_block_two_producers_serialize_through_capacity_one() {
         // Two producers contending for a single slot. Each takes its

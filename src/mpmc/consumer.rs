@@ -204,6 +204,83 @@ impl<T, C: Config> Consumer<T, C> {
         })
     }
 
+    /// Drains all currently-claimable items, calling `f` for each.
+    /// Returns the number drained.
+    ///
+    /// Each item still requires a CAS-claim (mpmc's slot ownership
+    /// is per-slot, not via a shared head), so drain doesn't avoid
+    /// CAS traffic. The wins are: (1) one `wake_n(count)` for the
+    /// whole batch instead of `count` `wake_one` calls, and (2) a
+    /// tighter inner loop with no Option wrapping per item.
+    ///
+    /// "Currently-claimable" means: slots with `state == 1` at or
+    /// after `next_scan`, up to one full lap. May terminate early
+    /// if other consumers race in and claim items first.
+    pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut count = 0usize;
+        while let Some((pos, round_pos)) = self.claim_slot() {
+            let q = &*self.queue;
+            // SAFETY: claim_slot's CAS gave us unique ownership of
+            // (pos, round_pos). Producer committed before publishing.
+            let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
+            q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            // Single batched wake. With many parked producers (one
+            // per next-round slot we just released), `wake_n(count)`
+            // releases up to `count` of them — each `wake_one` would
+            // strand the rest until the next pop/drain.
+            self.queue.producer_park.wake_n(count);
+        }
+        count
+    }
+
+    /// Drains up to `limit` items, calling `f` for each. Returns
+    /// the number drained. Useful for fairness in multi-source
+    /// consumer loops.
+    pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut count = 0usize;
+        while count < limit {
+            let Some((pos, round_pos)) = self.claim_slot() else {
+                break;
+            };
+            let q = &*self.queue;
+            let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
+            q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            self.queue.producer_park.wake_n(count);
+        }
+        count
+    }
+
+    /// Drains items, blocking when empty, until the ring is closed
+    /// AND drained. Calls `f` for each item. Returns the total count.
+    ///
+    /// Combines [`drain`](Self::drain)'s batched wake with
+    /// [`pop_block`](Self::pop_block)'s park-on-empty protocol.
+    pub fn drain_block(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut total = 0usize;
+        loop {
+            total += self.drain(&mut f);
+            // pop_block re-checks close after wake; if close + empty
+            // it returns None and we exit. Otherwise we got one more
+            // item and can resume draining (typically batches resume
+            // in the next drain() pass).
+            match self.pop_block() {
+                Some(v) => {
+                    total += 1;
+                    f(v);
+                }
+                None => return total,
+            }
+        }
+    }
+
     /// Pops the next item, blocking the calling thread when the
     /// ring is empty until a producer publishes one. Returns
     /// `None` only when the ring is closed AND empty (no live

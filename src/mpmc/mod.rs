@@ -1174,4 +1174,110 @@ mod tests {
         assert_eq!(got, vec![1, 2]);
         assert!(c.pop_ref_block().is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Drain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_empty_returns_zero() {
+        let (_p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let n = c.drain(|_| panic!("unexpected"));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn drain_all_published() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let mut got = Vec::new();
+        let n = c.drain(|v| got.push(v));
+        assert_eq!(n, 4);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn drain_up_to_limit() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let mut got = Vec::new();
+        let n = c.drain_up_to(2, |v| got.push(v));
+        assert_eq!(n, 2);
+        // Remaining 2 still claimable.
+        let mut rest = Vec::new();
+        c.drain(|v| rest.push(v));
+        let mut all: Vec<u32> = got.into_iter().chain(rest).collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn drain_block_drains_to_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            c.drain_block(|v| got.push(v));
+            got
+        });
+        for i in 0..3u32 {
+            p.push(i).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 100..103u32 {
+            p.push(i).unwrap();
+        }
+        drop(p);
+        let mut got = h.join().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 100, 101, 102]);
+    }
+
+    /// mpmc analog of `mpsc::drain_wakes_all_parked_producers` — same
+    /// regression class. With `wake_n(count)` all parked producers
+    /// wake after a drain; with the old `wake_one` only one would,
+    /// stranding the rest.
+    #[test]
+    fn drain_wakes_all_parked_producers() {
+        const CAP: u32 = 4;
+        const N_PRODUCERS: u32 = 4;
+
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(CAP as usize)).split();
+        for i in 0..CAP {
+            p.push(i).unwrap();
+        }
+
+        let producers: Vec<_> = (0..N_PRODUCERS)
+            .map(|tid| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    p.push_block(1000 + tid).expect("consumers dropped");
+                })
+            })
+            .collect();
+        drop(p);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Single drain — releases done[s] for all 4 slots and wakes
+        // up to 4 producers via wake_n.
+        let n = c.drain(|_| {});
+        assert_eq!(n, CAP as usize);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for (i, h) in producers.into_iter().enumerate() {
+            while !h.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drain woke fewer than {N_PRODUCERS} parked producers — \
+                     producer {i} (and possibly later ones) still parked"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            h.join().unwrap();
+        }
+    }
 }

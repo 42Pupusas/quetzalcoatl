@@ -45,6 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop so we don't FAA, CAS, or tombstone a slot we'd then have
   to roll back per iteration. Broadcast still has no blocking
   API by design.
+- **`drain` / `drain_up_to` / `drain_block`** on spsc and mpmc;
+  **`drain_block`** on mpsc (drain/`drain_up_to` already existed).
+  drain_block combines drain's batched wake fan-out with park-on-
+  empty, exiting cleanly when all producers have dropped.
+
+### Fixed
+- **`mpsc::Consumer::drain` woke only one parked producer per
+  batch.** When N producers were parked on `push_block` waiting
+  for space, a single drain freed N slots but only one producer
+  resumed — the rest stayed parked until the next push or pop
+  emitted another wake. With drain-only consumer patterns this
+  could deadlock. Replaced `wake_one()` with a new
+  `WakeSet::wake_n(count)` that releases up to `count` parkers
+  per call. `mpmc::Consumer::drain` (newly added in this release)
+  uses the same `wake_n(count)` shape, so the regression class
+  is closed everywhere drains exist.
 
 ## [0.8.1] - 2026-05-01
 

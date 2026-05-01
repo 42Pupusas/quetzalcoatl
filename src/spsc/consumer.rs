@@ -64,6 +64,83 @@ impl<T> Consumer<T> {
         Some(val)
     }
 
+    /// Drains all currently available items, calling `f` for each
+    /// one. Returns the number drained.
+    ///
+    /// Amortizes the `head` pointer update: individual reads happen
+    /// in sequence but the shared `head` is written **once** at the
+    /// end of the batch, reducing cache-line invalidation traffic
+    /// between consumer and producer from O(n) to O(1). The single
+    /// post-batch `wake_producer` is sufficient because spsc has
+    /// only one producer.
+    pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut head = self.queue.head.load(Ordering::Relaxed);
+        let mut count = 0usize;
+        loop {
+            if !self.available(head) {
+                break;
+            }
+            // SAFETY: available(head) returned true → tail > head with
+            // Acquire, so the slot at `head` is initialized.
+            let val = unsafe { (*self.queue.slot(head).get()).assume_init_read() };
+            head += 1;
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            // Single head store for the entire batch.
+            self.queue.head.store(head, Ordering::Release);
+            self.queue.wake_producer();
+        }
+        count
+    }
+
+    /// Drains up to `limit` items, calling `f` for each. Returns the
+    /// number drained. Useful for fairness in multi-source consumer
+    /// loops.
+    pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut head = self.queue.head.load(Ordering::Relaxed);
+        let mut count = 0usize;
+        while count < limit {
+            if !self.available(head) {
+                break;
+            }
+            let val = unsafe { (*self.queue.slot(head).get()).assume_init_read() };
+            head += 1;
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            self.queue.head.store(head, Ordering::Release);
+            self.queue.wake_producer();
+        }
+        count
+    }
+
+    /// Drains items, blocking when empty, until the producer drops.
+    /// Calls `f` for each item drained. Returns the total count.
+    ///
+    /// Combines [`drain`](Self::drain)'s amortized head update with
+    /// [`pop_block`](Self::pop_block)'s park-on-empty protocol. Use
+    /// this for a long-running consumer loop that wants throughput
+    /// (drain) and CPU efficiency on idle (block).
+    pub fn drain_block(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut total = 0usize;
+        loop {
+            total += self.drain(&mut f);
+            // After the drain, either wait for more items or exit on
+            // producer-closed (with a final drain to catch any
+            // late-published items).
+            match self.pop_block() {
+                Some(v) => {
+                    total += 1;
+                    f(v);
+                }
+                None => return total,
+            }
+        }
+    }
+
     /// Pops the next item, blocking the calling thread when the ring
     /// is empty until a producer publishes one. Returns `None` only
     /// when the [`Producer`](super::Producer) has been dropped AND

@@ -815,4 +815,91 @@ mod tests {
         assert_eq!(v2, 2);
         assert!(c.pop_ref_block().is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Drain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_empty_returns_zero() {
+        let (_p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let n = c.drain(|_| panic!("unexpected"));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn drain_all_available() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let mut got = Vec::new();
+        let n = c.drain(|v| got.push(v));
+        assert_eq!(n, 4);
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        assert_eq!(c.pop(), None);
+    }
+
+    #[test]
+    fn drain_up_to_limit() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let mut got = Vec::new();
+        let n = c.drain_up_to(2, |v| got.push(v));
+        assert_eq!(n, 2);
+        assert_eq!(got, vec![0, 1]);
+        // Remaining are still there.
+        assert_eq!(c.pop(), Some(2));
+        assert_eq!(c.pop(), Some(3));
+    }
+
+    #[test]
+    fn drain_block_drains_to_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            c.drain_block(|v| got.push(v));
+            got
+        });
+        // Push, sleep, push, drop. drain_block should pick everything up.
+        p.push(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        p.push(2).unwrap();
+        p.push(3).unwrap();
+        drop(p);
+        let got = h.join().unwrap();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn drain_wakes_producer() {
+        // SPSC has only one producer. Test that drain releasing the
+        // ring wakes it from push_block.
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let h = std::thread::spawn(move || {
+            for i in 4..8u32 {
+                p.push_block(i).expect("consumer dropped");
+            }
+        });
+        // Producer parks waiting for space.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Single drain frees all 4 slots and wakes producer.
+        let n = c.drain(|_| {});
+        assert_eq!(n, 4);
+        // Producer should complete its 4 more pushes promptly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !h.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain failed to wake producer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.join().unwrap();
+    }
 }

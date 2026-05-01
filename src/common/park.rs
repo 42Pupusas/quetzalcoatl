@@ -88,6 +88,36 @@ impl WakeSet {
         // the wake.
     }
 
+    /// Wakes up to `n` parked waiters. Used by drain-style operations
+    /// that free `n` slots in one batch and want to release roughly
+    /// `n` parkers at once. Caps at the number of currently parked
+    /// waiters; extra wakes (when `n` exceeds parkers) are no-ops.
+    ///
+    /// Each iteration is `wake_one`'s logic: pick the lowest set bit,
+    /// CAS it clear, unpark the slot. Implemented as a loop rather
+    /// than swap-bits-once because we want to wake *exactly* `n` if
+    /// available, not all of them.
+    #[inline]
+    pub fn wake_n(&self, n: usize) {
+        for _ in 0..n {
+            let ws = self.wake.load(Ordering::Relaxed);
+            if ws == 0 {
+                return;
+            }
+            let bit = ws.trailing_zeros();
+            let mask = 1u64 << bit;
+            let prev = self.wake.fetch_and(!mask, Ordering::Relaxed);
+            if prev & mask == 0 {
+                // Lost the race on this bit — try again. Don't count
+                // this iteration since we didn't wake anything.
+                continue;
+            }
+            if let Some(handle) = self.parkers[bit as usize].get() {
+                handle.unpark();
+            }
+        }
+    }
+
     /// Wakes every waiter parked on the bitmap, swapping it to zero
     /// in the process. Cold-path helper for close-time draining.
     pub fn flush(&self) {

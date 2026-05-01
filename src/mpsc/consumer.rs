@@ -177,11 +177,12 @@ impl<T> Consumer<T> {
             // optimization. Producers use head for fullness pre-checks,
             // so batching reduces cache-line invalidations from O(n) to O(1).
             self.queue.head.store(head, Ordering::Release);
-            // One wake per drain batch (not per item) — drain produces
-            // up to `cap` of free space at once, and waking more than
-            // one producer per batch buys nothing if they're spinning.
-            // `wake_one` self-gates on a `Relaxed` load.
-            self.queue.producer_park.wake_one();
+            // Wake up to `count` parked producers. A drain frees `count`
+            // slots, and there may be that many producers parked on
+            // push_block waiting for space — waking only one would
+            // strand the rest until the next pop. `wake_n` self-gates
+            // on the bitmap being non-zero.
+            self.queue.producer_park.wake_n(count);
         }
 
         count
@@ -226,10 +227,37 @@ impl<T> Consumer<T> {
 
         if count > 0 {
             self.queue.head.store(head, Ordering::Release);
-            self.queue.producer_park.wake_one();
+            // Wake up to `count` parked producers — see `drain` for
+            // rationale.
+            self.queue.producer_park.wake_n(count);
         }
 
         count
+    }
+
+    /// Drains items, blocking when empty, until all producers have
+    /// dropped. Calls `f` for each item drained. Returns the total
+    /// count.
+    ///
+    /// Combines [`drain`](Self::drain)'s amortized head update and
+    /// `wake_n` fan-out with [`pop_block`](Self::pop_block)'s park-
+    /// on-empty protocol. Use this for a long-running consumer that
+    /// wants throughput (drain) and CPU efficiency on idle (block).
+    pub fn drain_block(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut total = 0usize;
+        loop {
+            total += self.drain(&mut f);
+            // After the drain, either wait for more items or exit on
+            // closed (with a final drain to catch late publishes
+            // racing the producer's last drop).
+            match self.pop_block() {
+                Some(v) => {
+                    total += 1;
+                    f(v);
+                }
+                None => return total,
+            }
+        }
     }
 
     /// Pops the next item, blocking the calling thread when the
