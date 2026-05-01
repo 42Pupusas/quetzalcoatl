@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 
 /// The consumer side of an SPMC ring buffer.
 ///
@@ -64,6 +65,9 @@ pub struct Consumer<T> {
     /// up to `BATCH_SIZE` items.
     batch_next: Cell<usize>,
     batch_end: Cell<usize>,
+    /// Stable park slot for this consumer (mod `PARK_SLOTS`). Used by
+    /// `pop_block` to set/clear its bit on `consumer_park.wake`.
+    park_slot: usize,
 }
 
 /// Maximum positions claimed in one head FAA. Larger = fewer atomics on
@@ -74,11 +78,23 @@ const BATCH_SIZE: usize = 32;
 
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
+        // Distinct park slot per clone, mod PARK_SLOTS.
+        let park_idx = self
+            .queue
+            .consumer_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        // Bump the live-consumer count so the producer can detect
+        // "all consumers gone" via consumer_closed.
+        self.queue
+            .consumer_count_live
+            .fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             cached_tail: Cell::new(0),
             batch_next: Cell::new(0),
             batch_end: Cell::new(0),
+            park_slot: park_idx & PARK_MASK,
         }
     }
 }
@@ -94,6 +110,7 @@ impl<T> Consumer<T> {
             cached_tail: Cell::new(0),
             batch_next: Cell::new(0),
             batch_end: Cell::new(0),
+            park_slot: 0,
         }
     }
 
@@ -203,7 +220,58 @@ impl<T> Consumer<T> {
         // done[s] == head + cap and proceed to overwrite the slot.
         slot_done.store(head + self.queue.cap, Ordering::Release);
 
+        // Wake the producer if it's parked in push_block. Self-gated
+        // on a Relaxed load of `producer_parked`.
+        self.queue.wake_producer();
+
         Some(val)
+    }
+
+    /// Pops the next item, blocking the calling thread when the ring
+    /// is empty until a producer publishes one. Returns `None` only
+    /// when the [`Producer`](super::Producer) has been dropped AND
+    /// the ring has drained.
+    ///
+    /// Spins via the shared backoff schedule first, then sets a wake
+    /// bit on the consumer wake bitmap and parks. The producer signals
+    /// after every push, gated on a single `Relaxed` load.
+    #[must_use]
+    pub fn pop_block(&self) -> Option<T> {
+        let q = &*self.queue;
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if let Some(v) = self.pop() {
+                return Some(v);
+            }
+            if q.closed.0.load(Ordering::Acquire) {
+                if let Some(v) = self.pop() {
+                    return Some(v);
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            q.consumer_park.ensure_handle_installed(self.park_slot);
+            // SeqCst pairs with the producer's `consumer_park.wake.load`
+            // after `ready.store(Release)`.
+            q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+
+            if let Some(v) = self.pop() {
+                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return Some(v);
+            }
+            if q.closed.0.load(Ordering::Acquire) {
+                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.pop();
+            }
+
+            std::thread::park();
+            q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+        }
     }
 
     /// Returns a zero-copy read reference to the next item in the buffer.
@@ -220,7 +288,7 @@ impl<T> Consumer<T> {
             done_ptr,
             head,
             cap: self.queue.cap,
-            _consumer: self,
+            consumer: self,
         })
     }
 
@@ -274,6 +342,14 @@ impl<T> Drop for Consumer<T> {
             }
             q.done_slot(pos).0.store(pos + cap, Ordering::Release);
         }
+        // Last-consumer drop: flag `consumer_closed` and wake the
+        // producer if it's parked in push_block.
+        if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            q.consumer_closed.0.store(true, Ordering::Release);
+            if let Some(handle) = q.producer_parker.get() {
+                handle.unpark();
+            }
+        }
     }
 }
 
@@ -283,7 +359,7 @@ pub struct SlotReader<'a, T> {
     done_ptr: *const AtomicUsize,
     head: usize,
     cap: usize,
-    _consumer: &'a mut Consumer<T>,
+    consumer: &'a mut Consumer<T>,
 }
 
 impl<T> std::ops::Deref for SlotReader<'_, T> {
@@ -306,5 +382,6 @@ impl<T> Drop for SlotReader<'_, T> {
         unsafe {
             (*self.done_ptr).store(self.head + self.cap, Ordering::Release);
         }
+        self.consumer.queue.wake_producer();
     }
 }

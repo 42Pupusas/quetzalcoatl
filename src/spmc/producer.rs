@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
 
 /// The producer side of an SPMC ring buffer.
 ///
@@ -59,9 +60,58 @@ impl<T> Producer<T> {
                 self.queue
                     .tail
                     .store(self.write_pos.get(), Ordering::Release);
+                // Wake one consumer parked in pop_block, if any.
+                // Self-gated on a Relaxed load of the bitmap.
+                self.queue.consumer_park.wake_one();
                 Ok(())
             }
             None => Err(val),
+        }
+    }
+
+    /// Pushes a value, blocking the calling thread when the ring is
+    /// full until a consumer makes space. Returns `Err(val)` only
+    /// when the last [`Consumer`](super::Consumer) has been dropped
+    /// (no consumer left to drain).
+    ///
+    /// Spins via the shared backoff schedule first, then registers
+    /// the producer parker handle and parks. Consumers signal after
+    /// every pop, gated on a single `Relaxed` load.
+    pub fn push_block(&self, mut val: T) -> Result<(), T> {
+        let q = &*self.queue;
+        let mut backoff = 0u32;
+        loop {
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => return Ok(()),
+                Err(returned) => val = returned,
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = q.producer_parker.set(std::thread::current());
+            // SeqCst pairs with consumer's `producer_parked.load`
+            // after `done.store(Release)`.
+            q.producer_parked.0.store(true, Ordering::SeqCst);
+
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                q.producer_parked.0.store(false, Ordering::Relaxed);
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => {
+                    q.producer_parked.0.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(returned) => val = returned,
+            }
+
+            std::thread::park();
+            q.producer_parked.0.store(false, Ordering::Relaxed);
         }
     }
 
@@ -80,6 +130,7 @@ impl<T> Producer<T> {
                 tail: &self.queue.tail,
                 write_pos: &self.write_pos,
                 pos,
+                queue: &self.queue,
             })
     }
 
@@ -108,6 +159,9 @@ impl<T> Drop for Producer<T> {
         // can return None. Release synchronizes with consumer's
         // Acquire-load of the closed flag.
         self.queue.closed.0.store(true, Ordering::Release);
+        // Wake every parked consumer so they can observe `closed`
+        // and exit pop_block.
+        self.queue.consumer_park.flush();
     }
 }
 
@@ -124,6 +178,7 @@ pub struct SlotWriter<'a, T> {
     tail: &'a AtomicUsize,
     write_pos: &'a std::cell::Cell<usize>,
     pos: usize,
+    queue: &'a RingBuffer<T>,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (single producer).
@@ -153,6 +208,7 @@ impl<'a, T> SlotWriter<'a, T> {
             tail: this.tail,
             write_pos: this.write_pos,
             pos: this.pos,
+            queue: this.queue,
             committed: false,
         }
     }
@@ -167,6 +223,7 @@ impl<'a, T> SlotWriter<'a, T> {
     pub unsafe fn commit_unchecked(self) {
         self.slot_ready.store(self.pos + 1, Ordering::Release);
         self.tail.store(self.write_pos.get(), Ordering::Release);
+        self.queue.consumer_park.wake_one();
         std::mem::forget(self);
     }
 }
@@ -189,6 +246,7 @@ pub struct WrittenSlot<'a, T> {
     tail: &'a AtomicUsize,
     write_pos: &'a std::cell::Cell<usize>,
     pos: usize,
+    queue: &'a RingBuffer<T>,
     committed: bool,
 }
 
@@ -202,6 +260,7 @@ impl<T> WrittenSlot<'_, T> {
     pub fn commit(mut self) {
         self.slot_ready.store(self.pos + 1, Ordering::Release);
         self.tail.store(self.write_pos.get(), Ordering::Release);
+        self.queue.consumer_park.wake_one();
         self.committed = true;
     }
 }

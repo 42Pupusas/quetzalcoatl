@@ -35,8 +35,9 @@ use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 
 /// A lock-free SPSC ring buffer.
 ///
@@ -52,6 +53,23 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// Set when the [`Producer`] is dropped. [`Consumer::pop_block`]
+    /// observes this and returns `None` once the queue drains.
+    pub(crate) producer_closed: CachePadded<AtomicBool>,
+    /// Set when the [`Consumer`] is dropped. [`Producer::push_block`]
+    /// observes this and returns `Err(val)` instead of hanging.
+    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    /// Single-producer park handle. Idempotently set the first time
+    /// the producer parks; the consumer reads it via `OnceLock::get`
+    /// to issue the unpark.
+    pub(crate) producer_parker: OnceLock<Thread>,
+    /// `true` ↔ producer is currently parked. Consumers gate their
+    /// unpark on this `Relaxed` load to keep the no-park hot path free.
+    pub(crate) producer_parked: CachePadded<AtomicBool>,
+    /// Single-consumer park handle. Symmetric to `producer_parker`.
+    pub(crate) consumer_parker: OnceLock<Thread>,
+    /// `true` ↔ consumer is currently parked.
+    pub(crate) consumer_parked: CachePadded<AtomicBool>,
 }
 
 // Safety: Single producer writes via tail, single consumer reads via head.
@@ -72,6 +90,38 @@ impl<T> RingBuffer<T> {
             tail: CachePadded(AtomicUsize::new(0)),
             cap,
             mask: capacity.mask,
+            producer_closed: CachePadded(AtomicBool::new(false)),
+            consumer_closed: CachePadded(AtomicBool::new(false)),
+            producer_parker: OnceLock::new(),
+            producer_parked: CachePadded(AtomicBool::new(false)),
+            consumer_parker: OnceLock::new(),
+            consumer_parked: CachePadded(AtomicBool::new(false)),
+        }
+    }
+
+    /// Wakes the parked producer, if any. Gated on a `Relaxed` load
+    /// of `producer_parked` so the no-park hot path stays branch-free
+    /// in the common case.
+    #[inline]
+    pub(crate) fn wake_producer(&self) {
+        if !self.producer_parked.0.load(Ordering::Relaxed) {
+            return;
+        }
+        self.producer_parked.0.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.producer_parker.get() {
+            handle.unpark();
+        }
+    }
+
+    /// Wakes the parked consumer, if any. Symmetric to `wake_producer`.
+    #[inline]
+    pub(crate) fn wake_consumer(&self) {
+        if !self.consumer_parked.0.load(Ordering::Relaxed) {
+            return;
+        }
+        self.consumer_parked.0.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.consumer_parker.get() {
+            handle.unpark();
         }
     }
 
@@ -620,5 +670,80 @@ mod tests {
         }
         h.join().unwrap();
         assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocking API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pop_block_wakes_on_push() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(7).unwrap();
+        assert_eq!(h.join().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn pop_block_returns_none_on_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_block());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(p);
+        assert_eq!(h.join().unwrap(), None);
+    }
+
+    #[test]
+    fn pop_block_drains_before_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        drop(p);
+        assert_eq!(c.pop_block(), Some(1));
+        assert_eq!(c.pop_block(), Some(2));
+        assert_eq!(c.pop_block(), None);
+    }
+
+    #[test]
+    fn push_block_unblocks_on_pop() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let h = std::thread::spawn(move || p.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(c.pop(), Some(0));
+        assert_eq!(h.join().unwrap(), Ok(()));
+        // Drain remaining including the unblocked push.
+        assert_eq!(c.pop(), Some(1));
+        assert_eq!(c.pop(), Some(2));
+        assert_eq!(c.pop(), Some(3));
+        assert_eq!(c.pop(), Some(99));
+    }
+
+    #[test]
+    fn push_block_returns_err_on_consumer_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+        let h = std::thread::spawn(move || p.push_block(99));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Drain the buffer so consumer's Drop only sets consumer_closed
+        // after we've seen push_block parked.
+        while c.pop().is_some() {}
+        drop(c);
+        assert_eq!(h.join().unwrap(), Err(99));
+    }
+
+    #[test]
+    fn is_closed_reflects_producer_drop() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        assert!(!c.is_closed());
+        drop(p);
+        assert!(c.is_closed());
     }
 }

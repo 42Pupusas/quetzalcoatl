@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
 
 /// The consumer side of an SPSC ring buffer.
 ///
@@ -56,7 +57,68 @@ impl<T> Consumer<T> {
         // signaling to the producer that the slot is free.
         self.queue.head.store(head + 1, Ordering::Release);
 
+        // Wake the producer if it's parked in push_block. Relaxed gate
+        // keeps the no-park hot path free.
+        self.queue.wake_producer();
+
         Some(val)
+    }
+
+    /// Pops the next item, blocking the calling thread when the ring
+    /// is empty until a producer publishes one. Returns `None` only
+    /// when the [`Producer`](super::Producer) has been dropped AND
+    /// the ring has drained.
+    ///
+    /// Spins via the shared backoff schedule first, then registers
+    /// the consumer parker handle and parks. The producer signals
+    /// after every push, gated on a single `Relaxed` load.
+    #[must_use]
+    pub fn pop_block(&mut self) -> Option<T> {
+        let mut backoff = 0u32;
+        loop {
+            if let Some(v) = self.pop() {
+                return Some(v);
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                // Re-check after observing closed: producer may have
+                // published just before its drop, and we must drain
+                // that before returning None.
+                if let Some(v) = self.pop() {
+                    return Some(v);
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = self.queue.consumer_parker.set(std::thread::current());
+            // SeqCst pairs with the producer's `consumer_parked.load`
+            // after `tail.store(Release)`: either we see the published
+            // slot in the re-check below, or the producer sees our flag
+            // and unparks us.
+            self.queue.consumer_parked.0.store(true, Ordering::SeqCst);
+
+            if let Some(v) = self.pop() {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return Some(v);
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return self.pop();
+            }
+
+            std::thread::park();
+            self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns `true` once the [`Producer`](super::Producer) has been
+    /// dropped.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.queue.producer_closed.0.load(Ordering::Acquire)
     }
 
     /// Returns a zero-copy read reference to the next item in the buffer.
@@ -108,6 +170,13 @@ impl<T> Consumer<T> {
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
+        // Mark consumer-closed so a parked producer in push_block can
+        // observe it and return Err(val).
+        self.queue.consumer_closed.0.store(true, Ordering::Release);
+        // Wake the producer if it's parked.
+        if let Some(handle) = self.queue.producer_parker.get() {
+            handle.unpark();
+        }
     }
 }
 
@@ -146,5 +215,6 @@ impl<T> Drop for SlotReader<'_, T> {
             .queue
             .head
             .store(self.head + 1, Ordering::Release);
+        self.consumer.queue.wake_producer();
     }
 }

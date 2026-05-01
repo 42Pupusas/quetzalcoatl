@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
 
 /// The producer side of an SPSC ring buffer.
 ///
@@ -72,7 +73,64 @@ impl<T> Producer<T> {
         // Release: ensures the data write above is visible before tail advances.
         self.queue.tail.store(pos + 1, Ordering::Release);
 
+        // Wake the consumer if it's parked in pop_block. Relaxed gate
+        // keeps the no-park hot path free.
+        self.queue.wake_consumer();
+
         Ok(())
+    }
+
+    /// Pushes a value, blocking the calling thread when the ring is
+    /// full until the consumer makes space. Returns `Err(val)` only
+    /// when the [`Consumer`](super::Consumer) has been dropped (no
+    /// consumer left to drain).
+    ///
+    /// Spins via the shared backoff schedule first, then registers
+    /// the producer parker handle and parks. The consumer signals
+    /// after every pop, gated on a single `Relaxed` load.
+    pub fn push_block(&self, mut val: T) -> Result<(), T> {
+        let q = &*self.queue;
+        let mut backoff = 0u32;
+        loop {
+            // Check consumer_closed *before* attempting push. Once
+            // the consumer drops it sets `consumer_closed = true`;
+            // any free space we'd find afterward is permanent and
+            // must not be filled.
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => return Ok(()),
+                Err(returned) => val = returned,
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            // Idempotently install our parker handle.
+            let _ = q.producer_parker.set(std::thread::current());
+            // SeqCst pairs with the consumer's `producer_parked.load`
+            // after `head.store(Release)`: either we succeed in the
+            // re-check below, or the consumer sees our flag and unparks
+            // us.
+            q.producer_parked.0.store(true, Ordering::SeqCst);
+
+            if q.consumer_closed.0.load(Ordering::Acquire) {
+                q.producer_parked.0.store(false, Ordering::Relaxed);
+                return Err(val);
+            }
+            match self.push(val) {
+                Ok(()) => {
+                    q.producer_parked.0.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(returned) => val = returned,
+            }
+
+            std::thread::park();
+            q.producer_parked.0.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Reserves a slot for zero-copy writing.
@@ -95,6 +153,7 @@ impl<T> Producer<T> {
             tail: &self.queue.tail,
             write_pos: &self.write_pos,
             pos,
+            queue: &self.queue,
         })
     }
 
@@ -117,6 +176,20 @@ impl<T> Producer<T> {
     }
 }
 
+impl<T> Drop for Producer<T> {
+    fn drop(&mut self) {
+        // Mark the queue closed so a parked consumer in pop_block can
+        // observe it and return None. Release synchronizes with the
+        // consumer's Acquire-load of producer_closed.
+        self.queue.producer_closed.0.store(true, Ordering::Release);
+        // Wake the consumer if it's parked, so it observes the close
+        // instead of waiting forever.
+        if let Some(handle) = self.queue.consumer_parker.get() {
+            handle.unpark();
+        }
+    }
+}
+
 /// A write-reservation into a ring buffer slot.
 ///
 /// Obtained via [`Producer::reserve`]. Call [`write`](Self::write) to
@@ -132,6 +205,7 @@ pub struct SlotWriter<'a, T> {
     tail: &'a AtomicUsize,
     write_pos: &'a Cell<usize>,
     pos: usize,
+    queue: &'a RingBuffer<T>,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (single producer).
@@ -165,6 +239,7 @@ impl<'a, T> SlotWriter<'a, T> {
             tail: this.tail,
             write_pos: this.write_pos,
             pos: this.pos,
+            queue: this.queue,
             committed: false,
         }
     }
@@ -180,6 +255,7 @@ impl<'a, T> SlotWriter<'a, T> {
     #[inline]
     pub unsafe fn commit_unchecked(self) {
         self.tail.store(self.pos + 1, Ordering::Release);
+        self.queue.wake_consumer();
         // Skip the SlotWriter drop (which would roll back write_pos).
         std::mem::forget(self);
     }
@@ -202,6 +278,7 @@ pub struct WrittenSlot<'a, T> {
     tail: &'a AtomicUsize,
     write_pos: &'a Cell<usize>,
     pos: usize,
+    queue: &'a RingBuffer<T>,
     committed: bool,
 }
 
@@ -214,6 +291,7 @@ impl<T> WrittenSlot<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.tail.store(self.pos + 1, Ordering::Release);
+        self.queue.wake_consumer();
         self.committed = true;
     }
 }
