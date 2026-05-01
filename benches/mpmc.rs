@@ -302,5 +302,292 @@ fn bench_mpmc_vs_n_spmc(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_mpmc_vs_n_spmc);
+// ---------------------------------------------------------------------------
+// Large-struct throughput: copy (push/pop) vs zero-copy (reserve/pop_ref).
+// Single producer, single consumer pattern — the zero-copy benefit is from
+// avoiding the 2KB memcpy per item, not from contention. Other shapes are
+// covered above.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct LargeStruct {
+    data: [u8; 2048],
+}
+
+impl LargeStruct {
+    fn new(seed: u8) -> Self {
+        Self { data: [seed; 2048] }
+    }
+}
+
+fn bench_large_struct_mpmc(c: &mut Criterion) {
+    use quetzalcoatl::mpmc::RingBuffer;
+
+    let mut group = c.benchmark_group("large_struct_mpmc");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    let total_items = 10_000u64;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("2kb_copy", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                let start = std::time::Instant::now();
+                let producer_handle = thread::spawn(move || {
+                    for i in 0..total_items {
+                        while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+                let mut received = 0u64;
+                while received < total_items {
+                    if consumer.pop().is_some() {
+                        received += 1;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                producer_handle.join().unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.bench_function("2kb_zero_copy", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let (mut producer, mut consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                let start = std::time::Instant::now();
+                let producer_handle = thread::spawn(move || {
+                    for i in 0..total_items {
+                        loop {
+                            if let Some(w) = producer.reserve() {
+                                w.write(black_box(LargeStruct::new(i as u8))).commit();
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+                let mut received = 0u64;
+                while received < total_items {
+                    if let Some(reader) = consumer.pop_ref() {
+                        black_box(&*reader);
+                        received += 1;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                producer_handle.join().unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Blocking API: push_block / pop_block under contention.
+//
+// 2P x 2C, small ring (16), each consumer doing slow work. Compares
+// spin-retry vs push_block / pop_block. Throughput should be in line under
+// saturation; idle-CPU savings are not measured here (see examples/mpmc_block.rs).
+// ---------------------------------------------------------------------------
+
+fn bench_blocking_mpmc(c: &mut Criterion) {
+    use quetzalcoatl::mpmc::RingBuffer;
+
+    let mut group = c.benchmark_group("blocking_mpmc");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    let p_count = 2u64;
+    let q_count = 2usize;
+    let per_p = 5_000u64;
+    let total_items = p_count * per_p;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("spin", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let received = Arc::new(AtomicUsize::new(0));
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let c = consumer.clone();
+                        let r = received.clone();
+                        thread::spawn(move || {
+                            while r.load(Ordering::Relaxed) < total_items as usize {
+                                if let Some(v) = c.pop() {
+                                    black_box(slow_work(v));
+                                    r.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                let producers: Vec<_> = (0..p_count)
+                    .map(|tid| {
+                        let p = producer.clone();
+                        thread::spawn(move || {
+                            for i in 0..per_p {
+                                while p.push(tid * per_p + i).is_err() {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                drop(producer);
+                for h in producers {
+                    h.join().unwrap();
+                }
+                for h in consumers {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.bench_function("block", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let c = consumer.clone();
+                        thread::spawn(move || {
+                            let mut local = 0u64;
+                            while let Some(v) = c.pop_block() {
+                                black_box(slow_work(v));
+                                local += 1;
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                let producers: Vec<_> = (0..p_count)
+                    .map(|tid| {
+                        let p = producer.clone();
+                        thread::spawn(move || {
+                            for i in 0..per_p {
+                                p.push_block(tid * per_p + i).expect("consumers dropped");
+                            }
+                        })
+                    })
+                    .collect();
+                drop(producer);
+                for h in producers {
+                    h.join().unwrap();
+                }
+                let mut sum = 0u64;
+                for h in consumers {
+                    sum += h.join().unwrap();
+                }
+                assert_eq!(sum, total_items);
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Large struct + zero-copy blocking: reserve_block / pop_ref_block under
+// contention. 2P x 2C, small ring (16), 2KB items.
+// ---------------------------------------------------------------------------
+
+fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
+    use quetzalcoatl::mpmc::RingBuffer;
+
+    let mut group = c.benchmark_group("large_struct_mpmc_zero_copy_blocking");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    let p_count = 2u64;
+    let q_count = 2usize;
+    let per_p = 2_500u64;
+    let total_items = p_count * per_p;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("2kb_items", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let mut c = consumer.clone();
+                        thread::spawn(move || {
+                            let mut local = 0u64;
+                            while let Some(reader) = c.pop_ref_block() {
+                                black_box(slow_work(reader.data[0] as u64));
+                                local += 1;
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                let producers: Vec<_> = (0..p_count)
+                    .map(|_| {
+                        let mut p = producer.clone();
+                        thread::spawn(move || {
+                            for i in 0..per_p {
+                                let w = p.reserve_block().expect("consumers dropped");
+                                w.write(black_box(LargeStruct::new(i as u8))).commit();
+                            }
+                        })
+                    })
+                    .collect();
+                drop(producer);
+                for h in producers {
+                    h.join().unwrap();
+                }
+                let mut sum = 0u64;
+                for h in consumers {
+                    sum += h.join().unwrap();
+                }
+                assert_eq!(sum, total_items);
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_mpmc_vs_n_spmc,
+    bench_large_struct_mpmc,
+    bench_blocking_mpmc,
+    bench_large_struct_mpmc_zero_copy_blocking,
+);
 criterion_main!(benches);

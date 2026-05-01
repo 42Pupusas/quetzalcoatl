@@ -784,6 +784,164 @@ fn bench_burst_producer_slow_work(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Blocking API: push_block / pop_block under contention.
+//
+// 1 producer, 2 consumers, small ring (16), each consumer doing slow work.
+// Compares spin-retry vs push_block / pop_block.
+// ---------------------------------------------------------------------------
+
+#[inline(never)]
+fn slow_consume_work(seed: u64) -> u64 {
+    let mut x = seed;
+    for _ in 0..64 {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        x = black_box(x);
+    }
+    x
+}
+
+fn bench_blocking_spmc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blocking_spmc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let total_items = 10_000u64;
+    let q_count = 2usize;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("spin", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let c = consumer.clone();
+                        let r = received.clone();
+                        thread::spawn(move || {
+                            while r.load(std::sync::atomic::Ordering::Relaxed)
+                                < total_items as usize
+                            {
+                                if let Some(v) = c.pop() {
+                                    black_box(slow_consume_work(v));
+                                    r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                for i in 0..total_items {
+                    while producer.push(i).is_err() {
+                        std::hint::spin_loop();
+                    }
+                }
+                for h in consumers {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.bench_function("block", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let c = consumer.clone();
+                        thread::spawn(move || {
+                            let mut local = 0u64;
+                            while let Some(v) = c.pop_block() {
+                                black_box(slow_consume_work(v));
+                                local += 1;
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                for i in 0..total_items {
+                    producer.push_block(i).expect("consumers dropped");
+                }
+                drop(producer);
+                let mut sum = 0u64;
+                for h in consumers {
+                    sum += h.join().unwrap();
+                }
+                assert_eq!(sum, total_items);
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Large struct + zero-copy blocking: reserve_block / pop_ref_block under
+// contention. 1 producer, 2 consumers, small ring (16), 2KB items.
+// ---------------------------------------------------------------------------
+
+fn bench_large_struct_spmc_zero_copy_blocking(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_struct_spmc_zero_copy_blocking");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let total_items = 5_000u64;
+    let q_count = 2usize;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("2kb_items", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (mut producer, consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+                let consumers: Vec<_> = (0..q_count)
+                    .map(|_| {
+                        let mut c = consumer.clone();
+                        thread::spawn(move || {
+                            let mut local = 0u64;
+                            while let Some(reader) = c.pop_ref_block() {
+                                black_box(slow_consume_work(reader.data[0] as u64));
+                                local += 1;
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                drop(consumer);
+
+                let start = std::time::Instant::now();
+                for i in 0..total_items {
+                    let w = producer.reserve_block().expect("consumers dropped");
+                    w.write(black_box(LargeStruct::new(i as u8))).commit();
+                }
+                drop(producer);
+                let mut sum = 0u64;
+                for h in consumers {
+                    sum += h.join().unwrap();
+                }
+                assert_eq!(sum, total_items);
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spmc_scaling,
@@ -794,5 +952,7 @@ criterion_group!(
     bench_work_distribution,
     bench_slow_work_scaling,
     bench_burst_producer_slow_work,
+    bench_blocking_spmc,
+    bench_large_struct_spmc_zero_copy_blocking,
 );
 criterion_main!(benches);

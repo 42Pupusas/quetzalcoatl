@@ -288,6 +288,138 @@ fn bench_large_struct_spsc_zero_copy(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Blocking API: push_block / pop_block under contention.
+//
+// Small ring + slow consumer so the ring fills up frequently, forcing the
+// producer to wait. Compares spin-retry vs push_block / pop_block: the
+// blocking variants should not regress throughput vs spin-retry under
+// saturation, and should burn far less CPU when truly idle (not measured
+// here — see `examples/mpmc_block.rs` for that).
+// ---------------------------------------------------------------------------
+
+#[inline(never)]
+fn slow_consume_work(seed: u64) -> u64 {
+    let mut x = seed;
+    for _ in 0..64 {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        x = black_box(x);
+    }
+    x
+}
+
+fn bench_blocking_spsc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blocking_spsc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let total_items = 10_000u64;
+    group.throughput(Throughput::Elements(total_items));
+
+    // Spin baseline: producer retries on Err, consumer spin-loops on None.
+    group.bench_function("spin", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let start = std::time::Instant::now();
+                let h = thread::spawn(move || {
+                    for i in 0..total_items {
+                        while producer.push(i).is_err() {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+                let mut received = 0u64;
+                while received < total_items {
+                    if let Some(v) = consumer.pop() {
+                        black_box(slow_consume_work(v));
+                        received += 1;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                h.join().unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.bench_function("block", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let start = std::time::Instant::now();
+                let h = thread::spawn(move || {
+                    for i in 0..total_items {
+                        producer.push_block(i).expect("consumer dropped");
+                    }
+                });
+                let mut received = 0u64;
+                while received < total_items {
+                    match consumer.pop_block() {
+                        Some(v) => {
+                            black_box(slow_consume_work(v));
+                            received += 1;
+                        }
+                        None => break,
+                    }
+                }
+                h.join().unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Large struct + zero-copy blocking: reserve_block / pop_ref_block under
+// contention. Small ring (16) and 2KB items so the producer waits often.
+// ---------------------------------------------------------------------------
+
+fn bench_large_struct_spsc_zero_copy_blocking(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_struct_spsc_zero_copy_blocking");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let total_items = 5_000u64;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("2kb_items", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (mut producer, mut consumer) =
+                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+                let start = std::time::Instant::now();
+                let h = thread::spawn(move || {
+                    for i in 0..total_items {
+                        let w = producer.reserve_block().expect("consumer dropped");
+                        w.write(black_box(LargeStruct::new(i as u8))).commit();
+                    }
+                });
+                let mut received = 0u64;
+                while received < total_items {
+                    match consumer.pop_ref_block() {
+                        Some(reader) => {
+                            black_box(slow_consume_work(reader.data[0] as u64));
+                            received += 1;
+                        }
+                        None => break,
+                    }
+                }
+                h.join().unwrap();
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_push_only,
@@ -297,5 +429,7 @@ criterion_group!(
     bench_capacity_scaling,
     bench_large_struct_spsc,
     bench_large_struct_spsc_zero_copy,
+    bench_blocking_spsc,
+    bench_large_struct_spsc_zero_copy_blocking,
 );
 criterion_main!(benches);
