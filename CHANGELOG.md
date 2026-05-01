@@ -7,21 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-05-01
+## [0.10.0] - 2026-05-01
 
 ### Added
-- **`spsc::Producer::push_block` / `spsc::Consumer::pop_block`** —
-  blocking variants for the SPSC ring. Symmetric single-side parking
-  via `OnceLock<Thread>` + `AtomicBool` per side. `pop_block` returns
-  `None` once the producer drops AND the queue drains; `push_block`
-  returns `Err(val)` once the consumer drops.
-- **`spsc::Consumer::is_closed`** — observe producer-drop terminally.
-- **`spmc::Producer::push_block` / `spmc::Consumer::pop_block`** —
-  blocking variants for the SPMC ring. Single-producer side uses
-  `OnceLock<Thread>` + `AtomicBool`; multi-consumer side uses the
-  shared `WakeSet` futex-style bitmap. Reuses the existing `closed`
-  flag for producer-drop and adds `consumer_closed` for last-consumer
-  drop.
 - **`mpmc::Producer::reserve` + `SlotWriter` / `WrittenSlot`** —
   zero-copy producer API for the MPMC ring, mirroring the shape
   used by spsc/spmc/mpsc. `SlotWriter` dropped without commit
@@ -49,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **`drain_block`** on mpsc (drain/`drain_up_to` already existed).
   drain_block combines drain's batched wake fan-out with park-on-
   empty, exiting cleanly when all producers have dropped.
+- **Bench coverage** for blocking, mpmc zero-copy, and zero-copy
+  blocking APIs across all four rings.
 
 ### Fixed
 - **`mpsc::Consumer::drain` woke only one parked producer per
@@ -61,6 +51,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per call. `mpmc::Consumer::drain` (newly added in this release)
   uses the same `wake_n(count)` shape, so the regression class
   is closed everywhere drains exist.
+
+### Packaging
+- Tight `include` allowlist in Cargo.toml — `benches/` and
+  `examples/` no longer ship in the published `.crate`. Package
+  shrinks from 47 files / 111.4 KiB compressed to 27 files /
+  86.7 KiB compressed.
+
+## [0.9.0] - 2026-05-01
+
+### Added
+- **`spsc::Producer::push_block` / `spsc::Consumer::pop_block`** —
+  blocking variants for the SPSC ring. Symmetric single-side parking
+  via `OnceLock<Thread>` + `AtomicBool` per side. `pop_block` returns
+  `None` once the producer drops AND the queue drains; `push_block`
+  returns `Err(val)` once the consumer drops.
+- **`spsc::Consumer::is_closed`** — observe producer-drop terminally.
+- **`spmc::Producer::push_block` / `spmc::Consumer::pop_block`** —
+  blocking variants for the SPMC ring. Single-producer side uses
+  `OnceLock<Thread>` + `AtomicBool`; multi-consumer side uses the
+  shared `WakeSet` futex-style bitmap. Reuses the existing `closed`
+  flag for producer-drop and adds `consumer_closed` for last-consumer
+  drop.
 
 ## [0.8.1] - 2026-05-01
 
