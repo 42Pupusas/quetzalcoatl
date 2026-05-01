@@ -1,10 +1,9 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::RingBuffer;
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_TIMEOUT_MICROS};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
 use crate::common::TOMBSTONE;
 
 /// The consumer side of an MPSC ring buffer.
@@ -264,7 +263,7 @@ impl<T> Consumer<T> {
                 return self.pop();
             }
 
-            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            std::thread::park();
             self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
         }
     }

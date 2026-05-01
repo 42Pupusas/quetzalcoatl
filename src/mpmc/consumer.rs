@@ -1,10 +1,9 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -149,7 +148,9 @@ impl<T, C: Config> Consumer<T, C> {
     /// path: spins briefly first, then sets a wake bit and parks.
     /// Producers signal after every `ready[s].store(Release)`,
     /// gated on a single `Relaxed` load so the no-park hot path
-    /// stays cheap.
+    /// stays cheap. Close paths flush the wake set, so a parked
+    /// consumer always either sees a publish in its re-check or is
+    /// unparked by a producer/close.
     #[must_use]
     pub fn pop_block(&self) -> Option<T> {
         let q = &*self.queue;
@@ -189,7 +190,7 @@ impl<T, C: Config> Consumer<T, C> {
                 return self.pop();
             }
 
-            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            std::thread::park();
             q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }

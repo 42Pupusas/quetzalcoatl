@@ -1,10 +1,9 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
@@ -100,8 +99,9 @@ impl<T, C: Config> Producer<T, C> {
     ///
     /// The `SeqCst` on `producer_park.wake.fetch_or` pairs with the
     /// consumer's `producer_park.wake.load` after `done[s].store
-    /// (Release)` to close the missed-wake window; the 200μs timeout
-    /// is a belt-and-braces backstop.
+    /// (Release)` to close the missed-wake window. Close paths flush
+    /// the wake set, so a parked producer always either sees a slot
+    /// release in its re-check or is unparked by a consumer/close.
     #[cold]
     fn park_until_slot_free(
         &self,
@@ -131,7 +131,7 @@ impl<T, C: Config> Producer<T, C> {
                 return found;
             }
 
-            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            std::thread::park();
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
@@ -251,7 +251,7 @@ impl<T, C: Config> Producer<T, C> {
                 return Err(val);
             }
 
-            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            std::thread::park();
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }

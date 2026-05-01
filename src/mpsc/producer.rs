@@ -1,10 +1,9 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::RingBuffer;
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK, PARK_TIMEOUT_MICROS};
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 use crate::common::TOMBSTONE;
 
 /// The producer side of an MPSC ring buffer.
@@ -144,7 +143,7 @@ impl<T> Producer<T> {
                 Err(returned) => val = returned,
             }
 
-            std::thread::park_timeout(Duration::from_micros(PARK_TIMEOUT_MICROS));
+            std::thread::park();
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }

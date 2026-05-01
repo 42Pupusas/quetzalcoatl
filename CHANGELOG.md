@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-01
+
+### Fixed
+- **Idle-thread CPU on `push_block` / `pop_block`** — replaced the
+  200μs `park_timeout` backstop with plain `park()` across both
+  `mpmc` and `mpsc` slow paths. The timeout caused parked threads
+  to wake ~5,000×/sec on a fully idle ring, scan, and re-park,
+  burning CPU and atomic traffic for no benefit. Wake correctness
+  rests on the existing SeqCst `fetch_or` / `Relaxed` load pairing
+  plus close-time `WakeSet::flush`; the timeout was redundant.
+
 ## [0.8.0] - 2026-04-27
 
 ### Added

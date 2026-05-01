@@ -4,18 +4,17 @@
 //! Each ring that exposes blocking `push_block` / `pop_block` keeps a
 //! [`WakeSet`] per side (producer / consumer). A waiter takes a stable
 //! park slot, sets its bit on the wake bitmap, parks via
-//! [`std::thread::park_timeout`], and the peer side wakes one slot's
-//! thread with [`WakeSet::wake_one`] gated on the bitmap being
-//! non-zero (a single `Relaxed` load on the fast path).
+//! [`std::thread::park`], and the peer side wakes one slot's thread
+//! with [`WakeSet::wake_one`] gated on the bitmap being non-zero (a
+//! single `Relaxed` load on the fast path).
 //!
 //! The ordering invariant is closed by a `SeqCst` `fetch_or` on the
 //! waiter's bit *before* the final emptiness/full-ness re-check, paired
 //! with the peer's `Relaxed` load of the same bitmap *after* the
 //! release that would let the waiter make progress. Either the waiter
 //! sees progress in its re-check, or the peer sees the bit and unparks
-//! it. The [`PARK_TIMEOUT_MICROS`] backstop bounds wait latency if a
-//! wake is somehow lost (defensive against future ordering
-//! refactors).
+//! it. Close paths additionally `flush()` both wake sets so a parked
+//! waiter never observes "closed but still parked."
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -39,12 +38,6 @@ pub const PARK_MASK: usize = PARK_SLOTS - 1;
 /// burned ~tens of microseconds and a futex round-trip (1–10μs) is
 /// amortized.
 pub const BACKOFF_PARK_THRESHOLD: u32 = 12;
-
-/// Safety-net park timeout (microseconds). The wake protocol's
-/// `SeqCst` pairing should make missed wakes impossible, but this
-/// timeout caps wait latency if a wake is somehow lost — defensive
-/// against future refactors of the ordering invariants.
-pub const PARK_TIMEOUT_MICROS: u64 = 200;
 
 /// One side's park state — a 64-bit wake bitmap plus a parker table
 /// of `Thread` handles indexed by park slot. Producers and consumers
