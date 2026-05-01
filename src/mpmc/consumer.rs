@@ -65,15 +65,19 @@ impl<T, C: Config> Consumer<T, C> {
         }
     }
 
-    /// Pops the first published slot found at or after `next_scan`,
-    /// returning `None` after one full lap of the ring without
-    /// finding any published item.
+    /// Scans for a published slot and CAS-claims it. Returns the
+    /// `(pos, round_pos)` of the claimed slot on success. After a
+    /// successful claim the slot is in state "claimed but not
+    /// released" (`ready[s] = round_pos + 2`) and the caller is
+    /// responsible for reading the value and storing
+    /// `done[s] = round_pos + cap` to release the slot for reuse.
     ///
-    /// Items are returned in the order slots become published, not
-    /// in producer push order — see the module docs.
+    /// Updates `next_scan` and bumps `local_consumed` (with a flush
+    /// to the shared watermark every `CONSUMED_FLUSH`) on success;
+    /// on failure (full lap with nothing claimable) advances
+    /// `next_scan` past the lap.
     #[inline]
-    #[must_use]
-    pub fn pop(&self) -> Option<T> {
+    fn claim_slot(&self) -> Option<(usize, usize)> {
         let q = &*self.queue;
         let cap = q.cap;
         let mask = q.mask;
@@ -98,18 +102,6 @@ impl<T, C: Config> Consumer<T, C> {
                     .compare_exchange(r, claimed_marker, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    // SAFETY: the successful CAS gives us unique
-                    // ownership of slot `s` for round R, and the
-                    // producer for that round had committed the
-                    // value before storing state=1.
-                    let val = unsafe { q.data_slot(scan).get().cast::<T>().read() };
-                    q.done_slot(scan).store(round_pos + cap, Ordering::Release);
-                    // Wake one parked producer if any. `wake_one`
-                    // self-gates on a `Relaxed` load, so this is
-                    // effectively a no-op when nothing is parked;
-                    // a missed wake here is covered by the producer's
-                    // 200μs park timeout backstop.
-                    q.producer_park.wake_one();
                     // Advance scan past the consumed slot, keeping
                     // it monotonic in case we claimed a future slot.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
@@ -122,7 +114,7 @@ impl<T, C: Config> Consumer<T, C> {
                         self.local_consumed.set(lc);
                     }
 
-                    return Some(val);
+                    return Some((scan, round_pos));
                 }
                 // CAS lost — skip far enough that the contended
                 // line cools before our next attempt.
@@ -137,6 +129,50 @@ impl<T, C: Config> Consumer<T, C> {
                 return None;
             }
         }
+    }
+
+    /// Pops the first published slot found at or after `next_scan`,
+    /// returning `None` after one full lap of the ring without
+    /// finding any published item.
+    ///
+    /// Items are returned in the order slots become published, not
+    /// in producer push order — see the module docs.
+    #[inline]
+    #[must_use]
+    pub fn pop(&self) -> Option<T> {
+        let (pos, round_pos) = self.claim_slot()?;
+        let q = &*self.queue;
+        // SAFETY: the successful CAS in claim_slot gave us unique
+        // ownership of slot `pos & mask` for this round. The
+        // producer committed the value before storing state=1.
+        let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
+        q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+        // Wake one parked producer if any.
+        q.producer_park.wake_one();
+        Some(val)
+    }
+
+    /// Returns a zero-copy read reference to the next published
+    /// item, returning `None` after one full lap of the ring without
+    /// finding any published item.
+    ///
+    /// Unlike [`pop`](Self::pop), this does not copy the data out.
+    /// It returns a [`SlotReader`] that dereferences to `&T`. The
+    /// slot is held in state "claimed but not released" until the
+    /// reader is dropped — the producer at the corresponding next-
+    /// round position will block until then. Keep the reader's
+    /// lifetime short to avoid stalling producers.
+    ///
+    /// Items are returned in the order slots become published.
+    #[inline]
+    #[must_use]
+    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, C>> {
+        let (pos, round_pos) = self.claim_slot()?;
+        Some(SlotReader {
+            consumer: self,
+            pos,
+            round_pos,
+        })
     }
 
     /// Pops the next item, blocking the calling thread when the
@@ -240,5 +276,50 @@ impl<T, C: Config> Drop for Consumer<T, C> {
             self.queue.consumer_closed.0.store(true, Ordering::Release);
             self.queue.producer_park.flush();
         }
+    }
+}
+
+/// A zero-copy read reference to an item in an MPMC ring buffer.
+///
+/// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`,
+/// allowing direct reads from the slot without copying.
+///
+/// While this reader exists the slot is in state "claimed but not
+/// released": the producer for the corresponding next-round position
+/// will block until the reader is dropped. Keep the reader's
+/// lifetime short under contention to avoid stalling producers.
+///
+/// On drop: drops the value in place, stores
+/// `done[s] = round_pos + cap` to release the slot, and wakes one
+/// parked producer (if any).
+pub struct SlotReader<'a, T, C: Config = DefaultConfig> {
+    consumer: &'a mut Consumer<T, C>,
+    pos: usize,
+    round_pos: usize,
+}
+
+impl<T, C: Config> std::ops::Deref for SlotReader<'_, T, C> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: claim_slot's CAS gave us unique ownership of this
+        // (slot, round) pair, and the producer committed the value
+        // before publishing state=1.
+        unsafe { (*self.consumer.queue.data_slot(self.pos).get()).assume_init_ref() }
+    }
+}
+
+impl<T, C: Config> Drop for SlotReader<'_, T, C> {
+    fn drop(&mut self) {
+        let q = &*self.consumer.queue;
+        // SAFETY: we hold the slot exclusively (state == 2 since
+        // claim_slot's CAS); the value is initialized.
+        unsafe {
+            q.data_slot(self.pos).get().cast::<T>().drop_in_place();
+        }
+        // Release: round_pos + cap signals the next-round producer
+        // that the slot is free for reuse.
+        q.done_slot(self.pos)
+            .store(self.round_pos + q.cap, Ordering::Release);
+        q.producer_park.wake_one();
     }
 }

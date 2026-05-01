@@ -56,8 +56,8 @@
 mod consumer;
 mod producer;
 
-pub use consumer::Consumer;
-pub use producer::Producer;
+pub use consumer::{Consumer, SlotReader};
+pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
@@ -874,4 +874,221 @@ mod tests {
     no_counter_test!(no_counter_p8_q1, 8, 1, 5_000_000);
     no_counter_test!(no_counter_p2_q4, 2, 4, 5_000_000);
     no_counter_test!(no_counter_p4_q2, 4, 2, 5_000_000);
+
+    // -----------------------------------------------------------------------
+    // Zero-copy API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reserve_write_commit_cycle() {
+        let (mut p, c) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let w = p.reserve().unwrap();
+        w.write(42).commit();
+        assert_eq!(c.pop(), Some(42));
+        assert_eq!(c.pop(), None);
+    }
+
+    #[test]
+    fn reserve_slot_mut_commit_unchecked() {
+        let (mut p, c) = RingBuffer::<[u8; 32]>::new(Capacity::exact(4)).split();
+        let mut w = p.reserve().unwrap();
+        w.slot_mut().write([0xAB; 32]);
+        // SAFETY: slot_mut().write initialized the slot.
+        unsafe { w.commit_unchecked() };
+        let v = c.pop().unwrap();
+        assert_eq!(v[0], 0xAB);
+        assert_eq!(v[31], 0xAB);
+    }
+
+    #[test]
+    fn pop_ref_zero_copy_read() {
+        let (mut p, mut c) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        p.reserve().unwrap().write(99).commit();
+        let r = c.pop_ref().unwrap();
+        assert_eq!(*r, 99);
+        drop(r);
+        assert!(c.pop_ref().is_none());
+    }
+
+    #[test]
+    fn reserve_drop_without_commit_restores_bit() {
+        // Capacity 4, batch size = 32 (DefaultConfig::PRODUCER_BATCH).
+        // The first reserve claims a batch starting at pos 0, takes
+        // bit 0. Dropping rolls back the bit; a subsequent reserve
+        // from the same handle should reuse pos 0 (and write succeeds).
+        let (mut p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        {
+            let _w = p.reserve().unwrap();
+            // _w dropped here without commit — bit must be restored.
+        }
+        // The next reserve reuses the same batch position.
+        p.reserve().unwrap().write(7).commit();
+        assert_eq!(c.pop(), Some(7));
+    }
+
+    #[test]
+    fn reserve_drop_does_not_leak() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (mut p, _c) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+            let w = p.reserve().unwrap();
+            w.write(DropCounter {
+                counter: counter.clone(),
+            });
+            // WrittenSlot dropped without commit → must drop the value.
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reserve_uncommitted_then_producer_drop_tombstones() {
+        // SlotWriter dropped without commit leaves the bit in
+        // batch_unused. Producer::drop must tombstone it so the
+        // ring is left in a consistent state (not leaking a slot).
+        let (mut p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        {
+            let _w = p.reserve().unwrap();
+            // SlotWriter dropped without commit; bit restored.
+        }
+        // Drop the producer — its drop tombstones the unused bits,
+        // including the one we restored. Consumer should see closed
+        // and observe an empty queue cleanly.
+        drop(p);
+        assert!(c.is_closed());
+        assert_eq!(c.pop(), None);
+    }
+
+    #[test]
+    fn pop_ref_drop_releases_slot_for_reuse() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        // Fill the ring.
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        assert!(p.push(99).is_err());
+
+        // pop_ref claims a slot but does not release done[s] until
+        // drop — the slot is reusable only after the reader drops.
+        {
+            let _r = c.pop_ref().unwrap();
+            // While _r is alive, the producer at the next-round
+            // position for this slot should still see done[s] = pos
+            // (not pos+cap), so push to that specific position would
+            // block. We don't poke at internals; just confirm
+            // post-drop reuse works.
+        }
+        // After drop, the producer can push again into the freed slot.
+        p.push(99).unwrap();
+        // We can drain everything — order is publish-order, not
+        // push-order, so just check the multiset.
+        let mut got = Vec::new();
+        while let Some(v) = c.pop() {
+            got.push(v);
+        }
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 99]);
+    }
+
+    #[test]
+    fn pop_ref_drops_value_on_reader_drop() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut p, mut c) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+        p.reserve()
+            .unwrap()
+            .write(DropCounter {
+                counter: counter.clone(),
+            })
+            .commit();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        {
+            let _r = c.pop_ref().unwrap();
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        // SlotReader::drop must drop the value exactly once.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mixed_push_reserve_pop_pop_ref() {
+        let (mut p, mut c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        p.push(1).unwrap();
+        p.reserve().unwrap().write(2).commit();
+        p.push(3).unwrap();
+
+        // Order is publish order. With a single producer and no
+        // contention, that matches push order.
+        assert_eq!(c.pop(), Some(1));
+        let r = c.pop_ref().unwrap();
+        assert_eq!(*r, 2);
+        drop(r);
+        assert_eq!(c.pop(), Some(3));
+        assert_eq!(c.pop(), None);
+    }
+
+    #[test]
+    #[ignore = "stress test — slow under Miri"]
+    fn concurrent_reserve_pop_ref() {
+        // Two producers using reserve(), two consumers using pop_ref().
+        // Verify item-count and value-set are exactly correct.
+        let total: u64 = 4000;
+        let p_count: u64 = 2;
+        let per_p = total / p_count;
+        let (prod, cons) = RingBuffer::<u64>::new(Capacity::exact(64)).split();
+
+        let pp: Vec<_> = (0..p_count)
+            .map(|tid| {
+                let mut p = prod.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_p {
+                        loop {
+                            if let Some(w) = p.reserve() {
+                                w.write(tid * per_p + i).commit();
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(prod);
+
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc: Vec<_> = (0..2)
+            .map(|_| {
+                let mut c = cons.clone();
+                let r = received.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    while r.load(std::sync::atomic::Ordering::Relaxed)
+                        < usize::try_from(total).unwrap()
+                    {
+                        if let Some(reader) = c.pop_ref() {
+                            got.push(*reader);
+                            drop(reader);
+                            r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        drop(cons);
+
+        for h in pp {
+            h.join().unwrap();
+        }
+        let mut all: Vec<u64> = Vec::new();
+        for h in cc {
+            all.extend(h.join().unwrap());
+        }
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), usize::try_from(total).unwrap());
+        for (i, v) in all.iter().enumerate() {
+            assert_eq!(*v, i as u64);
+        }
+    }
 }

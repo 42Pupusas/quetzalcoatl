@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `WakeSet` futex-style bitmap. Reuses the existing `closed`
   flag for producer-drop and adds `consumer_closed` for last-consumer
   drop.
+- **`mpmc::Producer::reserve` + `SlotWriter` / `WrittenSlot`** —
+  zero-copy producer API for the MPMC ring, mirroring the shape
+  used by spsc/spmc/mpsc. `SlotWriter` dropped without commit
+  restores the slot's bit to `batch_unused` so the same producer
+  can reuse it without re-claiming a batch position; `WrittenSlot`
+  dropped without commit drops the value in place and rolls back
+  the bit. Producer-drop's existing tombstone loop covers any bit
+  still uncommitted at handle-drop.
+- **`mpmc::Consumer::pop_ref` + `SlotReader`** — zero-copy consumer
+  API. Holds the slot in state "claimed but not released"
+  (`ready[s] = round_pos + 2`) until the reader is dropped; on
+  drop, drops the value, releases `done[s] = round_pos + cap`,
+  and wakes one parked producer. Long-lived readers under
+  contention will block the producer at the next-round position.
 
 ## [0.8.1] - 2026-05-01
 
