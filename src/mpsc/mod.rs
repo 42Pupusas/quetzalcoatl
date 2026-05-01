@@ -1131,4 +1131,71 @@ mod tests {
         let expected: Vec<u32> = (0..16u32).chain(100..116u32).collect();
         assert_eq!(got, expected);
     }
+
+    // -----------------------------------------------------------------------
+    // Zero-copy blocking API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reserve_block_unblocks_on_pop() {
+        let (mut p, mut c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        assert!(p.reserve().is_none());
+        let h = std::thread::spawn(move || {
+            let w = p.reserve_block().unwrap();
+            w.write(99).commit();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(c.pop(), Some(1));
+        h.join().unwrap();
+        assert_eq!(c.pop(), Some(2));
+        assert_eq!(c.pop(), Some(99));
+    }
+
+    #[test]
+    fn reserve_block_returns_none_on_consumer_close() {
+        let (mut p, c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        let h = std::thread::spawn(move || p.reserve_block().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(c);
+        assert!(!h.join().unwrap());
+    }
+
+    #[test]
+    fn pop_ref_block_wakes_on_push() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || {
+            let r = c.pop_ref_block().unwrap();
+            *r
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(7).unwrap();
+        assert_eq!(h.join().unwrap(), 7);
+    }
+
+    #[test]
+    fn pop_ref_block_returns_none_on_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || c.pop_ref_block().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(p);
+        assert!(!h.join().unwrap());
+    }
+
+    #[test]
+    fn pop_ref_block_drains_before_close() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+        drop(p);
+        let v1 = *c.pop_ref_block().unwrap();
+        let v2 = *c.pop_ref_block().unwrap();
+        let mut got = vec![v1, v2];
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+        assert!(c.pop_ref_block().is_none());
+    }
 }

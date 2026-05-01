@@ -249,6 +249,62 @@ impl<T, C: Config> Producer<T, C> {
         })
     }
 
+    /// Reserves a slot for zero-copy writing, blocking the calling
+    /// thread when the ring is full until a consumer makes space.
+    /// Returns `None` only when the last
+    /// [`Consumer`](super::Consumer) has been dropped (no consumer
+    /// left to drain).
+    ///
+    /// Same wait protocol as [`push_block`](Self::push_block). Useful
+    /// when you want zero-copy writes plus blocking.
+    pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T, C>> {
+        let bit_mask = 1u64 << self.park_slot;
+        let park_slot = self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return None;
+            }
+            // The discarded SlotWriter on `is_some()` restores the
+            // bit on drop, so the second reserve() reuses the same
+            // slot. Self-cancelling — no destructive mutation.
+            if self.reserve().is_some() {
+                return self.reserve();
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            self.queue.producer_park.ensure_handle_installed(park_slot);
+            self.queue
+                .producer_park
+                .wake
+                .fetch_or(bit_mask, Ordering::SeqCst);
+
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return None;
+            }
+            if self.reserve().is_some() {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.reserve();
+            }
+
+            std::thread::park();
+            self.queue
+                .producer_park
+                .wake
+                .fetch_and(!bit_mask, Ordering::Relaxed);
+        }
+    }
+
     /// Pushes a value, blocking the calling thread when the ring
     /// is full until a consumer makes space. Returns `Err(val)`
     /// only when the last [`Consumer`](super::Consumer) has been

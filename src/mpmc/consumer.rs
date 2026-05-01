@@ -65,6 +65,35 @@ impl<T, C: Config> Consumer<T, C> {
         }
     }
 
+    /// Non-mutating check: returns true if there's an item this
+    /// consumer would likely claim on the next `pop`/`pop_ref`.
+    /// Used as a pre-park gate so we don't CAS-claim a slot we'd
+    /// then have to release on `SlotReader::drop`.
+    ///
+    /// Scans up to one full lap looking for any slot in state 1
+    /// (published, unclaimed). Doesn't update `next_scan` or take
+    /// any locks — purely an Acquire load per slot. May see false
+    /// negatives under contention (another consumer claims the
+    /// slot between this scan and our retry); benign — we just
+    /// re-park.
+    #[inline]
+    fn has_item(&self) -> bool {
+        let q = &*self.queue;
+        let mask = q.mask;
+        let start = self.next_scan.get();
+        for offset in 0..q.cap {
+            let scan = start + offset;
+            let s = scan & mask;
+            let r = q.ready_slot(scan).load(Ordering::Acquire);
+            let delta = r.wrapping_sub(s);
+            let state = delta & mask;
+            if state == 1 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Scans for a published slot and CAS-claims it. Returns the
     /// `(pos, round_pos)` of the claimed slot on success. After a
     /// successful claim the slot is in state "claimed but not
@@ -228,6 +257,67 @@ impl<T, C: Config> Consumer<T, C> {
 
             std::thread::park();
             q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns a zero-copy read reference to the next item, blocking
+    /// the calling thread when the ring is empty until a producer
+    /// publishes one. Returns `None` only when the ring is closed
+    /// AND empty (no live producers, nothing left to drain).
+    ///
+    /// Same wait protocol as [`pop_block`](Self::pop_block). Useful
+    /// when you want zero-copy reads plus blocking.
+    #[must_use]
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
+        let bit_mask = 1u64 << self.park_slot;
+        let park_slot = self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            // Non-mutating gate: avoid CAS-claiming a slot that the
+            // discarded SlotReader would then have to release.
+            if self.has_item() {
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            self.queue.consumer_park.ensure_handle_installed(park_slot);
+            self.queue
+                .consumer_park
+                .wake
+                .fetch_or(bit_mask, Ordering::SeqCst);
+
+            if self.has_item() {
+                self.queue
+                    .consumer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                self.queue
+                    .consumer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+
+            std::thread::park();
+            self.queue
+                .consumer_park
+                .wake
+                .fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
 

@@ -43,6 +43,16 @@ impl<T> Producer<T> {
         Some((data_ptr, &ready.0, pos))
     }
 
+    /// Non-mutating check: returns true if `try_claim` would
+    /// currently succeed. Used by `reserve_block` as the pre-park
+    /// gate so we don't construct then drop a `SlotWriter` per
+    /// iteration.
+    #[inline]
+    fn has_space(&self) -> bool {
+        let pos = self.write_pos.get();
+        self.queue.done_slot(pos).0.load(Ordering::Acquire) == pos
+    }
+
     /// Pushes a value into the ring buffer.
     ///
     /// Returns `Err(val)` if the buffer is full.
@@ -132,6 +142,46 @@ impl<T> Producer<T> {
                 pos,
                 queue: &self.queue,
             })
+    }
+
+    /// Reserves a slot for zero-copy writing, blocking the calling
+    /// thread when the ring is full until a consumer makes space.
+    /// Returns `None` only when the last
+    /// [`Consumer`](super::Consumer) has been dropped (no consumer
+    /// left to drain).
+    ///
+    /// Same wait protocol as [`push_block`](Self::push_block). Useful
+    /// when you want zero-copy writes plus blocking.
+    pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let mut backoff = 0u32;
+        loop {
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return None;
+            }
+            // Non-mutating gate.
+            if self.has_space() {
+                return self.reserve();
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = self.queue.producer_parker.set(std::thread::current());
+            self.queue.producer_parked.0.store(true, Ordering::SeqCst);
+
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+                return None;
+            }
+            if self.has_space() {
+                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+                return self.reserve();
+            }
+
+            std::thread::park();
+            self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Returns the number of items currently in the buffer.

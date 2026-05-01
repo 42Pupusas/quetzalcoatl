@@ -17,6 +17,22 @@ pub struct Consumer<T> {
 }
 
 impl<T> Consumer<T> {
+    /// Non-mutating check: returns true if a `pop`/`pop_ref` would
+    /// likely succeed at the current `head`. Used as a pre-park
+    /// gate so we don't construct a `SlotReader` (or `pop` a value)
+    /// just to discard it.
+    ///
+    /// May return false when a tombstone is at `head` even though
+    /// the next non-tombstoned slot is ready — this just causes an
+    /// extra spin/park iteration where `pop_ref` itself will skip
+    /// the tombstone and return the real item.
+    #[inline]
+    fn has_item(&self) -> bool {
+        let head = self.queue.head.load(Ordering::Relaxed);
+        let seq = self.queue.slot(head).sequence.load(Ordering::Acquire);
+        seq == head * 2 + 1 || seq == TOMBSTONE
+    }
+
     /// Returns None if the queue is empty or if a slot has been claimed
     /// by a producer but not yet written (non-blocking behavior).
     ///
@@ -261,6 +277,54 @@ impl<T> Consumer<T> {
             if self.queue.closed.0.load(Ordering::Acquire) {
                 self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
                 return self.pop();
+            }
+
+            std::thread::park();
+            self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns a zero-copy read reference to the next item, blocking
+    /// the calling thread when the ring is empty until a producer
+    /// publishes one. Returns `None` only when the last producer has
+    /// dropped AND the ring has drained.
+    ///
+    /// Same wait protocol as [`pop_block`](Self::pop_block). Useful
+    /// when you want zero-copy reads plus blocking.
+    #[must_use]
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
+        let mut backoff = 0u32;
+        loop {
+            // Non-mutating gate: do NOT call pop_ref() in the gate
+            // because the discarded SlotReader would advance head on
+            // drop and consume the item we wanted to return.
+            if self.has_item() {
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = self.queue.consumer_parker.set(std::thread::current());
+            self.queue.consumer_parked.0.store(true, Ordering::SeqCst);
+
+            if self.has_item() {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
             }
 
             std::thread::park();

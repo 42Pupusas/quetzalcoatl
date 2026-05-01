@@ -56,6 +56,21 @@ impl<T> Producer<T> {
         Some(pos)
     }
 
+    /// Non-mutating check: returns true if there's currently space
+    /// for at least one push/reserve. Used by `reserve_block` as
+    /// the pre-park gate so we don't construct a `SlotWriter` only
+    /// to drop it (which is correct but wasteful).
+    #[inline]
+    fn has_space(&self) -> bool {
+        let pos = self.write_pos.get();
+        if pos - self.cached_head.get() < self.queue.cap {
+            return true;
+        }
+        let head = self.queue.head.load(Ordering::Acquire);
+        self.cached_head.set(head);
+        pos - head < self.queue.cap
+    }
+
     /// Pushes a value into the ring buffer.
     ///
     /// Returns `Err(val)` if the buffer is full.
@@ -155,6 +170,56 @@ impl<T> Producer<T> {
             pos,
             queue: &self.queue,
         })
+    }
+
+    /// Reserves a slot for zero-copy writing, blocking the calling
+    /// thread when the ring is full until the consumer makes space.
+    /// Returns `None` only when the [`Consumer`](super::Consumer)
+    /// has been dropped (no consumer left to drain).
+    ///
+    /// Same wait protocol as [`push_block`](Self::push_block). Useful
+    /// when you want zero-copy writes plus blocking; otherwise prefer
+    /// [`reserve`](Self::reserve) for non-blocking or
+    /// [`push_block`](Self::push_block) for value-copy writes.
+    pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let mut backoff = 0u32;
+        loop {
+            // Check consumer_closed *before* attempting reserve.
+            // Once the consumer drops it sets `consumer_closed = true`;
+            // any free space we'd find afterward is permanent and
+            // must not be filled.
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return None;
+            }
+            // Non-mutating gate: avoids constructing-then-dropping a
+            // SlotWriter twice per loop iteration. Drop is benign for
+            // SlotWriter (it just rolls back write_pos), but it's
+            // wasted work.
+            if self.has_space() {
+                return self.reserve();
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = self.queue.producer_parker.set(std::thread::current());
+            // SeqCst pairs with the consumer's `producer_parked.load`
+            // after `head.store(Release)`.
+            self.queue.producer_parked.0.store(true, Ordering::SeqCst);
+
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+                return None;
+            }
+            if self.has_space() {
+                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+                return self.reserve();
+            }
+
+            std::thread::park();
+            self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Returns the number of items currently in the buffer.

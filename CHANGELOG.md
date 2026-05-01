@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drop, drops the value, releases `done[s] = round_pos + cap`,
   and wakes one parked producer. Long-lived readers under
   contention will block the producer at the next-round position.
+- **`reserve_block` / `pop_ref_block`** on spsc, spmc, mpsc, and
+  mpmc — zero-copy blocking variants. Same wait protocol as
+  `push_block` / `pop_block`; signature mirrors `reserve` /
+  `pop_ref` (returns `Option<SlotWriter>` / `Option<SlotReader>`,
+  with `None` meaning the peer has dropped). Each ring uses a
+  non-mutating gate (`has_space` / `has_item`) inside the park
+  loop so we don't FAA, CAS, or tombstone a slot we'd then have
+  to roll back per iteration. Broadcast still has no blocking
+  API by design.
 
 ## [0.8.1] - 2026-05-01
 

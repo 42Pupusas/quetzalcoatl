@@ -148,6 +148,72 @@ impl<T> Consumer<T> {
         })
     }
 
+    /// Non-mutating peek: returns true if a `pop_ref` (or `pop`)
+    /// would currently succeed. Used by `pop_ref_block` as the
+    /// pre-park gate — calling `pop_ref` itself for the gate would
+    /// construct a `SlotReader` that, when dropped, advances head
+    /// and consumes the item we wanted to return.
+    #[inline]
+    fn has_item(&self) -> bool {
+        let head = self.queue.head.load(Ordering::Relaxed);
+        self.available(head)
+    }
+
+    /// Returns a zero-copy read reference to the next item, blocking
+    /// the calling thread when the ring is empty until a producer
+    /// publishes one. Returns `None` only when the
+    /// [`Producer`](super::Producer) has been dropped AND the ring
+    /// has drained.
+    ///
+    /// Same wait protocol as [`pop_block`](Self::pop_block). Useful
+    /// when you want zero-copy reads plus blocking; otherwise prefer
+    /// [`pop_ref`](Self::pop_ref) for non-blocking or
+    /// [`pop_block`](Self::pop_block) for value-copy reads.
+    #[must_use]
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
+        let mut backoff = 0u32;
+        loop {
+            // Non-mutating gate: do NOT call pop_ref() in the gate,
+            // because the discarded SlotReader would advance head on
+            // drop and consume the item we wanted to return.
+            if self.has_item() {
+                return self.pop_ref();
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                // Re-check: producer may have published just before
+                // its drop. Drain that before returning None.
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            let _ = self.queue.consumer_parker.set(std::thread::current());
+            // SeqCst pairs with the producer's `consumer_parked.load`
+            // after `tail.store(Release)`.
+            self.queue.consumer_parked.0.store(true, Ordering::SeqCst);
+
+            if self.has_item() {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                return self.pop_ref();
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+
+            std::thread::park();
+            self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {

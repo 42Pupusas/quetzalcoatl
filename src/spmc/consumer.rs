@@ -190,6 +190,29 @@ impl<T> Consumer<T> {
         }
     }
 
+    /// Non-mutating check: returns true if `pop`/`pop_ref` would
+    /// currently succeed. Used by `pop_ref_block` as the pre-park
+    /// gate so we don't construct a `SlotReader` we'd have to drop
+    /// (which would release the slot via `done`, consuming the item
+    /// we wanted to return).
+    #[inline]
+    fn has_item(&self) -> bool {
+        // Local batch has positions left.
+        if self.batch_next.get() < self.batch_end.get() {
+            return true;
+        }
+        let q = &*self.queue;
+        let head = q.head.load(Ordering::Relaxed);
+        // Fast cached check.
+        if head < self.cached_tail.get() {
+            return true;
+        }
+        // Refresh tail; queue may have advanced.
+        let tail = q.tail.load(Ordering::Acquire);
+        self.cached_tail.set(tail);
+        head < tail
+    }
+
     /// Resolve `(data_ptr, done_ptr, h)` for a position we have claimed.
     ///
     /// The position is guaranteed `< tail` (bounded CAS), and the
@@ -290,6 +313,70 @@ impl<T> Consumer<T> {
             cap: self.queue.cap,
             consumer: self,
         })
+    }
+
+    /// Returns a zero-copy read reference to the next item, blocking
+    /// the calling thread when the ring is empty until a producer
+    /// publishes one. Returns `None` only when the
+    /// [`Producer`](super::Producer) has been dropped AND the ring
+    /// has drained.
+    ///
+    /// Same wait protocol as [`pop_block`](Self::pop_block). Useful
+    /// when you want zero-copy reads plus blocking.
+    #[must_use]
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            // Non-mutating gate: avoid constructing-then-dropping
+            // a SlotReader (which would release the slot's done
+            // store and consume the item we wanted to return).
+            if self.has_item() {
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            self.queue
+                .consumer_park
+                .ensure_handle_installed(self.park_slot);
+            self.queue
+                .consumer_park
+                .wake
+                .fetch_or(bit_mask, Ordering::SeqCst);
+
+            if self.has_item() {
+                self.queue
+                    .consumer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.pop_ref();
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                self.queue
+                    .consumer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                if self.has_item() {
+                    return self.pop_ref();
+                }
+                return None;
+            }
+
+            std::thread::park();
+            self.queue
+                .consumer_park
+                .wake
+                .fetch_and(!bit_mask, Ordering::Relaxed);
+        }
     }
 
     /// Returns the number of items currently in the buffer.

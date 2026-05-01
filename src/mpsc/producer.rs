@@ -75,6 +75,27 @@ impl<T> Producer<T> {
         Some((slot.data.get(), &slot.sequence, pos))
     }
 
+    /// Non-mutating check: returns true if there's currently
+    /// observable space for at least one push/reserve. Used by
+    /// `push_block` and `reserve_block` as the pre-park gate so
+    /// we don't FAA `tail` (and, for `reserve`, allocate a slot
+    /// that would have to be tombstoned on drop) per iteration.
+    ///
+    /// May see false negatives under contention: multiple producers
+    /// can pass simultaneously and only one's FAA actually succeeds
+    /// in claiming the last position. The losers re-park or retry
+    /// — same as without the gate.
+    #[inline]
+    fn has_space(&self) -> bool {
+        let current_tail = self.queue.tail.load(Ordering::Relaxed);
+        if current_tail - self.cached_head.get() < self.queue.cap {
+            return true;
+        }
+        let head = self.queue.head.load(Ordering::Acquire);
+        self.cached_head.set(head);
+        current_tail - head < self.queue.cap
+    }
+
     /// Pushes a value into the ring buffer.
     ///
     /// Multiple producers can push concurrently.
@@ -164,6 +185,60 @@ impl<T> Producer<T> {
                 pos,
                 queue,
             })
+    }
+
+    /// Reserves a slot for zero-copy writing, blocking the calling
+    /// thread when the ring is full until the consumer makes space.
+    /// Returns `None` only when the [`Consumer`](super::Consumer)
+    /// has been dropped (no consumer left to drain).
+    ///
+    /// Same wait protocol as [`push_block`](Self::push_block). Useful
+    /// when you want zero-copy writes plus blocking.
+    pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return None;
+            }
+            // Non-mutating gate: avoid FAA-then-tombstone per loop.
+            if self.has_space() {
+                return self.reserve();
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            self.queue
+                .producer_park
+                .ensure_handle_installed(self.park_slot);
+            self.queue
+                .producer_park
+                .wake
+                .fetch_or(bit_mask, Ordering::SeqCst);
+
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return None;
+            }
+            if self.has_space() {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.reserve();
+            }
+
+            std::thread::park();
+            self.queue
+                .producer_park
+                .wake
+                .fetch_and(!bit_mask, Ordering::Relaxed);
+        }
     }
 
     /// Returns the number of items currently in the buffer.
