@@ -9,6 +9,15 @@ repository = "https://github.com/42Pupusas/quetzalcoatl"
 keywords = ["lock-free", "mpmc", "spmc", "ring-buffer", "broadcast"]
 categories = ["concurrency", "data-structures"]
 readme = "README.md"
+# Tight allowlist — keeps benches/ and examples/ out of the published
+# crate (they reference dev-dependencies and bloat the download).
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [features]
 # Enables `dhat` heap profiling in examples that opt in (currently
