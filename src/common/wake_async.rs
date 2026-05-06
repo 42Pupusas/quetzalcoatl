@@ -188,7 +188,6 @@ impl WakerSet {
 
     /// Wakes every registered waker. Used at close time.
     pub fn flush(&self) {
-        self.pending.store(false, Ordering::Relaxed);
         for slot in &*self.slots {
             slot.wake();
         }

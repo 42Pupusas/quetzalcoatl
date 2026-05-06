@@ -355,6 +355,82 @@ fn bench_arc_large_struct(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Async API: push_async / pop_async, 1 producer + N consumers (broadcast).
+//
+// Run with: cargo bench --bench broadcast --features async
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+fn bench_async_broadcast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("async_broadcast");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let n_consumers: usize = 2;
+    let total_items: u64 = 1_000;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("saturated", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, c1) =
+                    RingBuffer::<u64>::new(Capacity::exact(16), n_consumers + 1).split();
+                let mut consumers = vec![c1.clone()];
+                for _ in 1..n_consumers {
+                    consumers.push(c1.clone());
+                }
+                drop(c1);
+
+                let start = std::time::Instant::now();
+
+                let consumer_threads: Vec<_> = consumers
+                    .into_iter()
+                    .map(|mut c| {
+                        thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .build()
+                                .unwrap();
+                            let local = tokio::task::LocalSet::new();
+                            rt.block_on(local.run_until(async move {
+                                while let Some(v) = c.pop_async().await {
+                                    black_box(v);
+                                }
+                            }));
+                        })
+                    })
+                    .collect();
+
+                let producer_thread = thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        for i in 0..total_items {
+                            producer.push_async(i).await.expect("all consumers dropped");
+                        }
+                    }));
+                });
+
+                producer_thread.join().unwrap();
+                for h in consumer_threads {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
+
+    // NOTE: an "unsaturated" variant (cap >> total, producer never parks)
+    // exposes a rare deadlock at high iteration counts. Investigation
+    // pending — see project_broadcast_async_unsaturated_race.md.
+
+    group.finish();
+}
+
+#[cfg(not(feature = "async"))]
 criterion_group!(
     benches,
     bench_consumer_scaling,
@@ -362,4 +438,15 @@ criterion_group!(
     bench_large_struct_clone_vs_ref,
     bench_arc_large_struct,
 );
+
+#[cfg(feature = "async")]
+criterion_group!(
+    benches,
+    bench_consumer_scaling,
+    bench_producer_scaling,
+    bench_large_struct_clone_vs_ref,
+    bench_arc_large_struct,
+    bench_async_broadcast,
+);
+
 criterion_main!(benches);

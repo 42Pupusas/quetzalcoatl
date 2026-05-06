@@ -1,6 +1,8 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::TOMBSTONE;
@@ -17,9 +19,41 @@ pub struct Producer<T> {
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
+        #[cfg(feature = "async")]
+        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             cached_min_head: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// Returns true if at least one consumer slot is currently active.
+/// Used by `push_async` to detect "all consumers gone" without an
+/// explicit consumer-count atomic — the per-slot `active` flags are
+/// the existing source of truth.
+#[cfg(feature = "async")]
+fn any_consumer_active<T>(q: &RingBuffer<T>) -> bool {
+    q.consumer_slots
+        .iter()
+        .any(|s| s.active.load(Ordering::Acquire))
+}
+
+#[cfg(feature = "async")]
+impl<T> Drop for Producer<T> {
+    fn drop(&mut self) {
+        if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last producer gone: flag closed and flush all parked
+            // consumers so their pop_async can return None after
+            // their backlog drains.
+            //
+            // SeqCst pairs with the consumer's `closed.load(SeqCst)`
+            // after register: the consumer's recheck must observe this
+            // store, otherwise a consumer parked between "load closed
+            // false" and "register" would miss both the close signal
+            // and the flush, hanging forever.
+            self.queue.closed.0.store(true, Ordering::SeqCst);
+            self.queue.consumer_waker.flush();
         }
     }
 }
@@ -99,10 +133,54 @@ impl<T> Producer<T> {
                 // SAFETY: We exclusively own this slot via FAA claim.
                 unsafe { (*data_ptr).write(val) };
                 slot_seq.store(pos * 2 + 1, Ordering::Release);
+                #[cfg(feature = "async")]
+                self.queue.wake_consumer_async();
                 Ok(())
             }
             None => Err(val),
         }
+    }
+
+    /// Pushes a value asynchronously, yielding to the executor when the
+    /// ring is full (slowest consumer hasn't caught up). Returns
+    /// `Err(val)` only when all consumers have been dropped.
+    ///
+    /// The future is cancel-safe: dropping it before completion leaves
+    /// the ring unchanged (the value is moved back out on cancellation).
+    #[cfg(feature = "async")]
+    #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
+    pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
+        let mut val = Some(val);
+        std::future::poll_fn(move |cx| {
+            let v = val.take().expect("polled after completion");
+            // No active consumers means a push would just sit until
+            // overwritten — treat as Err so producers can detect the
+            // shutdown.
+            if !any_consumer_active(&self.queue) {
+                return Poll::Ready(Err(v));
+            }
+            match self.push(v) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(returned) => {
+                    val = Some(returned);
+                    // Producers register on slot index = current tail
+                    // mod PARK_SLOTS; the consumer's wake fires the
+                    // matching slot.
+                    let slot = self.queue.tail.load(Ordering::Relaxed);
+                    self.queue.producer_waker.register(slot, cx);
+                    if !any_consumer_active(&self.queue) {
+                        return Poll::Ready(Err(val.take().unwrap()));
+                    }
+                    match self.push(val.take().unwrap()) {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(returned) => {
+                            val = Some(returned);
+                            Poll::Pending
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Reserves a slot for zero-copy writing.
@@ -113,11 +191,13 @@ impl<T> Producer<T> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
+        let queue = &*self.queue;
         self.claim_slot()
             .map(|(data_ptr, slot_sequence, pos)| SlotWriter {
                 slot_data: data_ptr,
                 slot_sequence,
                 pos,
+                queue,
             })
     }
 
@@ -151,6 +231,8 @@ pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
+    #[allow(dead_code)] // only read when feature = "async" is enabled
+    queue: &'a RingBuffer<T>,
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
@@ -178,6 +260,7 @@ impl<'a, T> SlotWriter<'a, T> {
             slot_data: this.slot_data,
             slot_sequence: this.slot_sequence,
             pos: this.pos,
+            queue: this.queue,
             committed: false,
         }
     }
@@ -192,6 +275,8 @@ impl<'a, T> SlotWriter<'a, T> {
     pub unsafe fn commit_unchecked(self) {
         self.slot_sequence
             .store(self.pos * 2 + 1, Ordering::Release);
+        #[cfg(feature = "async")]
+        self.queue.wake_consumer_async();
         std::mem::forget(self);
     }
 }
@@ -210,6 +295,8 @@ pub struct WrittenSlot<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
+    #[allow(dead_code)] // only read when feature = "async" is enabled
+    queue: &'a RingBuffer<T>,
     committed: bool,
 }
 
@@ -223,6 +310,8 @@ impl<T> WrittenSlot<'_, T> {
     pub fn commit(mut self) {
         self.slot_sequence
             .store(self.pos * 2 + 1, Ordering::Release);
+        #[cfg(feature = "async")]
+        self.queue.wake_consumer_async();
         self.committed = true;
     }
 }
@@ -235,6 +324,8 @@ impl<T> Drop for WrittenSlot<'_, T> {
                 self.slot_data.cast::<T>().drop_in_place();
             }
             self.slot_sequence.store(TOMBSTONE, Ordering::Release);
+            #[cfg(feature = "async")]
+            self.queue.wake_consumer_async();
         }
     }
 }

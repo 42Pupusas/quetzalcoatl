@@ -98,6 +98,17 @@ impl<T: Send + Sync> ArcProducer<T> {
     pub fn is_full(&self) -> bool {
         self.0.is_full()
     }
+
+    /// Pushes a value asynchronously, wrapping it in `Arc` internally.
+    /// See [`super::Producer::push_async`].
+    #[cfg(feature = "async")]
+    #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
+    pub async fn push_async(&self, val: T) -> Result<(), T> {
+        self.0.push_async(Arc::new(val)).await.map_err(|arc| {
+            // SAFETY: We just created this Arc with refcount 1.
+            Arc::try_unwrap(arc).ok().expect("Arc refcount should be 1")
+        })
+    }
 }
 
 /// Write handle for the Arc-wrapped broadcast buffer.
@@ -197,6 +208,14 @@ impl<T: Send + Sync> ArcConsumer<T> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.0.is_full()
+    }
+
+    /// Pops the next item asynchronously as an `Arc<T>`. See
+    /// [`super::Consumer::pop_async`].
+    #[cfg(feature = "async")]
+    #[allow(clippy::future_not_send)]
+    pub async fn pop_async(&mut self) -> Option<Arc<T>> {
+        self.0.pop_async().await
     }
 }
 

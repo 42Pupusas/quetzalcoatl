@@ -1,6 +1,8 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::TOMBSTONE;
@@ -50,6 +52,10 @@ impl<T> Drop for Consumer<T> {
         self.queue.consumer_slots[self.slot_index]
             .active
             .store(false, Ordering::Release);
+        // Flush producers parked on push_async so they can re-check
+        // any_consumer_active() and either retry or return Err.
+        #[cfg(feature = "async")]
+        self.queue.producer_waker.flush();
     }
 }
 
@@ -102,8 +108,47 @@ impl<T> Consumer<T> {
                 .head
                 .store(head + 1, Ordering::Release);
 
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async();
+
             return Some(val);
         }
+    }
+
+    /// Pops a value asynchronously, yielding to the executor when this
+    /// consumer's backlog is empty until a producer publishes one.
+    /// Returns `None` once all producers have dropped and this
+    /// consumer's backlog has drained.
+    ///
+    /// The future is cancel-safe: dropping it before completion does
+    /// not consume any item.
+    #[cfg(feature = "async")]
+    #[allow(clippy::future_not_send)]
+    pub fn pop_async(&mut self) -> impl std::future::Future<Output = Option<T>> + '_
+    where
+        T: Clone,
+    {
+        let slot = self.slot_index;
+        std::future::poll_fn(move |cx| {
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            self.queue.consumer_waker.register(slot, cx);
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            // SeqCst pairs with the producer drop's `closed.store(SeqCst)`:
+            // we must observe the close store if it has happened, otherwise
+            // we'd register a waker the producer-drop already flushed past
+            // and park forever.
+            if self.queue.closed.0.load(Ordering::SeqCst) {
+                return Poll::Ready(self.pop());
+            }
+            Poll::Pending
+        })
     }
 
     /// Returns a zero-copy read reference to the next item.
@@ -204,5 +249,7 @@ impl<T> Drop for SlotReader<'_, T> {
         self.consumer.queue.consumer_slots[self.consumer.slot_index]
             .head
             .store(self.head + 1, Ordering::Release);
+        #[cfg(feature = "async")]
+        self.consumer.queue.wake_producer_async();
     }
 }
