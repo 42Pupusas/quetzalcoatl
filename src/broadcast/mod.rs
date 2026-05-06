@@ -1121,15 +1121,28 @@ mod tests {
     #[test]
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread() {
-        // 1 producer + 2 consumers (broadcast: every consumer sees every
-        // item). Watchdog aborts within 5s if anything deadlocks.
+        async_push_pop_cross_thread_run(1, 5_000, 8, 30);
+    }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread_iters_unsaturated() {
+        // Stress: many iterations of (push 1k items, drop producer) with
+        // cap >> total so the producer never parks. Catches register/close
+        // races that single-iter tests miss.
+        async_push_pop_cross_thread_run(20_000, 1_000, 4096, 60);
+    }
+
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread_run(iters: usize, total: u64, cap: usize, deadline_secs: u64) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
         let done_watchdog = done.clone();
         let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
             while !done_watchdog.load(Ordering::Acquire) {
                 if std::time::Instant::now() > deadline {
                     eprintln!("\n\nbroadcast async_push_pop_cross_thread: deadlocked, aborting\n");
@@ -1139,9 +1152,8 @@ mod tests {
             }
         });
 
-        let total: u64 = 5_000;
-        for _ in 0..1 {
-            let (producer, c1) = RingBuffer::<u64>::new(Capacity::exact(8), 4).split();
+        for _ in 0..iters {
+            let (producer, c1) = RingBuffer::<u64>::new(Capacity::exact(cap), 4).split();
             let c2 = c1.clone();
 
             let consumer_threads: Vec<_> = [c1, c2]

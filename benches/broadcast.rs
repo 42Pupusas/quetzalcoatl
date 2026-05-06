@@ -423,9 +423,58 @@ fn bench_async_broadcast(c: &mut Criterion) {
         });
     });
 
-    // NOTE: an "unsaturated" variant (cap >> total, producer never parks)
-    // exposes a rare deadlock at high iteration counts. Investigation
-    // pending — see project_broadcast_async_unsaturated_race.md.
+    group.bench_function("unsaturated", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let (producer, c1) =
+                    RingBuffer::<u64>::new(Capacity::exact(4096), n_consumers + 1).split();
+                let mut consumers = vec![c1.clone()];
+                for _ in 1..n_consumers {
+                    consumers.push(c1.clone());
+                }
+                drop(c1);
+
+                let start = std::time::Instant::now();
+
+                let consumer_threads: Vec<_> = consumers
+                    .into_iter()
+                    .map(|mut c| {
+                        thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .build()
+                                .unwrap();
+                            let local = tokio::task::LocalSet::new();
+                            rt.block_on(local.run_until(async move {
+                                while let Some(v) = c.pop_async().await {
+                                    black_box(v);
+                                }
+                            }));
+                        })
+                    })
+                    .collect();
+
+                let producer_thread = thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        for i in 0..total_items {
+                            producer.push_async(i).await.expect("all consumers dropped");
+                        }
+                    }));
+                });
+
+                producer_thread.join().unwrap();
+                for h in consumer_threads {
+                    h.join().unwrap();
+                }
+                total += start.elapsed();
+            }
+            total
+        });
+    });
 
     group.finish();
 }

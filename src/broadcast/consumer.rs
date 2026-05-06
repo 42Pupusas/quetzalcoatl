@@ -137,14 +137,17 @@ impl<T> Consumer<T> {
                 return Poll::Ready(self.pop());
             }
             self.queue.consumer_waker.register(slot, cx);
+            // SeqCst fence after register: pairs with the producer drop's
+            // SeqCst store of `closed`, ensuring our re-check observes any
+            // close that happened after our pre-register load. Without
+            // this, an x86 store buffer can leave a window where the
+            // close is invisible across our register, the flush has
+            // already passed our slot, and we park forever.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }
-            // SeqCst pairs with the producer drop's `closed.store(SeqCst)`:
-            // we must observe the close store if it has happened, otherwise
-            // we'd register a waker the producer-drop already flushed past
-            // and park forever.
-            if self.queue.closed.0.load(Ordering::SeqCst) {
+            if self.queue.closed.0.load(Ordering::Acquire) {
                 return Poll::Ready(self.pop());
             }
             Poll::Pending
