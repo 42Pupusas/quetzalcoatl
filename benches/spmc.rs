@@ -942,6 +942,96 @@ fn bench_large_struct_spmc_zero_copy_blocking(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Async API: push_async / pop_async, one producer + N consumers.
+//
+// Each side gets its own thread with a current_thread runtime + LocalSet.
+// Run with: cargo bench --bench spmc --features async
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+fn run_async_spmc_bench(
+    b: &mut criterion::Bencher,
+    cap: usize,
+    c_count: usize,
+    total_items: u64,
+    consumer_work: fn(u64) -> u64,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    b.iter_custom(|iters| {
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..iters {
+            let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+            let received = Arc::new(AtomicU64::new(0));
+            let start = std::time::Instant::now();
+
+            let consumer_threads: Vec<_> = (0..c_count)
+                .map(|_| {
+                    let c = consumer.clone();
+                    let received = received.clone();
+                    thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        let local = tokio::task::LocalSet::new();
+                        rt.block_on(local.run_until(async move {
+                            while let Some(v) = c.pop_async().await {
+                                black_box(consumer_work(v));
+                                received.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }));
+                    })
+                })
+                .collect();
+            drop(consumer);
+
+            let producer_thread = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                rt.block_on(local.run_until(async move {
+                    for i in 0..total_items {
+                        producer.push_async(i).await.expect("all consumers dropped");
+                    }
+                }));
+            });
+
+            producer_thread.join().unwrap();
+            for h in consumer_threads {
+                h.join().unwrap();
+            }
+            total += start.elapsed();
+        }
+        total
+    });
+}
+
+#[cfg(feature = "async")]
+fn bench_async_spmc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blocking_spmc");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    let total_items = 10_000u64;
+    let c_count = 2usize;
+    group.throughput(Throughput::Elements(total_items));
+
+    // Saturated: small ring, slow consumer. Same shape as spin/block above.
+    group.bench_function("async_saturated", |b| {
+        run_async_spmc_bench(b, 16, c_count, total_items, slow_consume_work);
+    });
+
+    // Unsaturated: large ring, fast consumer.
+    group.bench_function("async_unsaturated", |b| {
+        run_async_spmc_bench(b, 4096, c_count, total_items, |v| v);
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "async"))]
 criterion_group!(
     benches,
     bench_spmc_scaling,
@@ -955,4 +1045,21 @@ criterion_group!(
     bench_blocking_spmc,
     bench_large_struct_spmc_zero_copy_blocking,
 );
+
+#[cfg(feature = "async")]
+criterion_group!(
+    benches,
+    bench_spmc_scaling,
+    bench_spmc_producer_only,
+    bench_spmc_contention,
+    bench_large_struct_spmc,
+    bench_large_struct_spmc_zero_copy,
+    bench_work_distribution,
+    bench_slow_work_scaling,
+    bench_burst_producer_slow_work,
+    bench_blocking_spmc,
+    bench_large_struct_spmc_zero_copy_blocking,
+    bench_async_spmc,
+);
+
 criterion_main!(benches);

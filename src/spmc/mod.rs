@@ -53,6 +53,8 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+#[cfg(feature = "async")]
+use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
@@ -137,6 +139,16 @@ pub struct RingBuffer<T> {
     /// The producer wakes one parked consumer after each publish
     /// (gated on the bitmap being non-zero).
     pub(crate) consumer_park: WakeSet,
+    /// Async equivalent of `producer_parker`: single waker registered
+    /// from `Poll::Pending` in `push_async`. Woken by any consumer
+    /// after a successful pop.
+    #[cfg(feature = "async")]
+    pub(crate) producer_waker: WakerSet,
+    /// Async equivalent of `consumer_park`: per-consumer-slot wakers
+    /// registered from `Poll::Pending` in `pop_async`. Woken by the
+    /// producer after every push / commit.
+    #[cfg(feature = "async")]
+    pub(crate) consumer_waker: WakerSet,
 }
 
 // Safety: Single producer writes to slot data, gated by per-slot `ready`
@@ -181,6 +193,10 @@ impl<T> RingBuffer<T> {
             producer_parker: OnceLock::new(),
             producer_parked: CachePadded(AtomicBool::new(false)),
             consumer_park: WakeSet::new(),
+            #[cfg(feature = "async")]
+            producer_waker: WakerSet::new(),
+            #[cfg(feature = "async")]
+            consumer_waker: WakerSet::new(),
             cap,
             mask: capacity.mask,
         }
@@ -197,6 +213,20 @@ impl<T> RingBuffer<T> {
         if let Some(handle) = self.producer_parker.get() {
             handle.unpark();
         }
+    }
+
+    /// Wakes the async producer task, if any. Self-gates on `pending`.
+    #[cfg(feature = "async")]
+    #[inline]
+    pub(crate) fn wake_producer_async(&self) {
+        self.producer_waker.wake_one();
+    }
+
+    /// Wakes one async consumer task, if any. Self-gates on `pending`.
+    #[cfg(feature = "async")]
+    #[inline]
+    pub(crate) fn wake_consumer_async(&self) {
+        self.consumer_waker.wake_one();
     }
 
     /// Returns the approximate number of items currently in the buffer.
@@ -1271,5 +1301,118 @@ mod tests {
             .collect();
         combined.sort_unstable();
         assert_eq!(combined, (0..32).collect::<Vec<_>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Async API
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread() {
+        // One producer + N consumers, each on its own thread with a
+        // current_thread runtime + LocalSet. Watchdog aborts within 5s
+        // if anything deadlocks.
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_watchdog = done.clone();
+        let watchdog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done_watchdog.load(Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("\n\nspmc async_push_pop_cross_thread: deadlocked, aborting\n");
+                    std::process::abort();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let n_consumers: u64 = 4;
+        let total: u64 = 10_000;
+        let received = Arc::new(AtomicU64::new(0));
+
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        let consumer_threads: Vec<_> = (0..n_consumers)
+            .map(|_| {
+                let c = consumer.clone();
+                let received = received.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        while c.pop_async().await.is_some() {
+                            received.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }));
+                })
+            })
+            .collect();
+        // Drop the original consumer handle so the live count is exactly
+        // `n_consumers`; otherwise the producer drop never closes the queue.
+        drop(consumer);
+
+        let ph = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                for i in 0..total {
+                    producer.push_async(i).await.expect("all consumers dropped");
+                }
+                // Producer dropped here → consumers' pop_async resolve to None.
+            }));
+        });
+
+        ph.join().unwrap();
+        for h in consumer_threads {
+            h.join().unwrap();
+        }
+        assert_eq!(received.load(Ordering::Relaxed), total);
+        done.store(true, Ordering::Release);
+        watchdog.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_pop_returns_none_on_close() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(producer);
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async move {
+            assert_eq!(consumer.pop_async().await, None);
+        }));
+        h.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_returns_err_on_consumer_close() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(consumer);
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async move {
+            assert_eq!(producer.push_async(99).await, Err(99));
+        }));
+        h.join().unwrap();
     }
 }

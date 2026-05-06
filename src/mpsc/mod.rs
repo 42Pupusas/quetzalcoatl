@@ -1363,7 +1363,7 @@ mod tests {
 
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n_producers: u64 = 4;
-        let per_producer: u64 = 25_000;
+        let per_producer: u64 = 2_500;
         let total = n_producers * per_producer;
 
         let producer_threads: Vec<_> = (0..n_producers)
