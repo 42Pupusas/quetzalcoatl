@@ -330,6 +330,12 @@ impl<T, C: Config> Consumer<T, C> {
             // published slot in the re-check below, or the
             // producer sees our bit and unparks us.
             q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // Fence so the recheck below is totally ordered with the
+            // producer's `ready.store(Release)`. Without it the recheck
+            // can be hoisted above our SeqCst fetch_or in the
+            // modification order, hitting the same lost-wake race we
+            // patched in producer's park_until_slot_free.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);

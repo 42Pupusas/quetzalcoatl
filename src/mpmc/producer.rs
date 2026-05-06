@@ -126,6 +126,15 @@ impl<T, C: Config> Producer<T, C> {
             }
 
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // SeqCst fence so the recheck below is totally ordered with
+            // the consumer's `done.store(Release)` in pop. Without the
+            // fence, the recheck's Acquire load of `done` can be hoisted
+            // past the SeqCst fetch_or in the modification order, and
+            // the consumer's wake_one (which loads our wake bit) can
+            // run before we set the bit — leaving us parked while a
+            // freshly-released slot sits in our batch_unused. Same race
+            // class as broadcast::pop_async's register-recheck.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // Re-check after publishing our wake bit.
             if let Some(found) = q.scan_unused(start, unused) {
@@ -343,6 +352,8 @@ impl<T, C: Config> Producer<T, C> {
             // the re-check below, or the consumer sees our bit
             // and unparks us.
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // Fence: see park_until_slot_free for the rationale.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             match self.push(val) {
                 Ok(()) => {

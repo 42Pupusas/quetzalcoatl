@@ -1450,6 +1450,141 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic — instruments the saturated mpmc/block deadlock; runs 200 iters of 5k items each"]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn block_stress_diagnostic() {
+        // Instrumented variant: when the watchdog fires (10s without
+        // any iter completing), dump the ring's debug snapshot so we
+        // can see what state the threads were in when everything
+        // parked.
+        //
+        // Snapshot from a captured deadlock at iter 43:
+        //   claim = 1461
+        //   ready = [1458, 1459, 1460, 1461, 1462, 1431, 1448, ..., 1457]
+        //   done  = [1472, 1473, 1474, 1475, 1476, 1445, 1462, ..., 1471]
+        //
+        // Every slot in state==2 ("consumed but next round not yet
+        // published"). Slot 5 is at round 89; rest at 90/91. Nobody
+        // ever published pos 1445 (round 90 slot 5) — refill_batch
+        // checks done[claim&mask]==claim before FAA'ing further, so
+        // claim is stuck at 1461 (slot 5, expects done[5]==1461 but
+        // it's 1445). Some producer that was supposed to publish pos
+        // 1445 either lost a wake event or its batch_unused never
+        // contained that bit. Investigation pending.
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let test_done = Arc::new(AtomicBool::new(false));
+        let test_done_watchdog = test_done.clone();
+        let progress = Arc::new(AtomicU64::new(0)); // bumped every completed iter
+        let progress_watchdog = progress.clone();
+        let snapshot_holder: Arc<std::sync::Mutex<Option<(usize, Vec<usize>, Vec<usize>)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let snapshot_holder_w = snapshot_holder.clone();
+
+        let watchdog = std::thread::spawn(move || {
+            // Idle watchdog: fires if no iter completes within 10s.
+            let mut last = progress_watchdog.load(Ordering::Acquire);
+            let mut last_t = std::time::Instant::now();
+            while !test_done_watchdog.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let cur = progress_watchdog.load(Ordering::Acquire);
+                if cur != last {
+                    last = cur;
+                    last_t = std::time::Instant::now();
+                    continue;
+                }
+                if last_t.elapsed() > std::time::Duration::from_secs(10) {
+                    use std::io::Write;
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(stderr, "\n\n=== DEADLOCK at iter {cur} ===");
+                    if let Ok(g) = snapshot_holder_w.lock() {
+                        if let Some((claim, ready, done_arr)) = &*g {
+                            let _ = writeln!(stderr, "claim = {claim}");
+                            let _ = writeln!(stderr, "ready = {ready:?}");
+                            let _ = writeln!(stderr, "done  = {done_arr:?}");
+                        } else {
+                            let _ = writeln!(stderr, "(no snapshot captured)");
+                        }
+                    }
+                    let _ = writeln!(stderr, "aborting\n");
+                    let _ = stderr.flush();
+                    drop(stderr);
+                    std::process::abort();
+                }
+            }
+        });
+
+        for iter in 0..200 {
+            if iter % 10 == 0 {
+                eprintln!("iter {iter}");
+            }
+            let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+            // Stash a snapshot of the queue's state every 100ms so the
+            // watchdog has something to dump when it fires.
+            let snap_q = producer.queue.clone();
+            let snap_holder = snapshot_holder.clone();
+            let snap_done = Arc::new(AtomicBool::new(false));
+            let snap_done2 = snap_done.clone();
+            let snap_thread = std::thread::spawn(move || {
+                while !snap_done2.load(Ordering::Acquire) {
+                    let snap = snap_q.debug_snapshot();
+                    if let Ok(mut g) = snap_holder.lock() {
+                        *g = Some(snap);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+
+            let consumers: Vec<_> = (0..2)
+                .map(|_| {
+                    let c = consumer.clone();
+                    std::thread::spawn(move || {
+                        let mut local = 0u64;
+                        while let Some(v) = c.pop_block() {
+                            let mut x = v;
+                            for _ in 0..64 {
+                                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                                x = std::hint::black_box(x);
+                            }
+                            local += 1;
+                        }
+                        local
+                    })
+                })
+                .collect();
+            drop(consumer);
+
+            let producers: Vec<_> = (0..2u64)
+                .map(|tid| {
+                    let p = producer.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..5000u64 {
+                            p.push_block(tid * 5000 + i).expect("consumers dropped");
+                        }
+                    })
+                })
+                .collect();
+            drop(producer);
+
+            for h in producers {
+                h.join().unwrap();
+            }
+            let mut sum = 0u64;
+            for h in consumers {
+                sum += h.join().unwrap();
+            }
+            // Stop snapshot thread for this iter
+            snap_done.store(true, Ordering::Release);
+            snap_thread.join().unwrap();
+            assert_eq!(sum, 10000);
+            progress.fetch_add(1, Ordering::Release);
+        }
+        test_done.store(true, Ordering::Release);
+        watchdog.join().unwrap();
+    }
+
+    #[test]
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread_iters_unsaturated() {
         async_mpmc_stress_iters(2_000, 4096, 500);
