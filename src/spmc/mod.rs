@@ -1180,4 +1180,96 @@ mod tests {
         assert_eq!(v2, 2);
         assert!(c.pop_ref_block().is_none());
     }
+
+    #[test]
+    fn drain_empty_returns_zero() {
+        let (_p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        assert_eq!(c.drain(|_| {}), 0);
+    }
+
+    #[test]
+    fn drain_collects_all_items() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        for i in 0..5u32 {
+            p.push(i).unwrap();
+        }
+        let mut out = Vec::new();
+        let count = c.drain(|v| out.push(v));
+        assert_eq!(count, 5);
+        assert_eq!(out, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn drain_up_to_respects_limit() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        for i in 0..5u32 {
+            p.push(i).unwrap();
+        }
+        let mut out = Vec::new();
+        let count = c.drain_up_to(3, |v| out.push(v));
+        assert_eq!(count, 3);
+        assert_eq!(out, [0, 1, 2]);
+        // Remaining items still poppable.
+        assert_eq!(c.pop(), Some(3));
+        assert_eq!(c.pop(), Some(4));
+    }
+
+    #[test]
+    fn drain_frees_slots_for_producer() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4u32 {
+            p.push(i).unwrap();
+        }
+        // Buffer full — producer can't push.
+        assert!(p.push(99).is_err());
+        c.drain(|_| {});
+        // Slots freed — producer can push again.
+        p.push(99).unwrap();
+        assert_eq!(c.pop(), Some(99));
+    }
+
+    #[test]
+    fn drain_block_runs_until_producer_drops() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        let h = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut c = c;
+            c.drain_block(|v| out.push(v));
+            out
+        });
+        for i in 0..5u32 {
+            p.push(i).unwrap();
+        }
+        drop(p);
+        let out = h.join().unwrap();
+        assert_eq!(out, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn drain_multi_consumer() {
+        // Two consumers each drain concurrently; combined they get all items.
+        let (p, c1) = RingBuffer::<u32>::new(Capacity::exact(64)).split();
+        let c2 = c1.clone();
+        for i in 0..32u32 {
+            p.push(i).unwrap();
+        }
+        let h1 = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            c1.drain(|v| out.push(v));
+            out
+        });
+        let h2 = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            c2.drain(|v| out.push(v));
+            out
+        });
+        let mut combined: Vec<u32> = h1
+            .join()
+            .unwrap()
+            .into_iter()
+            .chain(h2.join().unwrap())
+            .collect();
+        combined.sort_unstable();
+        assert_eq!(combined, (0..32).collect::<Vec<_>>());
+    }
 }

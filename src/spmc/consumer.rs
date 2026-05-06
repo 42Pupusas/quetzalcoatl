@@ -228,6 +228,81 @@ impl<T> Consumer<T> {
         (data_ptr, &slot_done.0, h)
     }
 
+    /// Drains all currently available items, calling `f` for each.
+    ///
+    /// Each slot's `done` store is issued immediately (so the producer can
+    /// reuse slots as fast as possible), but `wake_producer` is called only
+    /// **once** at the end of the batch — reducing the number of atomic
+    /// `producer_parked` checks from O(n) to O(1).
+    ///
+    /// Returns the number of items drained.
+    pub fn drain(&self, mut f: impl FnMut(T)) -> usize {
+        let mut count = 0usize;
+        loop {
+            let Some((data_ptr, slot_done, head)) = self.claim_slot() else {
+                break;
+            };
+            // SAFETY: bounded CAS guarantees pos < tail at claim time, so
+            // the producer has Release-stored ready[s] == pos+1, and our
+            // Acquire on tail happens-after that store. Data is initialized
+            // and exclusively ours.
+            let val = unsafe { data_ptr.cast::<T>().read() };
+            slot_done.store(head + self.queue.cap, Ordering::Release);
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            self.queue.wake_producer();
+        }
+        count
+    }
+
+    /// Drains up to `limit` available items, calling `f` for each.
+    ///
+    /// Same as [`drain`](Self::drain) but stops after `limit` items. Useful
+    /// for fairness in multi-source consumer loops.
+    ///
+    /// Returns the number of items drained.
+    pub fn drain_up_to(&self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut count = 0usize;
+        while count < limit {
+            let Some((data_ptr, slot_done, head)) = self.claim_slot() else {
+                break;
+            };
+            // SAFETY: same as drain — bounded CAS, producer Release-store
+            // happens-before our Acquire on tail.
+            let val = unsafe { data_ptr.cast::<T>().read() };
+            slot_done.store(head + self.queue.cap, Ordering::Release);
+            count += 1;
+            f(val);
+        }
+        if count > 0 {
+            self.queue.wake_producer();
+        }
+        count
+    }
+
+    /// Drains items, blocking when empty, until the producer drops.
+    /// Calls `f` for each item drained. Returns the total count.
+    ///
+    /// Combines [`drain`](Self::drain)'s amortized wake with
+    /// [`pop_block`](Self::pop_block)'s park-on-empty protocol. Use
+    /// this for a long-running consumer that wants throughput (drain)
+    /// and CPU efficiency on idle (block).
+    pub fn drain_block(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut total = 0usize;
+        loop {
+            total += self.drain(&mut f);
+            match self.pop_block() {
+                Some(v) => {
+                    total += 1;
+                    f(v);
+                }
+                None => return total,
+            }
+        }
+    }
+
     /// Pops an item from the ring buffer.
     #[inline]
     #[must_use]
