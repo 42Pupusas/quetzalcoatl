@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
@@ -222,6 +224,8 @@ impl<T, C: Config> Producer<T, C> {
         // self-gates on a `Relaxed` load; missed wakes are bounded
         // by the consumer's park-timeout backstop.
         q.consumer_park.wake_one();
+        #[cfg(feature = "async")]
+        q.wake_consumer_async();
         Ok(())
     }
 
@@ -356,6 +360,47 @@ impl<T, C: Config> Producer<T, C> {
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
+
+    /// Pushes a value asynchronously, yielding to the executor when
+    /// the ring is full until a consumer makes space. Returns
+    /// `Err(val)` only when the last consumer has been dropped (no
+    /// consumer left to drain).
+    ///
+    /// The future is cancel-safe: dropping it before completion leaves
+    /// the ring unchanged (the value is moved back out on cancellation).
+    ///
+    /// Each producer clone has its own park slot so multiple async
+    /// producers can wait concurrently without contending on a single
+    /// waker entry.
+    #[cfg(feature = "async")]
+    #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
+    pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
+        let mut val = Some(val);
+        let slot = self.park_slot;
+        std::future::poll_fn(move |cx| {
+            let v = val.take().expect("polled after completion");
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(Err(v));
+            }
+            match self.push(v) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(returned) => {
+                    val = Some(returned);
+                    self.queue.producer_waker.register(slot, cx);
+                    if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                        return Poll::Ready(Err(val.take().unwrap()));
+                    }
+                    match self.push(val.take().unwrap()) {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(returned) => {
+                            val = Some(returned);
+                            Poll::Pending
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 impl<T, C: Config> Drop for Producer<T, C> {
@@ -389,6 +434,8 @@ impl<T, C: Config> Drop for Producer<T, C> {
             // observe `closed` and exit. Cold path, last-drop only.
             self.queue.producer_park.flush();
             self.queue.consumer_park.flush();
+            #[cfg(feature = "async")]
+            self.queue.consumer_waker.flush();
         }
     }
 }
@@ -463,6 +510,8 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
         q.ready_slot(self.pos)
             .store(self.pos + 1, Ordering::Release);
         q.consumer_park.wake_one();
+        #[cfg(feature = "async")]
+        q.wake_consumer_async();
         // Skip SlotWriter::drop (which would restore the bit).
         std::mem::forget(self);
     }
@@ -505,6 +554,8 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
         q.ready_slot(self.pos)
             .store(self.pos + 1, Ordering::Release);
         q.consumer_park.wake_one();
+        #[cfg(feature = "async")]
+        q.wake_consumer_async();
         self.committed = true;
     }
 }

@@ -583,6 +583,110 @@ fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Async API: push_async / pop_async, M producers + N consumers.
+//
+// Each producer/consumer task runs on its own thread with a current_thread
+// runtime + LocalSet (Producer/Consumer are !Send).
+//
+// Run with: cargo bench --bench mpmc --features async
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+fn run_async_mpmc_bench(
+    b: &mut criterion::Bencher,
+    cap: usize,
+    p_count: u64,
+    c_count: usize,
+    per_p: u64,
+    consumer_work: fn(u64) -> u64,
+) {
+    use quetzalcoatl::mpmc::RingBuffer;
+
+    let total_items = p_count * per_p;
+    b.iter_custom(|iters| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+            let received = Arc::new(AtomicUsize::new(0));
+            let start = std::time::Instant::now();
+
+            let consumer_threads: Vec<_> = (0..c_count)
+                .map(|_| {
+                    let c = consumer.clone();
+                    let received = received.clone();
+                    thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        let local = tokio::task::LocalSet::new();
+                        rt.block_on(local.run_until(async move {
+                            while let Some(v) = c.pop_async().await {
+                                black_box(consumer_work(v));
+                                received.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }));
+                    })
+                })
+                .collect();
+            drop(consumer);
+
+            let producer_threads: Vec<_> = (0..p_count)
+                .map(|tid| {
+                    let p = producer.clone();
+                    thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        let local = tokio::task::LocalSet::new();
+                        rt.block_on(local.run_until(async move {
+                            for i in 0..per_p {
+                                p.push_async(tid * per_p + i)
+                                    .await
+                                    .expect("all consumers dropped");
+                            }
+                        }));
+                    })
+                })
+                .collect();
+            drop(producer);
+
+            for h in producer_threads {
+                h.join().unwrap();
+            }
+            for h in consumer_threads {
+                h.join().unwrap();
+            }
+            assert_eq!(received.load(Ordering::Relaxed), total_items as usize);
+            total += start.elapsed();
+        }
+        total
+    });
+}
+
+#[cfg(feature = "async")]
+fn bench_async_mpmc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("blocking_mpmc");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    let p_count = 2u64;
+    let q_count = 2usize;
+    let per_p = 5_000u64;
+    let total_items = p_count * per_p;
+    group.throughput(Throughput::Elements(total_items));
+
+    group.bench_function("async_saturated", |b| {
+        run_async_mpmc_bench(b, 16, p_count, q_count, per_p, slow_work);
+    });
+
+    group.bench_function("async_unsaturated", |b| {
+        run_async_mpmc_bench(b, 4096, p_count, q_count, per_p, |v| v);
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "async"))]
 criterion_group!(
     benches,
     bench_mpmc_vs_n_spmc,
@@ -590,4 +694,15 @@ criterion_group!(
     bench_blocking_mpmc,
     bench_large_struct_mpmc_zero_copy_blocking,
 );
+
+#[cfg(feature = "async")]
+criterion_group!(
+    benches,
+    bench_mpmc_vs_n_spmc,
+    bench_large_struct_mpmc,
+    bench_blocking_mpmc,
+    bench_large_struct_mpmc_zero_copy_blocking,
+    bench_async_mpmc,
+);
+
 criterion_main!(benches);

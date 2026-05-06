@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
@@ -178,6 +180,8 @@ impl<T, C: Config> Consumer<T, C> {
         q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
         // Wake one parked producer if any.
         q.producer_park.wake_one();
+        #[cfg(feature = "async")]
+        q.wake_producer_async();
         Some(val)
     }
 
@@ -233,6 +237,8 @@ impl<T, C: Config> Consumer<T, C> {
             // releases up to `count` of them — each `wake_one` would
             // strand the rest until the next pop/drain.
             self.queue.producer_park.wake_n(count);
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async_n(count);
         }
         count
     }
@@ -254,6 +260,8 @@ impl<T, C: Config> Consumer<T, C> {
         }
         if count > 0 {
             self.queue.producer_park.wake_n(count);
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async_n(count);
         }
         count
     }
@@ -335,6 +343,39 @@ impl<T, C: Config> Consumer<T, C> {
             std::thread::park();
             q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
+    }
+
+    /// Pops a value asynchronously, yielding to the executor when the
+    /// ring is empty until a producer publishes one. Returns `None`
+    /// when the ring is closed AND empty (no live producers, nothing
+    /// left to drain).
+    ///
+    /// The future is cancel-safe: dropping it before completion does
+    /// not consume any item.
+    ///
+    /// Each consumer clone has its own park slot so multiple async
+    /// consumers can wait concurrently without contending on a single
+    /// waker entry.
+    #[cfg(feature = "async")]
+    #[allow(clippy::future_not_send)]
+    pub fn pop_async(&self) -> impl std::future::Future<Output = Option<T>> + '_ {
+        let slot = self.park_slot;
+        std::future::poll_fn(move |cx| {
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            self.queue.consumer_waker.register(slot, cx);
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            Poll::Pending
+        })
     }
 
     /// Returns a zero-copy read reference to the next item, blocking
@@ -442,6 +483,8 @@ impl<T, C: Config> Drop for Consumer<T, C> {
         {
             self.queue.consumer_closed.0.store(true, Ordering::Release);
             self.queue.producer_park.flush();
+            #[cfg(feature = "async")]
+            self.queue.producer_waker.flush();
         }
     }
 }
@@ -488,5 +531,7 @@ impl<T, C: Config> Drop for SlotReader<'_, T, C> {
         q.done_slot(self.pos)
             .store(self.round_pos + q.cap, Ordering::Release);
         q.producer_park.wake_one();
+        #[cfg(feature = "async")]
+        q.wake_producer_async();
     }
 }
