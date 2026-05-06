@@ -1,4 +1,6 @@
 pub mod park;
+#[cfg(feature = "async")]
+pub mod wake_async;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;

@@ -28,6 +28,7 @@ include = [
 # `[dev-dependencies]` because Cargo disallows optional
 # dev-dependencies, but it's only pulled in when this feature is
 # enabled — production builds are unaffected.
+async = []
 dhat-heap = ["dep:dhat"]
 
 [dependencies]

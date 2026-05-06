@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 /// The consumer side of an SPSC ring buffer.
 ///
@@ -53,13 +55,11 @@ impl<T> Consumer<T> {
         // synchronized with our Acquire in `available`.
         let val = unsafe { (*self.queue.slot(head).get()).assume_init_read() };
 
-        // Release: ensures the read above completes before head advances,
-        // signaling to the producer that the slot is free.
         self.queue.head.store(head + 1, Ordering::Release);
 
-        // Wake the producer if it's parked in push_block. Relaxed gate
-        // keeps the no-park hot path free.
         self.queue.wake_producer();
+        #[cfg(feature = "async")]
+        self.queue.wake_producer_async();
 
         Some(val)
     }
@@ -88,9 +88,10 @@ impl<T> Consumer<T> {
             f(val);
         }
         if count > 0 {
-            // Single head store for the entire batch.
             self.queue.head.store(head, Ordering::Release);
             self.queue.wake_producer();
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async();
         }
         count
     }
@@ -113,6 +114,8 @@ impl<T> Consumer<T> {
         if count > 0 {
             self.queue.head.store(head, Ordering::Release);
             self.queue.wake_producer();
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async();
         }
         count
     }
@@ -189,6 +192,33 @@ impl<T> Consumer<T> {
             std::thread::park();
             self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Pops a value asynchronously, yielding to the executor when the
+    /// ring is empty until the producer pushes one. Returns `None` when
+    /// the producer has been dropped and the ring has drained.
+    ///
+    /// The future is cancel-safe: dropping it before completion does not
+    /// consume any item.
+    #[cfg(feature = "async")]
+    pub fn pop_async(&mut self) -> impl std::future::Future<Output = Option<T>> + '_ {
+        std::future::poll_fn(move |cx| {
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            // Register waker then re-check to close the lost-wake race.
+            self.queue.consumer_waker.register(0, cx);
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.producer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            Poll::Pending
+        })
     }
 
     /// Returns `true` once the [`Producer`](super::Producer) has been
@@ -313,13 +343,12 @@ impl<T> Consumer<T> {
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
-        // Mark consumer-closed so a parked producer in push_block can
-        // observe it and return Err(val).
         self.queue.consumer_closed.0.store(true, Ordering::Release);
-        // Wake the producer if it's parked.
         if let Some(handle) = self.queue.producer_parker.get() {
             handle.unpark();
         }
+        #[cfg(feature = "async")]
+        self.queue.producer_waker.flush();
     }
 }
 
@@ -347,17 +376,15 @@ impl<T> std::ops::Deref for SlotReader<'_, T> {
 
 impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
-        // SAFETY: The value is initialized (verified in pop_ref).
-        // Exclusive access guaranteed by &mut Consumer.
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
-
-        // Release: ensures the read completes before head advances.
         self.consumer
             .queue
             .head
             .store(self.head + 1, Ordering::Release);
         self.consumer.queue.wake_producer();
+        #[cfg(feature = "async")]
+        self.consumer.queue.wake_producer_async();
     }
 }

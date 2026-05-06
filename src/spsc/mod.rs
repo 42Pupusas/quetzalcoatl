@@ -31,6 +31,8 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+#[cfg(feature = "async")]
+use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
@@ -70,6 +72,16 @@ pub struct RingBuffer<T> {
     pub(crate) consumer_parker: OnceLock<Thread>,
     /// `true` ↔ consumer is currently parked.
     pub(crate) consumer_parked: CachePadded<AtomicBool>,
+    /// Async waker for the single producer. Registered before returning
+    /// `Poll::Pending` from `push_async`; woken by the consumer after
+    /// each `pop` or `drain`.
+    #[cfg(feature = "async")]
+    pub(crate) producer_waker: WakerSet,
+    /// Async waker for the single consumer. Registered before returning
+    /// `Poll::Pending` from `pop_async`; woken by the producer after
+    /// each `push`.
+    #[cfg(feature = "async")]
+    pub(crate) consumer_waker: WakerSet,
 }
 
 // Safety: Single producer writes via tail, single consumer reads via head.
@@ -96,6 +108,10 @@ impl<T> RingBuffer<T> {
             producer_parked: CachePadded(AtomicBool::new(false)),
             consumer_parker: OnceLock::new(),
             consumer_parked: CachePadded(AtomicBool::new(false)),
+            #[cfg(feature = "async")]
+            producer_waker: WakerSet::new(),
+            #[cfg(feature = "async")]
+            consumer_waker: WakerSet::new(),
         }
     }
 
@@ -123,6 +139,18 @@ impl<T> RingBuffer<T> {
         if let Some(handle) = self.consumer_parker.get() {
             handle.unpark();
         }
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    pub(crate) fn wake_producer_async(&self) {
+        self.producer_waker.wake_one();
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    pub(crate) fn wake_consumer_async(&self) {
+        self.consumer_waker.wake_one();
     }
 
     /// Returns the approximate number of items currently in the buffer.
@@ -901,5 +929,65 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         h.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread() {
+        // Producer and consumer on separate threads. The watchdog thread
+        // aborts the process if either side hangs longer than 5s, so the
+        // test fails fast instead of leaving the harness blocked on join.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_watchdog = done.clone();
+        let watchdog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done_watchdog.load(Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("\n\nasync_push_pop_cross_thread: deadlocked, aborting\n");
+                    std::process::abort();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let total: u64 = 1_000_000;
+
+        let ph = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                for i in 0..total {
+                    producer.push_async(i).await.expect("consumer dropped");
+                }
+            }));
+        });
+
+        let ch = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                let mut received = 0u64;
+                while received < total {
+                    match consumer.pop_async().await {
+                        Some(_) => received += 1,
+                        None => break,
+                    }
+                }
+                assert_eq!(received, total);
+            }));
+        });
+
+        ph.join().unwrap();
+        ch.join().unwrap();
+        done.store(true, Ordering::Release);
+        watchdog.join().unwrap();
     }
 }

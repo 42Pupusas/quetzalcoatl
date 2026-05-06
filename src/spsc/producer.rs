@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 /// The producer side of an SPSC ring buffer.
 ///
@@ -88,9 +90,9 @@ impl<T> Producer<T> {
         // Release: ensures the data write above is visible before tail advances.
         self.queue.tail.store(pos + 1, Ordering::Release);
 
-        // Wake the consumer if it's parked in pop_block. Relaxed gate
-        // keeps the no-park hot path free.
         self.queue.wake_consumer();
+        #[cfg(feature = "async")]
+        self.queue.wake_consumer_async();
 
         Ok(())
     }
@@ -222,6 +224,44 @@ impl<T> Producer<T> {
         }
     }
 
+    /// Pushes a value asynchronously, yielding to the executor when the
+    /// ring is full until the consumer makes space. Returns `Err(val)`
+    /// if the consumer has been dropped.
+    ///
+    /// The future is cancel-safe: dropping it before completion leaves
+    /// the ring unchanged (the value is moved back out on cancellation).
+    #[cfg(feature = "async")]
+    #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
+    pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
+        let mut val = Some(val);
+        std::future::poll_fn(move |cx| {
+            let v = val.take().expect("polled after completion");
+            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(Err(v));
+            }
+            match self.push(v) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(returned) => {
+                    val = Some(returned);
+                    // Register waker, then re-check to close the lost-wake race:
+                    // if a pop happened between our failed push and this register,
+                    // wake_producer_async was already called and we'd park forever.
+                    self.queue.producer_waker.register(0, cx);
+                    if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                        return Poll::Ready(Err(val.take().unwrap()));
+                    }
+                    match self.push(val.take().unwrap()) {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(returned) => {
+                            val = Some(returned);
+                            Poll::Pending
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -243,15 +283,12 @@ impl<T> Producer<T> {
 
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
-        // Mark the queue closed so a parked consumer in pop_block can
-        // observe it and return None. Release synchronizes with the
-        // consumer's Acquire-load of producer_closed.
         self.queue.producer_closed.0.store(true, Ordering::Release);
-        // Wake the consumer if it's parked, so it observes the close
-        // instead of waiting forever.
         if let Some(handle) = self.queue.consumer_parker.get() {
             handle.unpark();
         }
+        #[cfg(feature = "async")]
+        self.queue.consumer_waker.flush();
     }
 }
 
@@ -321,7 +358,8 @@ impl<'a, T> SlotWriter<'a, T> {
     pub unsafe fn commit_unchecked(self) {
         self.tail.store(self.pos + 1, Ordering::Release);
         self.queue.wake_consumer();
-        // Skip the SlotWriter drop (which would roll back write_pos).
+        #[cfg(feature = "async")]
+        self.queue.wake_consumer_async();
         std::mem::forget(self);
     }
 }
@@ -357,6 +395,8 @@ impl<T> WrittenSlot<'_, T> {
     pub fn commit(mut self) {
         self.tail.store(self.pos + 1, Ordering::Release);
         self.queue.wake_consumer();
+        #[cfg(feature = "async")]
+        self.queue.wake_consumer_async();
         self.committed = true;
     }
 }
