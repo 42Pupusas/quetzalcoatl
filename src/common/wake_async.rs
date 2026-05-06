@@ -10,8 +10,16 @@ use super::AlignedBuf;
 /// The writer is the producer or consumer that owns the slot (calling
 /// `store` before returning `Poll::Pending`). The reader is the peer
 /// side calling `wake`. Even sequence = stable; odd = write in progress.
+///
+/// `fresh` distinguishes "waker present and not yet fired" from "waker
+/// present but already fired" without mutating the slot from the reader
+/// side. `store` sets it true (a fresh waker needs waking); `wake` flips
+/// it false via CAS so subsequent reader scans skip a stale slot —
+/// otherwise a fast wake-loop would re-fire the same slot's waker over
+/// and over while peer slots starve.
 pub struct WakerSlot {
     seq: AtomicUsize,
+    fresh: AtomicBool,
     waker: UnsafeCell<Option<Waker>>,
 }
 
@@ -24,6 +32,7 @@ impl WakerSlot {
     pub const fn new() -> Self {
         Self {
             seq: AtomicUsize::new(0),
+            fresh: AtomicBool::new(false),
             waker: UnsafeCell::new(None),
         }
     }
@@ -41,43 +50,54 @@ impl WakerSlot {
         // Publish: advance to the next even value. Release so the reader's
         // Acquire on seq_before sees the completed write.
         self.seq.store(seq.wrapping_add(2), Ordering::Release);
+        // Mark fresh AFTER the seq publish so a reader that sees fresh=true
+        // is guaranteed to also see the new waker contents.
+        self.fresh.store(true, Ordering::Release);
     }
 
-    /// Takes and wakes the stored waker, if any.
-    ///
-    /// Returns `true` if a waker was present and fired, `false` if the
-    /// slot was empty or the writer was active (caller may retry).
+    /// Wakes the stored waker if it's fresh. Returns `true` only when
+    /// this call atomically claimed the slot's `fresh` flag and fired.
     ///
     /// # Correctness
     ///
-    /// The reader reads `seq_before` (Acquire), then reads the waker pointer,
-    /// then reads `seq_after` (Acquire). If seq changed the read was torn —
-    /// the waker is left in place and we return false. The writer will
-    /// re-register a fresh waker and the peer will wake it on the next
-    /// opportunity. This is safe because:
+    /// 1. Acquire-load `fresh`. If false the slot was empty or already
+    ///    fired by a previous wake — caller must scan the next slot.
+    /// 2. Read `seq_before` (Acquire). Bail if odd (writer active).
+    /// 3. Clone the waker (no mutation — clearing the slot here would
+    ///    race with a concurrent `store` and clobber a fresh waker).
+    /// 4. Verify `seq_after == seq_before`; otherwise the writer raced
+    ///    during step 3 and we bail (the writer's recheck catches the
+    ///    progress signal we just emitted).
+    /// 5. Compare-and-swap `fresh` from true to false. If we lose the
+    ///    CAS another wake fired first; bail.
+    /// 6. Wake the cloned waker.
     ///
-    /// - We only call `wake` when we know the ring made progress; the
-    ///   waiter will observe that progress on its next poll regardless.
-    /// - The writer always re-checks the ring condition after storing
-    ///   its waker, so it cannot miss the progress notification.
+    /// Steps 5 and 6 are the key bit: by claiming `fresh` atomically
+    /// before firing, we guarantee at most one wake per `store`, so
+    /// repeated `wake_one` scans don't re-fire the same slot while
+    /// other slots starve.
     #[inline]
     pub fn wake(&self) -> bool {
-        let seq_before = self.seq.load(Ordering::Acquire);
-        if seq_before & 1 != 0 {
-            // Writer active — slot in flux.
+        if !self.fresh.load(Ordering::Acquire) {
             return false;
         }
-        // SAFETY: seq is even (stable). Clone (don't take) so we never
-        // mutate the slot — clearing it would race with a concurrent
-        // store() and clobber a freshly-registered waker. Leaving the
-        // waker in place is harmless: re-firing a stale waker is a no-op
-        // (the task either re-polls or is gone), and the next register
-        // overwrites it via store().
+        let seq_before = self.seq.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            return false;
+        }
+        // SAFETY: seq even and fresh — the waker is fully published.
         let waker = unsafe { (*self.waker.get()).clone() };
         let seq_after = self.seq.load(Ordering::Acquire);
         if seq_after != seq_before {
-            // Writer raced during our clone — bail; the writer's re-check
-            // will catch the progress, or it'll register again.
+            return false;
+        }
+        // Atomically claim the wake. If another reader got here first
+        // (only possible across distinct WakerSet calls), let it fire.
+        if self
+            .fresh
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return false;
         }
         if let Some(w) = waker {

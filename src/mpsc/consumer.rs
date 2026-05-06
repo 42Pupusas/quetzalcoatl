@@ -1,6 +1,8 @@
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "async")]
+use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
@@ -78,6 +80,8 @@ impl<T> Consumer<T> {
             // on a `Relaxed` load; missed wakes are bounded by the
             // producer's park-timeout backstop.
             self.queue.producer_park.wake_one();
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async();
 
             return Some(val);
         }
@@ -183,6 +187,8 @@ impl<T> Consumer<T> {
             // strand the rest until the next pop. `wake_n` self-gates
             // on the bitmap being non-zero.
             self.queue.producer_park.wake_n(count);
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async_n(count);
         }
 
         count
@@ -230,6 +236,8 @@ impl<T> Consumer<T> {
             // Wake up to `count` parked producers — see `drain` for
             // rationale.
             self.queue.producer_park.wake_n(count);
+            #[cfg(feature = "async")]
+            self.queue.wake_producer_async_n(count);
         }
 
         count
@@ -310,6 +318,35 @@ impl<T> Consumer<T> {
             std::thread::park();
             self.queue.consumer_parked.0.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Pops a value asynchronously, yielding to the executor when the
+    /// ring is empty until a producer pushes one. Returns `None` when
+    /// the last producer has been dropped and the ring has drained.
+    ///
+    /// The future is cancel-safe: dropping it before completion does
+    /// not consume any item.
+    #[cfg(feature = "async")]
+    pub fn pop_async(&mut self) -> impl std::future::Future<Output = Option<T>> + '_ {
+        std::future::poll_fn(move |cx| {
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            // Register-then-recheck: closes the lost-wake race against
+            // a producer push that landed between our failed pop and
+            // this register.
+            self.queue.consumer_waker.register(0, cx);
+            if let Some(v) = self.pop() {
+                return Poll::Ready(Some(v));
+            }
+            if self.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(self.pop());
+            }
+            Poll::Pending
+        })
     }
 
     /// Returns a zero-copy read reference to the next item, blocking
@@ -396,6 +433,8 @@ impl<T> Drop for Consumer<T> {
         // its way out.
         self.queue.consumer_closed.0.store(true, Ordering::Release);
         self.queue.producer_park.flush();
+        #[cfg(feature = "async")]
+        self.queue.producer_waker.flush();
         while self.pop().is_some() {}
     }
 }
@@ -445,5 +484,7 @@ impl<T> Drop for SlotReader<'_, T> {
             .store(self.head + 1, Ordering::Release);
 
         self.consumer.queue.producer_park.wake_one();
+        #[cfg(feature = "async")]
+        self.consumer.queue.wake_producer_async();
     }
 }
