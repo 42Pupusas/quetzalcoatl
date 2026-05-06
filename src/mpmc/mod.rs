@@ -1448,4 +1448,96 @@ mod tests {
         }));
         h.join().unwrap();
     }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread_iters_unsaturated() {
+        async_mpmc_stress_iters(2_000, 4096, 500);
+    }
+
+    #[test]
+    #[ignore = "blocking-side rare deadlock at cap << total — see CHANGELOG/memory"]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread_iters_saturated() {
+        // Saturated: small ring forces producers to park, drain wakes
+        // multiple parked producers per batch. Currently flaky — same
+        // pre-existing rare deadlock as `bench_blocking_mpmc/block`.
+        async_mpmc_stress_iters(2_000, 16, 500);
+    }
+
+    #[cfg(feature = "async")]
+    fn async_mpmc_stress_iters(iters: usize, cap: usize, per_producer: u64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_watchdog = done.clone();
+        let watchdog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !done_watchdog.load(Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("\n\nmpmc async stress: deadlocked, aborting\n");
+                    std::process::abort();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let n_producers: u64 = 2;
+        let n_consumers: u64 = 2;
+        let total = n_producers * per_producer;
+        for _ in 0..iters {
+            let received = Arc::new(AtomicU64::new(0));
+            let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+
+            let consumer_threads: Vec<_> = (0..n_consumers)
+                .map(|_| {
+                    let c = consumer.clone();
+                    let received = received.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        let local = tokio::task::LocalSet::new();
+                        rt.block_on(local.run_until(async move {
+                            while c.pop_async().await.is_some() {
+                                received.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }));
+                    })
+                })
+                .collect();
+            drop(consumer);
+
+            let producer_threads: Vec<_> = (0..n_producers)
+                .map(|tid| {
+                    let p = producer.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        let local = tokio::task::LocalSet::new();
+                        rt.block_on(local.run_until(async move {
+                            for i in 0..per_producer {
+                                p.push_async(tid * per_producer + i)
+                                    .await
+                                    .expect("all consumers dropped");
+                            }
+                        }));
+                    })
+                })
+                .collect();
+            drop(producer);
+
+            for h in producer_threads {
+                h.join().unwrap();
+            }
+            for h in consumer_threads {
+                h.join().unwrap();
+            }
+            assert_eq!(received.load(Ordering::Relaxed), total);
+        }
+        done.store(true, Ordering::Release);
+        watchdog.join().unwrap();
+    }
 }

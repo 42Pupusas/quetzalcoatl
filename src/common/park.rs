@@ -62,30 +62,47 @@ impl WakeSet {
         }
     }
 
-    /// Wakes one peer parked on the bitmap. Caller must gate this on
-    /// `self.wake.load(Relaxed) != 0` for the no-cost fast path.
+    /// Wakes one peer parked on the bitmap.
     ///
     /// Concurrent peers racing on the same set bit: only one's
     /// `fetch_and` actually clears it; the loser observes the bit
     /// already clear and skips the unpark.
+    ///
+    /// The fast-path load uses `Acquire` (not `Relaxed`) so it
+    /// synchronizes with the peer's `fetch_or(bit, SeqCst)`. With
+    /// `Relaxed` the load could miss a freshly-set bit, leaving the
+    /// peer permanently parked when no further progress events
+    /// follow — surfaces under high-volume bench loops at small
+    /// capacities (cap=16 with 2 producers + 2 consumers reliably
+    /// hits this).
     #[inline]
     pub fn wake_one(&self) {
-        let ws = self.wake.load(Ordering::Relaxed);
-        if ws == 0 {
+        // Loop instead of try-once so we don't lose a wake when our
+        // first picked bit was already cleared by a concurrent
+        // wake_one from a peer producer/consumer. Without the loop
+        // (and especially when wake_one is called by a contending pair
+        // of producers/consumers), one wake event is silently dropped
+        // per simultaneous call — a parked counterpart at a higher bit
+        // is starved until the next progress event, which under
+        // saturated bench loops doesn't come reliably and reproducibly
+        // deadlocks at high iter counts.
+        loop {
+            let ws = self.wake.load(Ordering::SeqCst);
+            if ws == 0 {
+                return;
+            }
+            let bit = ws.trailing_zeros();
+            let mask = 1u64 << bit;
+            let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
+            if prev & mask == 0 {
+                // Concurrent wake_one beat us to this bit; pick another.
+                continue;
+            }
+            if let Some(handle) = self.parkers[bit as usize].get() {
+                handle.unpark();
+            }
             return;
         }
-        let bit = ws.trailing_zeros();
-        let mask = 1u64 << bit;
-        let prev = self.wake.fetch_and(!mask, Ordering::Relaxed);
-        if prev & mask == 0 {
-            return;
-        }
-        if let Some(handle) = self.parkers[bit as usize].get() {
-            handle.unpark();
-        }
-        // OnceLock None: peer set its bit before installing its
-        // handle. Benign — its own re-check after install catches
-        // the wake.
     }
 
     /// Wakes up to `n` parked waiters. Used by drain-style operations
@@ -100,7 +117,8 @@ impl WakeSet {
     #[inline]
     pub fn wake_n(&self, n: usize) {
         for _ in 0..n {
-            let ws = self.wake.load(Ordering::Relaxed);
+            // Acquire (not Relaxed) — see wake_one for the rationale.
+            let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 return;
             }

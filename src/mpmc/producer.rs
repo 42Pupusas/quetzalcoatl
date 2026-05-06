@@ -417,10 +417,19 @@ impl<T, C: Config> Drop for Producer<T, C> {
             let bit = unused.trailing_zeros() as usize;
             let pos = start + bit;
             // Wait for previous round's consumer to release before
-            // tombstoning, else we'd stomp on prior-round state.
+            // tombstoning, else we'd stomp on prior-round state. Wake
+            // any parked consumers each iteration: a consumer can be
+            // parked on `consumer_park` waiting for a state==1 slot we
+            // already published in this batch, and without an explicit
+            // wake here the consumer never advances past the slot whose
+            // `done` we're spinning on — classic deadlock during the
+            // producer's last drop.
             let done = q.done_slot(pos);
             let mut backoff = 0u32;
             while done.load(Ordering::Acquire) != pos {
+                q.consumer_park.wake_one();
+                #[cfg(feature = "async")]
+                q.wake_consumer_async();
                 crate::common::cas_backoff(&mut backoff);
             }
             q.ready_slot(pos).store(pos + 2, Ordering::Release);
@@ -429,7 +438,9 @@ impl<T, C: Config> Drop for Producer<T, C> {
         }
 
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.queue.closed.0.store(true, Ordering::Release);
+            // SeqCst pairs with consumer's `closed.load(SeqCst)` in
+            // pop_block's recheck after fetch_or — see consumer.rs.
+            self.queue.closed.0.store(true, Ordering::SeqCst);
             // Wake every parked producer and consumer so they can
             // observe `closed` and exit. Cold path, last-drop only.
             self.queue.producer_park.flush();

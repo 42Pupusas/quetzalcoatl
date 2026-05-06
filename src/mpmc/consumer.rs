@@ -335,7 +335,13 @@ impl<T, C: Config> Consumer<T, C> {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Some(v);
             }
-            if q.closed.0.load(Ordering::Acquire) {
+            // SeqCst on closed.load forces a total order with the last-
+            // producer drop's `closed.store`: same Acquire-Release race
+            // as broadcast — same-address pairing is theoretically
+            // sufficient but x86 TSO under stress permits the recheck
+            // to observe stale `closed=false`, causing an indefinite
+            // park if no further publish follows.
+            if q.closed.0.load(Ordering::SeqCst) {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return self.pop();
             }
