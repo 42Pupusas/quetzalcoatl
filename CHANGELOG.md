@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`mpmc::push_block` / `pop_block` saturated deadlock** —
+  three independent fixes; all three are needed for the bench
+  (`blocking_mpmc/block`: cap=16, 2P+2C, slow consumer) to run
+  reliably:
+  1. **Round-robin wake selection.** `WakeSet::wake_one` / `wake_n`
+     used to always pick the lowest set bit, starving any
+     higher-bit waiter when a low-bit waiter could be woken but
+     not make progress. Selection now rotates through slots via
+     a per-`WakeSet` cursor — every parked waiter gets a fair
+     share of wake events. This was the dominant deadlock cause:
+     producer at park slot 2 (empty batch, refill blocked) ate
+     every consumer wake by re-parking, while producer at park
+     slot 3 (holding the unpublished position the refill needed)
+     stayed parked indefinitely.
+  2. **Dekker SeqCst pairing.** `done.store` / `ready.store` are
+     now SeqCst (not Release), and `WakeSet::wake_one` / `wake_n`
+     start with a `SeqCst` fence — closes the classic Dekker race
+     between publish-and-wake on one side and fetch_or-fence-recheck
+     on the other.
+  3. **`park_timeout(1ms)` backstop** in `push_block` / `pop_block`
+     / `reserve_block` / `pop_ref_block`. Belt-and-suspenders:
+     fast paths are unchanged (an unpark wakes immediately), the
+     timeout caps any residual race at ~1ms.
+
+  `mpmc::tests::async_push_pop_cross_thread_iters_saturated` is no
+  longer `#[ignore]`.
+
 ## [0.10.0] - 2026-05-01
 
 ### Added

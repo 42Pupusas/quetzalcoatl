@@ -30,6 +30,10 @@ use super::AlignedBuf;
 /// re-parks).
 pub const PARK_SLOTS: usize = 64;
 pub const PARK_MASK: usize = PARK_SLOTS - 1;
+/// 32-bit version of [`PARK_MASK`] for `u32::rotate_right` shift
+/// counts. `PARK_SLOTS = 64` fits comfortably in `u32`.
+#[allow(clippy::cast_possible_truncation)]
+const PARK_MASK_U32: u32 = (PARK_SLOTS as u32) - 1;
 
 /// `cas_backoff` failure-counter threshold past which the slow path
 /// stops spinning and parks. The schedule in
@@ -51,6 +55,17 @@ pub struct WakeSet {
     /// that parks at each slot; readers (peers issuing wakes)
     /// obtain a `&Thread` via `OnceLock::get`.
     pub parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Round-robin cursor: index *just after* the last slot we woke.
+    /// `wake_one` rotates the bitmap by `cursor` before picking the
+    /// trailing-zero bit, so a stuck low-bit waiter that re-parks
+    /// immediately can't monopolize wake events and starve a
+    /// higher-bit waiter who could actually progress. Without this,
+    /// `bench_blocking_mpmc/block` deadlocked: producer at bit 2
+    /// (waiting on a refill that couldn't succeed yet) consumed
+    /// every consumer wake event, while the producer at bit 3
+    /// (holding the position the refill needed) stayed parked
+    /// forever.
+    pub cursor: AtomicU64,
 }
 
 impl WakeSet {
@@ -59,6 +74,7 @@ impl WakeSet {
         Self {
             wake: AtomicU64::new(0),
             parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            cursor: AtomicU64::new(0),
         }
     }
 
@@ -77,27 +93,51 @@ impl WakeSet {
     /// hits this).
     #[inline]
     pub fn wake_one(&self) {
-        // Loop instead of try-once so we don't lose a wake when our
-        // first picked bit was already cleared by a concurrent
-        // wake_one from a peer producer/consumer. Without the loop
-        // (and especially when wake_one is called by a contending pair
-        // of producers/consumers), one wake event is silently dropped
-        // per simultaneous call — a parked counterpart at a higher bit
-        // is starved until the next progress event, which under
-        // saturated bench loops doesn't come reliably and reproducibly
-        // deadlocks at high iter counts.
+        // Drain the caller's store buffer before sampling the wake
+        // bitmap. Callers (Producer::push, Consumer::pop, etc.) issue a
+        // Release store on `ready`/`done` and then call wake_one. Without
+        // this fence, x86 store-load reordering lets the SeqCst load on
+        // `wake` below complete before the Release store reaches cache,
+        // producing a Dekker-style missed wake: a peer that just parked
+        // (fetch_or(wake, SeqCst); fence(SeqCst); recheck) sees the stale
+        // value of `ready`/`done` and parks indefinitely while we read 0
+        // from `wake` and skip the unpark. SeqCst load alone is insufficient
+        // — it doesn't drain the store buffer; only an mfence (or RMW)
+        // does.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        // Round-robin: rotate the bitmap so the slot just past
+        // `cursor` is the new lowest bit, and pick its trailing
+        // zero. Without this, `trailing_zeros` always picks the
+        // lowest set slot; a stuck low-bit waiter that re-parks
+        // immediately consumes every wake event and starves a
+        // higher-bit waiter who could actually progress. This is the
+        // saturated mpmc/block deadlock pattern: producer at bit 2
+        // parks on a refill that can't succeed yet (waiting on
+        // round-N+1 release), producer at bit 3 has the unpublished
+        // round-N position; every consumer pop wakes producer 2 (it
+        // just re-parks), producer 3 stays parked indefinitely.
+        let cursor = self.cursor.load(Ordering::Relaxed);
         loop {
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 return;
             }
-            let bit = ws.trailing_zeros();
+            // Rotate so the cursor's "next" slot becomes bit 0, then
+            // un-rotate the chosen index back to its real slot.
+            #[allow(clippy::cast_possible_truncation)]
+            let shift = cursor as u32 & PARK_MASK_U32;
+            let rotated = ws.rotate_right(shift);
+            let rel_bit = rotated.trailing_zeros();
+            let bit = (rel_bit + shift) & PARK_MASK_U32;
             let mask = 1u64 << bit;
             let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
             if prev & mask == 0 {
                 // Concurrent wake_one beat us to this bit; pick another.
                 continue;
             }
+            // Advance cursor past this slot for the next caller.
+            self.cursor
+                .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
             if let Some(handle) = self.parkers[bit as usize].get() {
                 handle.unpark();
             }
@@ -116,13 +156,24 @@ impl WakeSet {
     /// available, not all of them.
     #[inline]
     pub fn wake_n(&self, n: usize) {
+        // See wake_one — drain the caller's store buffer before
+        // sampling the bitmap so prior Release stores on
+        // `ready`/`done` are globally visible.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let mut cursor = self.cursor.load(Ordering::Relaxed);
         for _ in 0..n {
             // Acquire (not Relaxed) — see wake_one for the rationale.
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
+                self.cursor.store(cursor, Ordering::Relaxed);
                 return;
             }
-            let bit = ws.trailing_zeros();
+            // Round-robin via cursor — see wake_one.
+            #[allow(clippy::cast_possible_truncation)]
+            let shift = cursor as u32 & PARK_MASK_U32;
+            let rotated = ws.rotate_right(shift);
+            let rel_bit = rotated.trailing_zeros();
+            let bit = (rel_bit + shift) & PARK_MASK_U32;
             let mask = 1u64 << bit;
             let prev = self.wake.fetch_and(!mask, Ordering::Relaxed);
             if prev & mask == 0 {
@@ -130,10 +181,12 @@ impl WakeSet {
                 // this iteration since we didn't wake anything.
                 continue;
             }
+            cursor = u64::from(bit).wrapping_add(1);
             if let Some(handle) = self.parkers[bit as usize].get() {
                 handle.unpark();
             }
         }
+        self.cursor.store(cursor, Ordering::Relaxed);
     }
 
     /// Wakes every waiter parked on the bitmap, swapping it to zero

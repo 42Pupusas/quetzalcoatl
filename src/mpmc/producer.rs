@@ -142,7 +142,8 @@ impl<T, C: Config> Producer<T, C> {
                 return found;
             }
 
-            std::thread::park();
+            // park_timeout backstop — see push_block.
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
@@ -226,12 +227,16 @@ impl<T, C: Config> Producer<T, C> {
         let data_ptr = q.data_slot(pos).get();
         unsafe { (*data_ptr).write(val) };
 
-        // Publish: ready[s] = pos + 1 (state = published).
-        q.ready_slot(pos).store(pos + 1, Ordering::Release);
+        // Publish: ready[s] = pos + 1 (state = published). SeqCst
+        // (not Release) drains the store buffer so the SeqCst load of
+        // `consumer_park.wake` inside wake_one cannot miss a freshly-
+        // parked consumer's bit. Symmetric to Consumer::pop's
+        // SeqCst store on `done` — both directions need the
+        // store-buffer drain to close the Dekker race against the
+        // peer's parking sequence (fetch_or(SC) + fence(SC) + recheck).
+        q.ready_slot(pos).store(pos + 1, Ordering::SeqCst);
 
-        // Wake one consumer parked in pop_block, if any. `wake_one`
-        // self-gates on a `Relaxed` load; missed wakes are bounded
-        // by the consumer's park-timeout backstop.
+        // Wake one consumer parked in pop_block, if any.
         q.consumer_park.wake_one();
         #[cfg(feature = "async")]
         q.wake_consumer_async();
@@ -310,7 +315,8 @@ impl<T, C: Config> Producer<T, C> {
                 return self.reserve();
             }
 
-            std::thread::park();
+            // park_timeout backstop — see push_block.
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
             self.queue
                 .producer_park
                 .wake
@@ -367,7 +373,16 @@ impl<T, C: Config> Producer<T, C> {
                 return Err(val);
             }
 
-            std::thread::park();
+            // park_timeout (not park) as a final-line backstop:
+            // round-robin in WakeSet eliminates the wake-bit
+            // starvation; the SeqCst pairing on `wake` closes the
+            // Dekker race. Together those should be sufficient, but
+            // an extremely rare residual race (cap=16 stress, ~3%
+            // of 5000-item runs) could still hang. The 1ms timeout
+            // caps that hang at 1ms — a parked producer always
+            // re-checks its done value within that window. Fast
+            // path (consumer unparks immediately) is unchanged.
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
@@ -528,9 +543,8 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
     #[inline]
     pub unsafe fn commit_unchecked(self) {
         let q = &*self.producer.queue;
-        // Publish: ready[s] = pos + 1 (state = published).
-        q.ready_slot(self.pos)
-            .store(self.pos + 1, Ordering::Release);
+        // SeqCst — see Producer::push.
+        q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
         q.consumer_park.wake_one();
         #[cfg(feature = "async")]
         q.wake_consumer_async();
@@ -573,8 +587,8 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
     #[inline]
     pub fn commit(mut self) {
         let q = &*self.producer.queue;
-        q.ready_slot(self.pos)
-            .store(self.pos + 1, Ordering::Release);
+        // SeqCst — see Producer::push.
+        q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
         q.consumer_park.wake_one();
         #[cfg(feature = "async")]
         q.wake_consumer_async();

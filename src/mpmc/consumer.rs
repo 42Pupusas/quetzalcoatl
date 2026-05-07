@@ -177,7 +177,13 @@ impl<T, C: Config> Consumer<T, C> {
         // ownership of slot `pos & mask` for this round. The
         // producer committed the value before storing state=1.
         let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-        q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+        // SeqCst (not Release) on done.store: drains the store buffer
+        // so the SeqCst load of `producer_park.wake` inside wake_one
+        // can't be satisfied before our store reaches global
+        // visibility. wake_one's leading SeqCst fence is theoretically
+        // equivalent, but writing the SeqCst on the store keeps the
+        // pairing local to the call site.
+        q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
         // Wake one parked producer if any.
         q.producer_park.wake_one();
         #[cfg(feature = "async")]
@@ -227,7 +233,10 @@ impl<T, C: Config> Consumer<T, C> {
             // SAFETY: claim_slot's CAS gave us unique ownership of
             // (pos, round_pos). Producer committed before publishing.
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-            q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+            // SeqCst (see Consumer::pop): drains the store buffer so
+            // the upcoming wake_n's wake.load cannot miss a parked
+            // producer bit set just after our store landed.
+            q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
             count += 1;
             f(val);
         }
@@ -254,7 +263,8 @@ impl<T, C: Config> Consumer<T, C> {
             };
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-            q.done_slot(pos).store(round_pos + q.cap, Ordering::Release);
+            // SeqCst — see Consumer::pop.
+            q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
             count += 1;
             f(val);
         }
@@ -352,7 +362,8 @@ impl<T, C: Config> Consumer<T, C> {
                 return self.pop();
             }
 
-            std::thread::park();
+            // park_timeout backstop — see Producer::push_block.
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
             q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
@@ -443,7 +454,8 @@ impl<T, C: Config> Consumer<T, C> {
                 return None;
             }
 
-            std::thread::park();
+            // park_timeout backstop — see Consumer::pop_block.
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
             self.queue
                 .consumer_park
                 .wake
@@ -538,10 +550,11 @@ impl<T, C: Config> Drop for SlotReader<'_, T, C> {
         unsafe {
             q.data_slot(self.pos).get().cast::<T>().drop_in_place();
         }
-        // Release: round_pos + cap signals the next-round producer
-        // that the slot is free for reuse.
+        // SeqCst — see Consumer::pop. The store-buffer drain is
+        // necessary so the upcoming wake_one's wake.load doesn't miss
+        // a parked producer's bit.
         q.done_slot(self.pos)
-            .store(self.round_pos + q.cap, Ordering::Release);
+            .store(self.round_pos + q.cap, Ordering::SeqCst);
         q.producer_park.wake_one();
         #[cfg(feature = "async")]
         q.wake_producer_async();

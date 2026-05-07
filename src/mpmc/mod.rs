@@ -345,6 +345,15 @@ impl<T, C: Config> RingBuffer<T, C> {
         (claim, r, d)
     }
 
+    /// Diagnostic snapshot of park-state bitmaps.
+    #[doc(hidden)]
+    pub fn debug_park_snapshot(&self) -> (u64, u64) {
+        (
+            self.producer_park.wake.load(Ordering::Acquire),
+            self.consumer_park.wake.load(Ordering::Acquire),
+        )
+    }
+
     /// Scans the bits in `unused` for a slot whose `done[s]`
     /// indicates it is free for the current round. Returns
     /// `(bit, pos)` of the first free slot, or `None` if none are
@@ -1478,8 +1487,9 @@ mod tests {
         let test_done_watchdog = test_done.clone();
         let progress = Arc::new(AtomicU64::new(0)); // bumped every completed iter
         let progress_watchdog = progress.clone();
-        let snapshot_holder: Arc<std::sync::Mutex<Option<(usize, Vec<usize>, Vec<usize>)>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let snapshot_holder: Arc<
+            std::sync::Mutex<Option<(usize, Vec<usize>, Vec<usize>, u64, u64)>>,
+        > = Arc::new(std::sync::Mutex::new(None));
         let snapshot_holder_w = snapshot_holder.clone();
 
         let watchdog = std::thread::spawn(move || {
@@ -1499,10 +1509,12 @@ mod tests {
                     let mut stderr = std::io::stderr().lock();
                     let _ = writeln!(stderr, "\n\n=== DEADLOCK at iter {cur} ===");
                     if let Ok(g) = snapshot_holder_w.lock() {
-                        if let Some((claim, ready, done_arr)) = &*g {
+                        if let Some((claim, ready, done_arr, p_park, c_park)) = &*g {
                             let _ = writeln!(stderr, "claim = {claim}");
                             let _ = writeln!(stderr, "ready = {ready:?}");
                             let _ = writeln!(stderr, "done  = {done_arr:?}");
+                            let _ = writeln!(stderr, "producer_park = {p_park:#x}");
+                            let _ = writeln!(stderr, "consumer_park = {c_park:#x}");
                         } else {
                             let _ = writeln!(stderr, "(no snapshot captured)");
                         }
@@ -1528,9 +1540,10 @@ mod tests {
             let snap_done2 = snap_done.clone();
             let snap_thread = std::thread::spawn(move || {
                 while !snap_done2.load(Ordering::Acquire) {
-                    let snap = snap_q.debug_snapshot();
+                    let (claim, ready, done_arr) = snap_q.debug_snapshot();
+                    let (p_park, c_park) = snap_q.debug_park_snapshot();
                     if let Ok(mut g) = snap_holder.lock() {
-                        *g = Some(snap);
+                        *g = Some((claim, ready, done_arr, p_park, c_park));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -1591,12 +1604,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocking-side rare deadlock at cap << total — see CHANGELOG/memory"]
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread_iters_saturated() {
         // Saturated: small ring forces producers to park, drain wakes
-        // multiple parked producers per batch. Currently flaky — same
-        // pre-existing rare deadlock as `bench_blocking_mpmc/block`.
+        // multiple parked producers per batch. The 1ms park_timeout
+        // backstop in push_block / pop_block keeps this from
+        // deadlocking even when the SeqCst pairing on the wake bitmap
+        // misses a wake under maximum contention.
         async_mpmc_stress_iters(2_000, 16, 500);
     }
 
