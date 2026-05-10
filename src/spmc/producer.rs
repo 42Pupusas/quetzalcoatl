@@ -1,4 +1,5 @@
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "async")]
@@ -9,50 +10,53 @@ use crate::common::park::BACKOFF_PARK_THRESHOLD;
 
 /// The producer side of an SPMC ring buffer.
 ///
-/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Not
-/// cloneable — only one producer exists per buffer.
+/// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
+/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
+/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// lifetimes shorter than `'static`.
 ///
-/// On drop, sets the ring buffer's `closed` flag so any consumer
-/// spinning on overshoot can return `None` instead of hanging.
-pub struct Producer<T> {
-    pub(super) queue: Arc<RingBuffer<T>>,
-    /// Local write cursor. Single producer means no atomics needed for
-    /// our own state — we publish via `ready[s]` per slot, update the
-    /// shared `tail` (Release) for consumer pre-FAA peeks, and read
-    /// `done[s]` to confirm the slot is free for reuse.
+/// Not cloneable — only one producer exists per buffer.
+pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
+    pub(super) queue: R,
     pub(super) write_pos: std::cell::Cell<usize>,
 }
 
-impl<T> Producer<T> {
-    /// Tries to claim slot at logical position `tail`.
-    ///
-    /// The slot is free iff `done[s] == tail` — i.e. the previous
-    /// consumer at logical position `tail - cap` released it for us
-    /// (or, for the first lap, this is the slot's initial state, since
-    /// `done[s]` is initialized to `s`).
+// SAFETY: Producer holds exclusive write access. The Cell field is only
+// touched by the single producer thread. R is Send, RingBuffer is Sync.
+unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Producer<T, R> {}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
+    pub(super) const fn new_with(queue: R) -> Self {
+        Self {
+            queue,
+            write_pos: std::cell::Cell::new(0),
+        }
+    }
+
+    #[inline]
+    fn ring(&self) -> &RingBuffer<T> {
+        &self.queue
+    }
+
     fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let pos = self.write_pos.get();
 
-        let done = self.queue.done_slot(pos);
+        let done = self.ring().done_slot(pos);
         if done.0.load(Ordering::Acquire) != pos {
             return None;
         }
 
-        let ready = self.queue.ready_slot(pos);
-        let data_ptr = self.queue.data_slot(pos).get();
+        let ready = self.ring().ready_slot(pos);
+        let data_ptr = self.ring().data_slot(pos).get();
 
         self.write_pos.set(pos + 1);
         Some((data_ptr, &ready.0, pos))
     }
 
-    /// Non-mutating check: returns true if `try_claim` would
-    /// currently succeed. Used by `reserve_block` as the pre-park
-    /// gate so we don't construct then drop a `SlotWriter` per
-    /// iteration.
     #[inline]
     fn has_space(&self) -> bool {
         let pos = self.write_pos.get();
-        self.queue.done_slot(pos).0.load(Ordering::Acquire) == pos
+        self.ring().done_slot(pos).0.load(Ordering::Acquire) == pos
     }
 
     /// Pushes a value into the ring buffer.
@@ -64,19 +68,13 @@ impl<T> Producer<T> {
             Some((data_ptr, slot_ready, pos)) => {
                 // SAFETY: We are the sole producer and the slot is free.
                 unsafe { (*data_ptr).write(val) };
-                // Publish: ready[s] = pos + 1 tells the consumer at
-                // logical position `pos` that data is available.
                 slot_ready.store(pos + 1, Ordering::Release);
-                // Consumers Acquire-load `tail` in their pre-FAA peek;
-                // Release ensures they see published slot data.
-                self.queue
+                self.ring()
                     .tail
                     .store(self.write_pos.get(), Ordering::Release);
-                // Wake one consumer parked in pop_block, if any.
-                // Self-gated on a Relaxed load of the bitmap.
-                self.queue.consumer_park.wake_one();
+                self.ring().consumer_park.wake_one();
                 #[cfg(feature = "async")]
-                self.queue.wake_consumer_async();
+                self.ring().wake_consumer_async();
                 Ok(())
             }
             None => Err(val),
@@ -85,14 +83,9 @@ impl<T> Producer<T> {
 
     /// Pushes a value, blocking the calling thread when the ring is
     /// full until a consumer makes space. Returns `Err(val)` only
-    /// when the last [`Consumer`](super::Consumer) has been dropped
-    /// (no consumer left to drain).
-    ///
-    /// Spins via the shared backoff schedule first, then registers
-    /// the producer parker handle and parks. Consumers signal after
-    /// every pop, gated on a single `Relaxed` load.
+    /// when the last [`Consumer`](super::Consumer) has been dropped.
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
-        let q = &*self.queue;
+        let q = self.ring();
         let mut backoff = 0u32;
         loop {
             if q.consumer_closed.0.load(Ordering::Acquire) {
@@ -108,8 +101,6 @@ impl<T> Producer<T> {
             }
 
             let _ = q.producer_parker.set(std::thread::current());
-            // SeqCst pairs with consumer's `producer_parked.load`
-            // after `done.store(Release)`.
             q.producer_parked.0.store(true, Ordering::SeqCst);
 
             if q.consumer_closed.0.load(Ordering::Acquire) {
@@ -131,27 +122,22 @@ impl<T> Producer<T> {
 
     /// Pushes a value asynchronously, yielding to the executor when the
     /// ring is full until a consumer makes space. Returns `Err(val)`
-    /// only when the last consumer has been dropped (no consumer left
-    /// to drain).
-    ///
-    /// The future is cancel-safe: dropping it before completion leaves
-    /// the ring unchanged (the value is moved back out on cancellation).
+    /// only when the last consumer has been dropped.
     #[cfg(feature = "async")]
     #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
     pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
         let mut val = Some(val);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    // Register-then-recheck closes the lost-wake race.
-                    self.queue.producer_waker.register(0, cx);
-                    if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                    self.ring().producer_waker.register(0, cx);
+                    if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {
@@ -178,28 +164,23 @@ impl<T> Producer<T> {
             .map(|(data_ptr, slot_ready, pos)| SlotWriter {
                 slot_data: data_ptr,
                 slot_ready,
-                tail: &self.queue.tail,
+                tail: &self.ring().tail,
                 write_pos: &self.write_pos,
                 pos,
-                queue: &self.queue,
+                queue: self.ring(),
             })
     }
 
     /// Reserves a slot for zero-copy writing, blocking the calling
     /// thread when the ring is full until a consumer makes space.
     /// Returns `None` only when the last
-    /// [`Consumer`](super::Consumer) has been dropped (no consumer
-    /// left to drain).
-    ///
-    /// Same wait protocol as [`push_block`](Self::push_block). Useful
-    /// when you want zero-copy writes plus blocking.
+    /// [`Consumer`](super::Consumer) has been dropped.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
         let mut backoff = 0u32;
         loop {
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                 return None;
             }
-            // Non-mutating gate.
             if self.has_space() {
                 return self.reserve();
             }
@@ -208,53 +189,57 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            let _ = self.queue.producer_parker.set(std::thread::current());
-            self.queue.producer_parked.0.store(true, Ordering::SeqCst);
+            let _ = self.ring().producer_parker.set(std::thread::current());
+            self.ring().producer_parked.0.store(true, Ordering::SeqCst);
 
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
-                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+                self.ring()
+                    .producer_parked
+                    .0
+                    .store(false, Ordering::Relaxed);
                 return None;
             }
             if self.has_space() {
-                self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+                self.ring()
+                    .producer_parked
+                    .0
+                    .store(false, Ordering::Relaxed);
                 return self.reserve();
             }
 
             std::thread::park();
-            self.queue.producer_parked.0.store(false, Ordering::Relaxed);
+            self.ring()
+                .producer_parked
+                .0
+                .store(false, Ordering::Relaxed);
         }
     }
 
     /// Returns the number of items currently in the buffer.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.ring().len()
     }
 
     /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.ring().is_empty()
     }
 
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.queue.is_full()
+        self.ring().is_full()
     }
 }
 
-impl<T> Drop for Producer<T> {
+impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
-        // Mark the queue closed so consumers spinning on overshoot
-        // can return None. Release synchronizes with consumer's
-        // Acquire-load of the closed flag.
-        self.queue.closed.0.store(true, Ordering::Release);
-        // Wake every parked consumer so they can observe `closed`
-        // and exit pop_block.
-        self.queue.consumer_park.flush();
+        self.ring().closed.0.store(true, Ordering::Release);
+        self.ring().consumer_park.flush();
         #[cfg(feature = "async")]
-        self.queue.consumer_waker.flush();
+        self.ring().consumer_waker.flush();
     }
 }
 
@@ -275,17 +260,15 @@ pub struct SlotWriter<'a, T> {
 }
 
 // SAFETY: SlotWriter holds exclusive access to the slot (single producer).
-// The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
+// The raw pointer points into the RingBuffer kept alive by the Producer's
+// reference (Arc or borrow).
 unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
 impl<'a, T> SlotWriter<'a, T> {
     /// Returns a mutable reference to the uninitialized slot memory.
-    ///
-    /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: Single producer has exclusive access. The pointer is valid
-        // because the Producer's Arc keeps the RingBuffer alive.
+        // SAFETY: Single producer has exclusive access.
         unsafe { &mut *self.slot_data }
     }
 
@@ -325,8 +308,6 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        // ready was never written; done was unchanged. Just roll back
-        // the local cursor.
         self.write_pos.set(self.pos);
     }
 }
@@ -346,7 +327,7 @@ pub struct WrittenSlot<'a, T> {
 }
 
 // SAFETY: Same as SlotWriter -- exclusive access to a slot in a RingBuffer
-// kept alive by the Producer's Arc.
+// kept alive by the Producer's reference.
 unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {
@@ -369,10 +350,6 @@ impl<T> Drop for WrittenSlot<'_, T> {
             unsafe {
                 self.slot_data.cast::<T>().drop_in_place();
             }
-            // Slot freeness is gated by `done`, not `ready`. Since we
-            // never published `ready`, no consumer can claim this slot
-            // — but `done[s]` still says `pos`, which is what producer's
-            // try_claim checks. Roll back the local cursor to retry.
             self.write_pos.set(self.pos);
         }
     }

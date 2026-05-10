@@ -173,23 +173,59 @@ impl<T> RingBuffer<T> {
     }
 
     /// Splits the ring buffer into a [`Producer`] and [`Consumer`] pair.
+    ///
+    /// Both handles hold an `Arc` to the ring buffer, so `T` must be
+    /// `'static`. For borrowed data (non-`'static` `T`), use
+    /// [`split_borrowed`](Self::split_borrowed).
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        let producer = Producer {
-            queue: arc.clone(),
-            cached_head: std::cell::Cell::new(0),
-            park_slot: 0,
-        };
+        let producer = Producer::new_with(arc.clone(), 0);
         let consumer = Consumer { queue: arc };
         (producer, consumer)
+    }
+
+    /// Splits a *borrowed* ring buffer into a producer/consumer pair
+    /// whose lifetimes are tied to the ring.
+    ///
+    /// Unlike [`split`](Self::split), the handles hold `&RingBuffer<T>`
+    /// instead of `Arc<RingBuffer<T>>`. This lets `T` carry lifetimes
+    /// shorter than `'static`.
+    ///
+    /// The returned producer is not `Clone`. Create additional producers
+    /// via [`new_producer`](Self::new_producer).
+    #[must_use]
+    pub const fn split_borrowed(&self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+        let producer = Producer::new_with(self, 0);
+        let consumer = Consumer { queue: self };
+        (producer, consumer)
+    }
+
+    /// Creates an additional borrowed producer handle.
+    ///
+    /// Use this instead of `Clone` when working with borrowed splits,
+    /// since `Clone` requires `Arc`.
+    pub fn new_producer(&self) -> Producer<T, &Self> {
+        self.producer_count.fetch_add(1, Ordering::Relaxed);
+        let park_idx = self
+            .producer_park_idx
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        Producer::new_with(self, park_idx & crate::common::park::PARK_MASK)
     }
 }
 
 impl<T> RingBuffer<T> {
-    /// Wakes the single parked consumer, if any. Gated internally on
-    /// `consumer_parked.load(Relaxed) != 0` for the no-cost fast
-    /// path.
+    /// Wakes the single parked consumer, if any. Gated on a `Relaxed`
+    /// load of `consumer_parked` so the no-park hot path stays
+    /// branch-free in the common case.
+    ///
+    /// Soundness depends on the caller having performed a `SeqCst`
+    /// commit on `tail` (in `push`/commit) before calling this. That
+    /// store and the consumer's `SeqCst` store of `consumer_parked = true`
+    /// in `pop_block`/`pop_ref_block` form a Dekker pair: either the
+    /// consumer observes the new `tail` in its post-store re-check and
+    /// skips parking, or we observe `parked == true` here and unpark.
     ///
     /// Idempotent: clearing the flag means any racing producer that
     /// observes it already cleared simply skips the unpark. The
@@ -199,7 +235,7 @@ impl<T> RingBuffer<T> {
     /// consumer re-checks the queue after every wake).
     #[inline]
     pub(crate) fn wake_consumer(&self) {
-        if !self.consumer_parked.0.load(Ordering::Relaxed) {
+        if !self.consumer_parked.0.load(Ordering::SeqCst) {
             return;
         }
         // Clear the flag first so concurrent producers all skip past it.
@@ -1449,5 +1485,112 @@ mod tests {
             assert_eq!(producer.push_async(99).await, Err(99));
         }));
         h.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Borrowed split (non-'static T)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn borrowed_split_push_pop() {
+        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let (producer, mut consumer) = ring.split_borrowed();
+
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn borrowed_split_non_static_lifetime() {
+        let wire_buf = vec![10u8, 20, 30, 40];
+        let ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
+        let (producer, mut consumer) = ring.split_borrowed();
+
+        producer.push(&wire_buf[0..2]).unwrap();
+        producer.push(&wire_buf[2..4]).unwrap();
+
+        assert_eq!(consumer.pop().unwrap(), &[10, 20]);
+        assert_eq!(consumer.pop().unwrap(), &[30, 40]);
+    }
+
+    #[test]
+    fn borrowed_split_multiple_producers() {
+        let ring = RingBuffer::<u32>::new(Capacity::exact(8));
+        let (p1, mut consumer) = ring.split_borrowed();
+        let p2 = ring.new_producer();
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for i in 0..4u32 {
+                    while p1.push(i).is_err() {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            s.spawn(move || {
+                for i in 100..104u32 {
+                    while p2.push(i).is_err() {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+            s.spawn(move || {
+                let mut got = Vec::new();
+                while got.len() < 8 {
+                    if let Some(v) = consumer.pop() {
+                        got.push(v);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                got.sort_unstable();
+                assert_eq!(got, vec![0, 1, 2, 3, 100, 101, 102, 103]);
+            });
+        });
+    }
+
+    #[test]
+    fn borrowed_split_struct_with_lifetime() {
+        #[derive(Debug, PartialEq)]
+        struct Req<'a> {
+            payload: &'a [u8],
+            kind: u8,
+        }
+
+        let wire = vec![0xBB; 128];
+        let ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
+        let (producer, mut consumer) = ring.split_borrowed();
+        let wire_ref = &wire;
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                producer
+                    .push(Req {
+                        payload: &wire_ref[..64],
+                        kind: 1,
+                    })
+                    .unwrap();
+                producer
+                    .push(Req {
+                        payload: &wire_ref[64..],
+                        kind: 2,
+                    })
+                    .unwrap();
+            });
+            s.spawn(move || {
+                let mut got = Vec::new();
+                while got.len() < 2 {
+                    if let Some(req) = consumer.pop() {
+                        got.push(req.kind);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                assert_eq!(got, vec![1, 2]);
+            });
+        });
     }
 }
