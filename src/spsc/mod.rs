@@ -1189,4 +1189,39 @@ mod tests {
             });
         });
     }
+
+    #[test]
+    fn borrowed_split_multi_lifetime_struct() {
+        #[derive(Debug)]
+        struct Req<'a, 'b> {
+            ops: &'a [u32],
+            out: &'b mut Vec<u32>,
+        }
+
+        // Both sources declared before the ring — both outlive it.
+        let ops = vec![1u32, 2, 3];
+        let mut results = Vec::new();
+
+        // The ring and both handles must drop before we can read
+        // `results` again — the &mut borrow is live for the ring's
+        // lifetime. Scoping achieves this.
+        {
+            let ring = RingBuffer::<Req<'_, '_>>::new(Capacity::exact(4));
+            let (producer, mut consumer) = ring.split_borrowed();
+
+            producer
+                .push(Req {
+                    ops: &ops,
+                    out: &mut results,
+                })
+                .unwrap();
+
+            let req = consumer.pop().unwrap();
+            for &op in req.ops {
+                req.out.push(op * 10);
+            }
+        }
+        // Ring dropped — mutable borrow released.
+        assert_eq!(results, vec![10, 20, 30]);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "quetzalcoatl"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 authors = ["quetzalcoatl contributors"]
 description = "Lock-free ring buffers (SPSC, MPSC, SPMC, MPMC, and broadcast) for high-performance concurrent communication"
@@ -66,3 +66,8 @@ harness = false
 [[bench]]
 name = "mpmc"
 harness = false
+
+[dev-dependencies]
+anyhow = "1.0.102"
+io-uring = "0.7.12"
+libc = "0.2.186"
