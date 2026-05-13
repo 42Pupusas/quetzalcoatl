@@ -25,12 +25,15 @@
 //! - `egress=slow`: egress does ~500ns of black-box CPU work per item.
 //!   Models real fan-out logic (routing, hashing, light parsing).
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use divan::black_box;
 use quetzalcoatl::capacity::Capacity;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+
+fn main() {
+    divan::main();
+}
 
 /// Items pushed by each producer thread.
 const ITEMS_PER_PRODUCER: u64 = 10_000;
@@ -52,7 +55,7 @@ fn slow_work(seed: u64) -> u64 {
     x
 }
 
-/// Round up `total` to next power of two ≥ `min_per_ring`. Ensures each
+/// Round up `total` to next power of two >= `min_per_ring`. Ensures each
 /// ring satisfies `Capacity::exact`'s power-of-two requirement while
 /// keeping total buffering close to TOTAL_CAPACITY.
 fn shard_cap(total: usize, n_rings: usize) -> Capacity {
@@ -64,7 +67,7 @@ fn shard_cap(total: usize, n_rings: usize) -> Capacity {
 // Variant A: MPMC — P producers, Q consumers, one ring.
 // ---------------------------------------------------------------------------
 
-fn run_mpmc(p: usize, q: usize) -> Duration {
+fn run_mpmc(p: usize, q: usize) {
     use quetzalcoatl::mpmc::RingBuffer;
 
     let total_items = (p as u64) * ITEMS_PER_PRODUCER;
@@ -107,14 +110,12 @@ fn run_mpmc(p: usize, q: usize) -> Duration {
         .collect();
     drop(producer);
 
-    let start = std::time::Instant::now();
     for h in producers {
         h.join().unwrap();
     }
     for h in consumers {
         h.join().unwrap();
     }
-    start.elapsed()
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ fn run_mpmc(p: usize, q: usize) -> Duration {
 // P producers → P SPSC rings → 1 egress thread → Q SPMC rings → Q consumers.
 // ---------------------------------------------------------------------------
 
-fn run_n_spmc(p: usize, q: usize, slow: bool) -> Duration {
+fn run_n_spmc(p: usize, q: usize, slow: bool) {
     use quetzalcoatl::spmc::RingBuffer as SpmcRing;
     use quetzalcoatl::spsc::RingBuffer as SpscRing;
 
@@ -236,7 +237,6 @@ fn run_n_spmc(p: usize, q: usize, slow: bool) -> Duration {
         })
         .collect();
 
-    let start = std::time::Instant::now();
     for h in producer_handles {
         h.join().unwrap();
     }
@@ -244,61 +244,62 @@ fn run_n_spmc(p: usize, q: usize, slow: bool) -> Duration {
     for h in consumer_handles {
         h.join().unwrap();
     }
-    start.elapsed()
 }
 
 // ---------------------------------------------------------------------------
-// Criterion harness
+// Shape wrapper for parameterized benchmarks.
 // ---------------------------------------------------------------------------
 
-fn bench_mpmc_vs_n_spmc(c: &mut Criterion) {
-    // Representative shapes: balanced, producer-heavy, consumer-heavy.
-    let shapes: &[(usize, usize)] = &[(2, 2), (4, 4), (8, 8), (4, 2), (2, 4)];
+/// (producers, consumers) shape — wraps a tuple so divan can display it.
+#[derive(Clone, Copy)]
+struct Shape(usize, usize);
 
-    for &(p, q) in shapes {
-        let label = format!("p{p}_q{q}");
+impl std::fmt::Display for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "p{}_q{}", self.0, self.1)
+    }
+}
+
+const SHAPES: &[Shape] = &[
+    Shape(2, 2),
+    Shape(4, 4),
+    Shape(8, 8),
+    Shape(4, 2),
+    Shape(2, 4),
+];
+
+// ---------------------------------------------------------------------------
+// Benchmark group: MPMC vs N-SPMC (with egress fan-out).
+// ---------------------------------------------------------------------------
+
+mod mpmc_vs_nspmc {
+    use super::*;
+
+    #[divan::bench(args = SHAPES, sample_count = 20, sample_size = 1)]
+    fn mpmc(bencher: divan::Bencher, shape: &Shape) {
+        let Shape(p, q) = *shape;
         let total_items = (p as u64) * ITEMS_PER_PRODUCER;
+        bencher
+            .counter(divan::counter::ItemsCount::new(total_items))
+            .bench(|| run_mpmc(p, q));
+    }
 
-        let mut group = c.benchmark_group(format!("mpmc_vs_nspmc/{label}"));
-        group.sample_size(20);
-        group.measurement_time(Duration::from_secs(3));
-        group.throughput(Throughput::Elements(total_items));
+    #[divan::bench(args = SHAPES, sample_count = 20, sample_size = 1)]
+    fn n_spmc_quick(bencher: divan::Bencher, shape: &Shape) {
+        let Shape(p, q) = *shape;
+        let total_items = (p as u64) * ITEMS_PER_PRODUCER;
+        bencher
+            .counter(divan::counter::ItemsCount::new(total_items))
+            .bench(|| run_n_spmc(p, q, false));
+    }
 
-        group.bench_with_input(BenchmarkId::new("mpmc", "quick"), &(p, q), |b, &(p, q)| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    total += run_mpmc(p, q);
-                }
-                total
-            });
-        });
-
-        group.bench_with_input(
-            BenchmarkId::new("n_spmc", "quick"),
-            &(p, q),
-            |b, &(p, q)| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        total += run_n_spmc(p, q, false);
-                    }
-                    total
-                });
-            },
-        );
-
-        group.bench_with_input(BenchmarkId::new("n_spmc", "slow"), &(p, q), |b, &(p, q)| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    total += run_n_spmc(p, q, true);
-                }
-                total
-            });
-        });
-
-        group.finish();
+    #[divan::bench(args = SHAPES, sample_count = 20, sample_size = 1)]
+    fn n_spmc_slow(bencher: divan::Bencher, shape: &Shape) {
+        let Shape(p, q) = *shape;
+        let total_items = (p as u64) * ITEMS_PER_PRODUCER;
+        bencher
+            .counter(divan::counter::ItemsCount::new(total_items))
+            .bench(|| run_n_spmc(p, q, true));
     }
 }
 
@@ -321,31 +322,30 @@ impl LargeStruct {
     }
 }
 
-fn bench_large_struct_mpmc(c: &mut Criterion) {
+mod large_struct_mpmc {
+    use super::*;
     use quetzalcoatl::mpmc::RingBuffer;
 
-    let mut group = c.benchmark_group("large_struct_mpmc");
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(3));
-    let total_items = 10_000u64;
-    group.throughput(Throughput::Elements(total_items));
+    const TOTAL_ITEMS: u64 = 10_000;
 
-    group.bench_function("2kb_copy", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn copy_2kb(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| {
                 let (producer, consumer) =
                     RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-                let start = std::time::Instant::now();
+
                 let producer_handle = thread::spawn(move || {
-                    for i in 0..total_items {
+                    for i in 0..TOTAL_ITEMS {
                         while producer.push(black_box(LargeStruct::new(i as u8))).is_err() {
                             std::hint::spin_loop();
                         }
                     }
                 });
+
                 let mut received = 0u64;
-                while received < total_items {
+                while received < TOTAL_ITEMS {
                     if consumer.pop().is_some() {
                         received += 1;
                     } else {
@@ -353,21 +353,19 @@ fn bench_large_struct_mpmc(c: &mut Criterion) {
                     }
                 }
                 producer_handle.join().unwrap();
-                total += start.elapsed();
-            }
-            total
-        });
-    });
+            });
+    }
 
-    group.bench_function("2kb_zero_copy", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn zero_copy_2kb(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| {
                 let (mut producer, mut consumer) =
                     RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
-                let start = std::time::Instant::now();
+
                 let producer_handle = thread::spawn(move || {
-                    for i in 0..total_items {
+                    for i in 0..TOTAL_ITEMS {
                         loop {
                             if let Some(w) = producer.reserve() {
                                 w.write(black_box(LargeStruct::new(i as u8))).commit();
@@ -377,8 +375,9 @@ fn bench_large_struct_mpmc(c: &mut Criterion) {
                         }
                     }
                 });
+
                 let mut received = 0u64;
-                while received < total_items {
+                while received < TOTAL_ITEMS {
                     if let Some(reader) = consumer.pop_ref() {
                         black_box(&*reader);
                         received += 1;
@@ -387,13 +386,8 @@ fn bench_large_struct_mpmc(c: &mut Criterion) {
                     }
                 }
                 producer_handle.join().unwrap();
-                total += start.elapsed();
-            }
-            total
-        });
-    });
-
-    group.finish();
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,30 +398,29 @@ fn bench_large_struct_mpmc(c: &mut Criterion) {
 // saturation; idle-CPU savings are not measured here (see examples/mpmc_block.rs).
 // ---------------------------------------------------------------------------
 
-fn bench_blocking_mpmc(c: &mut Criterion) {
+mod blocking_mpmc {
+    use super::*;
     use quetzalcoatl::mpmc::RingBuffer;
 
-    let mut group = c.benchmark_group("blocking_mpmc");
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(3));
-    let p_count = 2u64;
-    let q_count = 2usize;
-    let per_p = 5_000u64;
-    let total_items = p_count * per_p;
-    group.throughput(Throughput::Elements(total_items));
+    const P_COUNT: u64 = 2;
+    const Q_COUNT: usize = 2;
+    const PER_P: u64 = 5_000;
+    const TOTAL_ITEMS: u64 = P_COUNT * PER_P;
 
-    group.bench_function("spin", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn spin(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| {
                 let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
                 let received = Arc::new(AtomicUsize::new(0));
-                let consumers: Vec<_> = (0..q_count)
+
+                let consumers: Vec<_> = (0..Q_COUNT)
                     .map(|_| {
                         let c = consumer.clone();
                         let r = received.clone();
                         thread::spawn(move || {
-                            while r.load(Ordering::Relaxed) < total_items as usize {
+                            while r.load(Ordering::Relaxed) < TOTAL_ITEMS as usize {
                                 if let Some(v) = c.pop() {
                                     black_box(slow_work(v));
                                     r.fetch_add(1, Ordering::Relaxed);
@@ -440,13 +433,12 @@ fn bench_blocking_mpmc(c: &mut Criterion) {
                     .collect();
                 drop(consumer);
 
-                let start = std::time::Instant::now();
-                let producers: Vec<_> = (0..p_count)
+                let producers: Vec<_> = (0..P_COUNT)
                     .map(|tid| {
                         let p = producer.clone();
                         thread::spawn(move || {
-                            for i in 0..per_p {
-                                while p.push(tid * per_p + i).is_err() {
+                            for i in 0..PER_P {
+                                while p.push(tid * PER_P + i).is_err() {
                                     std::hint::spin_loop();
                                 }
                             }
@@ -454,24 +446,24 @@ fn bench_blocking_mpmc(c: &mut Criterion) {
                     })
                     .collect();
                 drop(producer);
+
                 for h in producers {
                     h.join().unwrap();
                 }
                 for h in consumers {
                     h.join().unwrap();
                 }
-                total += start.elapsed();
-            }
-            total
-        });
-    });
+            });
+    }
 
-    group.bench_function("block", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn block(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| {
                 let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
-                let consumers: Vec<_> = (0..q_count)
+
+                let consumers: Vec<_> = (0..Q_COUNT)
                     .map(|_| {
                         let c = consumer.clone();
                         thread::spawn(move || {
@@ -486,18 +478,18 @@ fn bench_blocking_mpmc(c: &mut Criterion) {
                     .collect();
                 drop(consumer);
 
-                let start = std::time::Instant::now();
-                let producers: Vec<_> = (0..p_count)
+                let producers: Vec<_> = (0..P_COUNT)
                     .map(|tid| {
                         let p = producer.clone();
                         thread::spawn(move || {
-                            for i in 0..per_p {
-                                p.push_block(tid * per_p + i).expect("consumers dropped");
+                            for i in 0..PER_P {
+                                p.push_block(tid * PER_P + i).expect("consumers dropped");
                             }
                         })
                     })
                     .collect();
                 drop(producer);
+
                 for h in producers {
                     h.join().unwrap();
                 }
@@ -505,14 +497,9 @@ fn bench_blocking_mpmc(c: &mut Criterion) {
                 for h in consumers {
                     sum += h.join().unwrap();
                 }
-                assert_eq!(sum, total_items);
-                total += start.elapsed();
-            }
-            total
-        });
-    });
-
-    group.finish();
+                assert_eq!(sum, TOTAL_ITEMS);
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -520,26 +507,24 @@ fn bench_blocking_mpmc(c: &mut Criterion) {
 // contention. 2P x 2C, small ring (16), 2KB items.
 // ---------------------------------------------------------------------------
 
-fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
+mod large_struct_mpmc_zero_copy_blocking {
+    use super::*;
     use quetzalcoatl::mpmc::RingBuffer;
 
-    let mut group = c.benchmark_group("large_struct_mpmc_zero_copy_blocking");
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(3));
-    let p_count = 2u64;
-    let q_count = 2usize;
-    let per_p = 2_500u64;
-    let total_items = p_count * per_p;
-    group.throughput(Throughput::Elements(total_items));
+    const P_COUNT: u64 = 2;
+    const Q_COUNT: usize = 2;
+    const PER_P: u64 = 2_500;
+    const TOTAL_ITEMS: u64 = P_COUNT * PER_P;
 
-    group.bench_function("2kb_items", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn items_2kb(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| {
                 let (producer, consumer) =
                     RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
 
-                let consumers: Vec<_> = (0..q_count)
+                let consumers: Vec<_> = (0..Q_COUNT)
                     .map(|_| {
                         let mut c = consumer.clone();
                         thread::spawn(move || {
@@ -554,12 +539,11 @@ fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
                     .collect();
                 drop(consumer);
 
-                let start = std::time::Instant::now();
-                let producers: Vec<_> = (0..p_count)
+                let producers: Vec<_> = (0..P_COUNT)
                     .map(|_| {
                         let mut p = producer.clone();
                         thread::spawn(move || {
-                            for i in 0..per_p {
+                            for i in 0..PER_P {
                                 let w = p.reserve_block().expect("consumers dropped");
                                 w.write(black_box(LargeStruct::new(i as u8))).commit();
                             }
@@ -567,6 +551,7 @@ fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
                     })
                     .collect();
                 drop(producer);
+
                 for h in producers {
                     h.join().unwrap();
                 }
@@ -574,13 +559,9 @@ fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
                 for h in consumers {
                     sum += h.join().unwrap();
                 }
-                assert_eq!(sum, total_items);
-                total += start.elapsed();
-            }
-            total
-        });
-    });
-    group.finish();
+                assert_eq!(sum, TOTAL_ITEMS);
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,8 +574,7 @@ fn bench_large_struct_mpmc_zero_copy_blocking(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "async")]
-fn run_async_mpmc_bench(
-    b: &mut criterion::Bencher,
+fn run_async_mpmc(
     cap: usize,
     p_count: u64,
     c_count: usize,
@@ -604,105 +584,78 @@ fn run_async_mpmc_bench(
     use quetzalcoatl::mpmc::RingBuffer;
 
     let total_items = p_count * per_p;
-    b.iter_custom(|iters| {
-        let mut total = Duration::ZERO;
-        for _ in 0..iters {
-            let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
-            let received = Arc::new(AtomicUsize::new(0));
-            let start = std::time::Instant::now();
+    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+    let received = Arc::new(AtomicUsize::new(0));
 
-            let consumer_threads: Vec<_> = (0..c_count)
-                .map(|_| {
-                    let c = consumer.clone();
-                    let received = received.clone();
-                    thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .build()
-                            .unwrap();
-                        let local = tokio::task::LocalSet::new();
-                        rt.block_on(local.run_until(async move {
-                            while let Some(v) = c.pop_async().await {
-                                black_box(consumer_work(v));
-                                received.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }));
-                    })
-                })
-                .collect();
-            drop(consumer);
+    let consumer_threads: Vec<_> = (0..c_count)
+        .map(|_| {
+            let c = consumer.clone();
+            let received = received.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                rt.block_on(local.run_until(async move {
+                    while let Some(v) = c.pop_async().await {
+                        black_box(consumer_work(v));
+                        received.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            })
+        })
+        .collect();
+    drop(consumer);
 
-            let producer_threads: Vec<_> = (0..p_count)
-                .map(|tid| {
-                    let p = producer.clone();
-                    thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .build()
-                            .unwrap();
-                        let local = tokio::task::LocalSet::new();
-                        rt.block_on(local.run_until(async move {
-                            for i in 0..per_p {
-                                p.push_async(tid * per_p + i)
-                                    .await
-                                    .expect("all consumers dropped");
-                            }
-                        }));
-                    })
-                })
-                .collect();
-            drop(producer);
+    let producer_threads: Vec<_> = (0..p_count)
+        .map(|tid| {
+            let p = producer.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let local = tokio::task::LocalSet::new();
+                rt.block_on(local.run_until(async move {
+                    for i in 0..per_p {
+                        p.push_async(tid * per_p + i)
+                            .await
+                            .expect("all consumers dropped");
+                    }
+                }));
+            })
+        })
+        .collect();
+    drop(producer);
 
-            for h in producer_threads {
-                h.join().unwrap();
-            }
-            for h in consumer_threads {
-                h.join().unwrap();
-            }
-            assert_eq!(received.load(Ordering::Relaxed), total_items as usize);
-            total += start.elapsed();
-        }
-        total
-    });
+    for h in producer_threads {
+        h.join().unwrap();
+    }
+    for h in consumer_threads {
+        h.join().unwrap();
+    }
+    assert_eq!(received.load(Ordering::Relaxed), total_items as usize);
 }
 
 #[cfg(feature = "async")]
-fn bench_async_mpmc(c: &mut Criterion) {
-    let mut group = c.benchmark_group("blocking_mpmc");
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(3));
-    let p_count = 2u64;
-    let q_count = 2usize;
-    let per_p = 5_000u64;
-    let total_items = p_count * per_p;
-    group.throughput(Throughput::Elements(total_items));
+mod async_mpmc {
+    use super::*;
 
-    group.bench_function("async_saturated", |b| {
-        run_async_mpmc_bench(b, 16, p_count, q_count, per_p, slow_work);
-    });
+    const P_COUNT: u64 = 2;
+    const Q_COUNT: usize = 2;
+    const PER_P: u64 = 5_000;
+    const TOTAL_ITEMS: u64 = P_COUNT * PER_P;
 
-    group.bench_function("async_unsaturated", |b| {
-        run_async_mpmc_bench(b, 4096, p_count, q_count, per_p, |v| v);
-    });
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn async_saturated(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| run_async_mpmc(16, P_COUNT, Q_COUNT, PER_P, slow_work));
+    }
 
-    group.finish();
+    #[divan::bench(sample_count = 20, sample_size = 1)]
+    fn async_unsaturated(bencher: divan::Bencher) {
+        bencher
+            .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
+            .bench(|| run_async_mpmc(4096, P_COUNT, Q_COUNT, PER_P, |v| v));
+    }
 }
-
-#[cfg(not(feature = "async"))]
-criterion_group!(
-    benches,
-    bench_mpmc_vs_n_spmc,
-    bench_large_struct_mpmc,
-    bench_blocking_mpmc,
-    bench_large_struct_mpmc_zero_copy_blocking,
-);
-
-#[cfg(feature = "async")]
-criterion_group!(
-    benches,
-    bench_mpmc_vs_n_spmc,
-    bench_large_struct_mpmc,
-    bench_blocking_mpmc,
-    bench_large_struct_mpmc_zero_copy_blocking,
-    bench_async_mpmc,
-);
-
-criterion_main!(benches);
