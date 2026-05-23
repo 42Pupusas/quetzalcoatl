@@ -22,8 +22,11 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 
 - **Lock-free** — no mutexes, only atomic FAA / Acquire-Release
 - **Zero dependencies** — pure `std` implementation
-- **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side (SPSC/MPSC/SPMC/broadcast)
-- **Blocking variants** — `mpmc::Producer::push_block` and `mpmc::Consumer::pop_block` park on backpressure instead of forcing the caller to spin
+- **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side (all five variants)
+- **Blocking variants** — `push_block` / `pop_block` / `reserve_block` / `pop_ref_block` across all rings (except broadcast) park on backpressure instead of forcing the caller to spin
+- **Async variants** — `push_async` / `pop_async` across all five variants (behind the `async` feature flag) integrate with any `Waker`-based executor
+- **Borrowed split** — `split_borrowed()` on SPSC/MPSC/SPMC lets the ring buffer own the storage while handing out `&`-tied producer/consumer handles, removing the `'static` bound on `T` for zero-copy APIs
+- **Batch drain** — `drain()` / `drain_up_to()` / `drain_block()` amortize cache-line invalidations across the batch (O(1) per batch, not per item)
 - **Compile-time tuning** — `mpmc::Config` trait + `Cfg<B, S, F>` helper let you customize batch / scan / flush behavior at the type level
 - **Sound by construction** — `commit()` is only available on `WrittenSlot` (after `write()`), so safe code cannot cause UB
 - **Miri-tested** — validated under Miri for undefined-behavior and data-race detection
@@ -33,7 +36,14 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.8"
+quetzalcoatl = "0.11"
+```
+
+To enable async support:
+
+```toml
+[dependencies]
+quetzalcoatl = { version = "0.11", features = ["async"] }
 ```
 
 ## Quick start
@@ -252,7 +262,7 @@ assert_eq!(arc2[0], 0xAB);
 
 ## Zero-copy API
 
-All four variants support a zero-copy path using a **typestate pattern**
+All five variants support a zero-copy path using a **typestate pattern**
 that enforces correctness at compile time:
 
 ```rust
@@ -307,9 +317,9 @@ The type system guarantees soundness:
 - O(1) push and pop — FAA for MPSC/broadcast producers (no retry loops),
   CAS for SPMC consumers
 - Fixed-size buffer — no allocations on the hot path
-- `drain()` / `drain_up_to()` on MPSC amortize the head-pointer update
-  for batch consumption (O(1) cache-line invalidations per batch instead
-  of per item)
+- `drain()` / `drain_up_to()` / `drain_block()` across all rings amortize
+  the head-pointer update for batch consumption (O(1) cache-line
+  invalidations per batch instead of per item)
 - Two-level `min_head` cache in broadcast avoids O(N) consumer scans
 
 Run benchmarks:
@@ -341,11 +351,16 @@ Full API docs: [docs.rs/quetzalcoatl](https://docs.rs/quetzalcoatl)
 See the [`examples/`](examples/) directory:
 
 ```bash
-cargo run --example basic       # SPSC basics
-cargo run --example mpsc        # Multi-producer concurrent example
-cargo run --example dynamic     # Dynamic producer creation pattern
-cargo run --example broadcast   # Broadcast pub/sub
-cargo run --example debug_spmc  # SPMC work distribution
+cargo run --example basic        # SPSC basics
+cargo run --example mpsc         # Multi-producer concurrent example
+cargo run --example dynamic      # Dynamic producer creation pattern
+cargo run --example broadcast    # Broadcast pub/sub
+cargo run --example debug_spmc   # SPMC work distribution
+cargo run --example mpmc_block   # MPMC push/pop × spin/block comparison
+cargo run --example mpmc_perf    # MPMC single-shot throughput
+cargo run --example mpmc_long    # MPMC per-iteration distribution
+cargo run --example mpmc_pinned  # MPMC with CPU-affinity strategies
+cargo run --example io_uring_recv # io_uring integration (Linux only)
 ```
 
 ## License
