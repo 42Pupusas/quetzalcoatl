@@ -160,6 +160,15 @@ impl<T> RingBuffer<T> {
         self.len() == self.cap
     }
 
+    /// Externally closes the ring, causing any blocked `pop_block` to
+    /// return `None`. Subsequent pushes are silently dropped.
+    pub fn close(&self) {
+        self.closed.0.store(true, Ordering::Release);
+        self.wake_consumer();
+        #[cfg(feature = "async")]
+        self.consumer_waker.flush();
+    }
+
     /// Returns a reference to the slot at logical position `pos`.
     ///
     /// Single point of unsafety: `pos & mask` is always `< cap == buf.len()`
