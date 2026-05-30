@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`spsc::RingBuffer::{producer_from_raw, consumer_from_raw}`** — `unsafe`
+  constructors that reconstitute a `Producer` / `Consumer` from a
+  `*const RingBuffer<T>`. This is the cross-address-space seam for memory
+  shared between contexts that don't share a Rust allocator — e.g. a
+  WebAssembly main thread and a Web Worker instantiated against the same
+  `WebAssembly.Memory`, where neither `split` (`Arc`) nor `split_borrowed`
+  (`&` lifetime) can bridge. The handle borrows the ring for `'static`; the
+  caller must pin the ring for the program (e.g. `Box::leak`) and uphold the
+  SPSC contract (exactly one producer and one consumer) across the boundary.
+  See the safety docs on each method.
+
 ### Fixed
 - **`mpmc::push_block` / `pop_block` saturated deadlock** —
   three independent fixes; all three are needed for the bench

@@ -272,6 +272,59 @@ impl<T> RingBuffer<T> {
         };
         (producer, consumer)
     }
+
+    /// Reconstructs a producer handle from a raw pointer to a ring buffer.
+    ///
+    /// This is the cross-address-space seam: when the `RingBuffer` lives in
+    /// memory shared between two execution contexts that do **not** share a
+    /// Rust allocator — most notably a WebAssembly main thread and a Web
+    /// Worker instantiated against the *same* `WebAssembly.Memory` — neither
+    /// `split` (needs `Arc`, whose refcount the other side can't see safely)
+    /// nor `split_borrowed` (needs a Rust `&` with a provable lifetime) can
+    /// bridge it. Each side instead reconstitutes its own handle from the
+    /// shared address via [`producer_from_raw`](Self::producer_from_raw) /
+    /// [`consumer_from_raw`](Self::consumer_from_raw).
+    ///
+    /// The handle borrows the ring for `'static`, which is sound only because
+    /// the caller pins the ring for the whole program (e.g. `Box::leak`).
+    ///
+    /// # Safety
+    /// The caller must guarantee all of:
+    /// - `ptr` points to a live, initialized `RingBuffer<T>` that remains
+    ///   valid and at this exact address for `'static` (never moved, never
+    ///   dropped) — `Box::leak` satisfies this.
+    /// - The pointed-to memory is genuinely shared with the other context
+    ///   (same `WebAssembly.Memory` / `SharedArrayBuffer`), so atomic
+    ///   operations on the cursors are coherent across both.
+    /// - The SPSC contract holds across the boundary: **exactly one** producer
+    ///   handle and **exactly one** consumer handle exist for this ring, each
+    ///   used from a single context. Reconstructing two producers, or using a
+    ///   handle from more than one thread, is undefined behavior.
+    #[must_use]
+    pub const unsafe fn producer_from_raw(ptr: *const Self) -> Producer<T, &'static Self> {
+        // SAFETY: caller guarantees `ptr` is a live `'static` ring (contract above).
+        let queue: &'static Self = unsafe { &*ptr };
+        Producer::new_with(queue)
+    }
+
+    /// Reconstructs a consumer handle from a raw pointer to a ring buffer.
+    ///
+    /// The consumer counterpart to [`producer_from_raw`](Self::producer_from_raw);
+    /// see it for the cross-address-space rationale.
+    ///
+    /// # Safety
+    /// Same contract as [`producer_from_raw`](Self::producer_from_raw): `ptr`
+    /// must be a live, `'static`, genuinely-shared `RingBuffer<T>`, and exactly
+    /// one consumer (and one producer) handle may exist for it.
+    #[must_use]
+    pub const unsafe fn consumer_from_raw(ptr: *const Self) -> Consumer<T, &'static Self> {
+        // SAFETY: caller guarantees `ptr` is a live `'static` ring (contract above).
+        let queue: &'static Self = unsafe { &*ptr };
+        Consumer {
+            queue,
+            cached_tail: std::cell::Cell::new(0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1063,6 +1116,64 @@ mod tests {
     // -----------------------------------------------------------------------
     // Borrowed split (non-'static T)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Raw-pointer split (cross-address-space seam, e.g. wasm shared memory)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn raw_split_push_pop() {
+        // Mirrors the shared-memory usage: leak the ring so it's `'static`,
+        // then reconstruct producer and consumer independently from its
+        // address (as the worker and main thread each would).
+        let ring: &'static RingBuffer<u32> =
+            Box::leak(Box::new(RingBuffer::new(Capacity::exact(4))));
+        let ptr = std::ptr::from_ref(ring);
+
+        // SAFETY: `ring` is leaked (`'static`, never moved/dropped); we make
+        // exactly one producer and one consumer, each used on this thread.
+        let producer = unsafe { RingBuffer::producer_from_raw(ptr) };
+        let mut consumer = unsafe { RingBuffer::consumer_from_raw(ptr) };
+
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    #[test]
+    fn raw_split_cross_thread() {
+        // The handles travel to a separate thread, as producer and consumer
+        // would live in separate execution contexts sharing the ring's memory.
+        let ring: &'static RingBuffer<u64> =
+            Box::leak(Box::new(RingBuffer::new(Capacity::exact(4))));
+        let ptr = std::ptr::from_ref(ring) as usize; // pointer crosses as bits
+        let n = 256u64;
+
+        let handle = std::thread::spawn(move || {
+            // SAFETY: single producer, leaked `'static` ring at `ptr`.
+            let producer = unsafe { RingBuffer::<u64>::producer_from_raw(ptr as *const _) };
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        // SAFETY: single consumer, same leaked ring.
+        let mut consumer = unsafe { RingBuffer::<u64>::consumer_from_raw(ptr as *const _) };
+        let mut received = 0u64;
+        while received < n {
+            if let Some(v) = consumer.pop() {
+                assert_eq!(v, received);
+                received += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        handle.join().unwrap();
+    }
 
     #[test]
     fn borrowed_split_push_pop() {
