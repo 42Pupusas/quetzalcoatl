@@ -121,10 +121,15 @@ fn main() -> anyhow::Result<()> {
         }])?;
     }
 
-    // Build the SQE: recv into registered buffer index 0.
+    // Build the SQE: read into registered buffer index 0. io_uring has no
+    // dedicated "recv into a fixed buffer" opcode, but READ_FIXED reads from
+    // any fd — including a connected stream socket — straight into a buffer
+    // registered via `register_buffers`, which is exactly the kernel-DMA-
+    // into-our-slot story this POC demonstrates. The offset (0) is ignored
+    // for sockets.
     slot.mark_kernel_owned();
 
-    let recv_e = opcode::RecvFixed::new(
+    let recv_e = opcode::ReadFixed::new(
         types::Fd(fd),
         slot.as_ptr(),
         BUF_SIZE as u32,
