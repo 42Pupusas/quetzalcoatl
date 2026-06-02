@@ -72,6 +72,22 @@ impl<T: Send + Sync> ArcProducer<T> {
         })
     }
 
+    /// Pushes a value, wrapping it in `Arc` internally and blocking the
+    /// calling thread when the ring is full until a consumer advances.
+    /// Returns `Err(val)` only when all consumers have been dropped.
+    ///
+    /// See [`super::Producer::push_block`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Arc` unwrap fails (should never happen).
+    pub fn push_block(&self, val: T) -> Result<(), T> {
+        self.0.push_block(Arc::new(val)).map_err(|arc| {
+            // SAFETY: We just created this Arc with refcount 1.
+            Arc::try_unwrap(arc).ok().expect("Arc refcount should be 1")
+        })
+    }
+
     /// Reserves a slot for zero-copy writing.
     ///
     /// Returns `None` if the buffer is full. On success, returns an
@@ -79,6 +95,16 @@ impl<T: Send + Sync> ArcProducer<T> {
     #[must_use]
     pub fn reserve(&mut self) -> Option<ArcSlotWriter<'_, T>> {
         self.0.reserve().map(|w| ArcSlotWriter { inner: w })
+    }
+
+    /// Reserves a slot for zero-copy writing, blocking the calling
+    /// thread when the ring is full until a consumer advances. Returns
+    /// `None` only when all consumers have been dropped.
+    ///
+    /// See [`super::Producer::reserve_block`].
+    #[must_use]
+    pub fn reserve_block(&mut self) -> Option<ArcSlotWriter<'_, T>> {
+        self.0.reserve_block().map(|w| ArcSlotWriter { inner: w })
     }
 
     /// Returns the number of items currently in the buffer.

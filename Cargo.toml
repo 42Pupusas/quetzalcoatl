@@ -1,6 +1,6 @@
 [package]
 name = "quetzalcoatl"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2021"
 authors = ["quetzalcoatl contributors"]
 description = "Lock-free ring buffers (SPSC, MPSC, SPMC, MPMC, and broadcast) for high-performance concurrent communication"

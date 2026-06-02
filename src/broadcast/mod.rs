@@ -34,6 +34,7 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+use crate::common::park::WakeSet;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
@@ -73,6 +74,18 @@ pub struct RingBuffer<T> {
     /// scan; read by all producers to avoid redundant O(N) scans.
     /// Always ≤ actual `min_head` (conservative), so a stale value is safe.
     pub(crate) min_head_cache: CachePadded<AtomicUsize>,
+    /// Sync producer-side park state. Bit `i` of `producer_park.wake` is
+    /// set while the producer in park slot `i` is blocked in
+    /// [`Producer::push_block`] waiting for the slowest consumer to
+    /// advance its head. Consumers `wake_one` after advancing a head.
+    /// Independent of the async `producer_waker` below.
+    pub(crate) producer_park: WakeSet,
+    /// Round-robin park-slot allocator for blocking producers. Each
+    /// `push_block`/`reserve_block` caller takes a stable slot
+    /// `idx & PARK_MASK` so concurrent blocking producers don't collide
+    /// on one bitmap bit (aliasing past 64 is benign — false wake,
+    /// re-check, re-park).
+    pub(crate) producer_park_idx: CachePadded<AtomicUsize>,
     /// Live producer count (only tracked when `async` is enabled). When
     /// it reaches zero `closed` is set so `pop_async` can resolve to `None`.
     #[cfg(feature = "async")]
@@ -130,6 +143,8 @@ impl<T> RingBuffer<T> {
             mask: capacity.mask,
             tail: CachePadded(AtomicUsize::new(0)),
             min_head_cache: CachePadded(AtomicUsize::new(0)),
+            producer_park: WakeSet::new(),
+            producer_park_idx: CachePadded(AtomicUsize::new(0)),
             consumer_slots: consumer_slots.into_boxed_slice(),
             #[cfg(feature = "async")]
             producer_count: CachePadded(AtomicUsize::new(1)),
@@ -140,6 +155,18 @@ impl<T> RingBuffer<T> {
             #[cfg(feature = "async")]
             consumer_waker: WakerSet::new(),
         }
+    }
+
+    /// Wakes one blocking producer parked in [`Producer::push_block`] /
+    /// [`Producer::reserve_block`], if any. Self-gates on the wake
+    /// bitmap being non-zero (a single load on the fast path), so it's
+    /// cheap to call after every consumer head advance. A producer's
+    /// unblock condition is `min_head` moving, which depends on the
+    /// slowest consumer — so any consumer advancing may free the
+    /// producer; a false wake just re-checks and re-parks.
+    #[inline]
+    pub(crate) fn wake_producer(&self) {
+        self.producer_park.wake_one();
     }
 
     /// Wakes one async producer task, if any. Self-gates on `pending`.
@@ -179,6 +206,7 @@ impl<T> RingBuffer<T> {
         let producer = Producer {
             queue: Arc::clone(&arc),
             cached_min_head: std::cell::Cell::new(0),
+            park_slot: 0,
         };
         let consumer = Consumer {
             queue: arc,
@@ -1236,5 +1264,203 @@ mod tests {
             assert_eq!(producer.push_async(99).await, Err(99));
         }));
         h.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocking push_block / reserve_block (sync park, no busy spin)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn push_block_empty_succeeds_immediately() {
+        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+        assert!(producer.push_block(1).is_ok());
+        assert!(producer.push_block(2).is_ok());
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
+    }
+
+    #[test]
+    fn push_block_parks_until_consumer_advances() {
+        // cap=2: fill it, then a blocking push must park until the
+        // consumer pops, freeing a slot. No value is lost or spun on.
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
+        producer.push(10).unwrap();
+        producer.push(20).unwrap();
+        assert!(producer.is_full());
+
+        let h = std::thread::spawn(move || {
+            // Blocks here: ring is full. Wakes when main pops below.
+            producer.push_block(30).unwrap();
+            producer
+        });
+
+        // Give the producer time to actually park rather than win a race.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(consumer.pop(), Some(10)); // frees a slot, wakes producer
+
+        let producer = h.join().unwrap();
+        // The parked push went through.
+        assert_eq!(consumer.pop(), Some(20));
+        assert_eq!(consumer.pop(), Some(30));
+        drop(producer);
+    }
+
+    #[test]
+    fn push_block_returns_err_when_all_consumers_gone() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        assert!(producer.is_full());
+
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(consumer); // last consumer gone → producer must unblock with Err
+        });
+
+        // Parks (full), then the consumer drop flushes it; no consumer
+        // means the value can never be observed, so Err is returned.
+        assert_eq!(producer.push_block(99), Err(99));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn reserve_block_parks_until_consumer_advances() {
+        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
+        producer.push(10).unwrap();
+        producer.push(20).unwrap();
+
+        let h = std::thread::spawn(move || {
+            let slot = producer.reserve_block().expect("consumer still active");
+            slot.write(30).commit();
+            producer
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(consumer.pop(), Some(10));
+
+        let producer = h.join().unwrap();
+        assert_eq!(consumer.pop(), Some(20));
+        assert_eq!(consumer.pop(), Some(30));
+        drop(producer);
+    }
+
+    #[test]
+    fn push_block_multi_consumer_waits_for_slowest() {
+        // Two consumers; the producer can't advance past the slowest.
+        // Draining only the fast consumer must NOT unblock the producer;
+        // the slow consumer popping is what frees the slot.
+        let (producer, mut fast) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
+        let mut slow = fast.clone();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+
+        let h = std::thread::spawn(move || {
+            producer.push_block(3).unwrap();
+            producer
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Fast consumer drains fully; min_head still pinned by `slow`.
+        assert_eq!(fast.pop(), Some(1));
+        assert_eq!(fast.pop(), Some(2));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Now the slow consumer advances, raising min_head → producer wakes.
+        assert_eq!(slow.pop(), Some(1));
+
+        let producer = h.join().unwrap();
+        assert_eq!(slow.pop(), Some(2));
+        assert_eq!(slow.pop(), Some(3));
+        assert_eq!(fast.pop(), Some(3));
+        drop(producer);
+    }
+
+    #[test]
+    fn push_block_streams_far_past_capacity() {
+        // Regression for the relay burst hang: a single producer pushes
+        // many multiples of capacity through push_block while two
+        // consumers drain. Pre-fix, push_block delegated to push, whose
+        // claim_slot did an unconditional FAA then spun unboundedly on a
+        // full ring — so the producer wedged instead of parking. The wrap
+        // (N ≫ cap) is what exercises the "claimed slot still occupied"
+        // branch.
+        const CAP: usize = 16;
+        const N: u64 = 100_000;
+        let (producer, c1) = RingBuffer::<u64>::new(Capacity::exact(CAP), 2).split();
+        let c2 = c1.clone();
+
+        let prod = std::thread::spawn(move || {
+            for i in 0..N {
+                producer.push_block(i).expect("consumers alive");
+            }
+        });
+
+        // Move each consumer into its own drain thread (no lingering
+        // handle that would pin min_head at 0 and stall the producer).
+        let drain = |mut c: Consumer<u64>| {
+            std::thread::spawn(move || {
+                let mut next = 0u64;
+                while next < N {
+                    match c.pop() {
+                        Some(v) => {
+                            assert_eq!(v, next, "broadcast consumer saw out-of-order item");
+                            next += 1;
+                        }
+                        None => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        let d1 = drain(c1);
+        let d2 = drain(c2);
+
+        prod.join().unwrap();
+        d1.join().unwrap();
+        d2.join().unwrap();
+    }
+
+    #[test]
+    fn push_block_multi_producer_streams_past_capacity() {
+        // Mirrors the SubRepl ring: N producers (one per shard) sharing
+        // one broadcast ring, blocking-pushing concurrently while
+        // consumers drain. Verifies the multi-producer race path in
+        // push_block (has_space true, then a peer takes the slot → Err →
+        // loop) terminates rather than wedging or recursing.
+        const CAP: usize = 8;
+        const PER: u64 = 20_000;
+        const PRODUCERS: u64 = 3;
+        // One consumer only: a second idle consumer would pin min_head at
+        // 0 and (correctly) block the producers forever.
+        let (seed, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(CAP), 2).split();
+
+        // Producer is !Sync (per-handle Cell cache + park slot), so each
+        // thread takes its own clone — same as the relay's per-shard
+        // SubRepl producers.
+        let mut prod_handles = Vec::new();
+        for _ in 0..PRODUCERS {
+            let p = seed.clone();
+            prod_handles.push(std::thread::spawn(move || {
+                for i in 0..PER {
+                    p.push_block(i).expect("consumer alive");
+                }
+            }));
+        }
+        drop(seed);
+
+        let total = PER * PRODUCERS;
+        let drained = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while count < total {
+                match consumer.pop() {
+                    Some(_) => count += 1,
+                    None => std::thread::yield_now(),
+                }
+            }
+            count
+        });
+
+        for h in prod_handles {
+            h.join().unwrap();
+        }
+        assert_eq!(drained.join().unwrap(), total);
     }
 }

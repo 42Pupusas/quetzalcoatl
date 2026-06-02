@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-02
+
 ### Added
+- **`broadcast::Producer::{push_block, reserve_block}`** — blocking
+  producer API for the broadcast ring, mirroring the `push_block` /
+  `reserve_block` already on spsc/spmc/mpsc/mpmc. Parks the calling
+  thread (shared backoff schedule, then `thread::park`) while the ring
+  is full — i.e. the slowest consumer hasn't advanced — and wakes when
+  any consumer advances a head or drops. Returns `Err(val)` / `None`
+  only when **all** consumers have been dropped (a push with no
+  consumer would sit until overwritten, so that's treated as a closed
+  channel). `ArcProducer` gains the matching `push_block` /
+  `reserve_block` wrappers. Unlike `push`, the value is moved out and
+  back on each retry, so `T` need not be `Clone`.
 - **`spsc::RingBuffer::{producer_from_raw, consumer_from_raw}`** — `unsafe`
   constructors that reconstitute a `Producer` / `Consumer` from a
   `*const RingBuffer<T>`. This is the cross-address-space seam for memory
@@ -244,7 +257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.8.1...v0.9.0

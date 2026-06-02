@@ -1514,7 +1514,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_non_static_lifetime() {
-        let wire_buf = vec![10u8, 20, 30, 40];
+        let wire_buf = [10u8, 20, 30, 40];
         let ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 

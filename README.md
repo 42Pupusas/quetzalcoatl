@@ -23,7 +23,7 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 - **Lock-free** — no mutexes, only atomic FAA / Acquire-Release
 - **Zero dependencies** — pure `std` implementation
 - **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side (all five variants)
-- **Blocking variants** — `push_block` / `pop_block` / `reserve_block` / `pop_ref_block` across all rings (except broadcast) park on backpressure instead of forcing the caller to spin
+- **Blocking variants** — `push_block` / `pop_block` / `reserve_block` / `pop_ref_block` across all rings park on backpressure instead of forcing the caller to spin (broadcast has the producer-side `push_block` / `reserve_block`; its consumers never block)
 - **Async variants** — `push_async` / `pop_async` across all five variants (behind the `async` feature flag) integrate with any `Waker`-based executor
 - **Borrowed split** — `split_borrowed()` on SPSC/MPSC/SPMC lets the ring buffer own the storage while handing out `&`-tied producer/consumer handles, removing the `'static` bound on `T` for zero-copy APIs
 - **Batch drain** — `drain()` / `drain_up_to()` / `drain_block()` amortize cache-line invalidations across the batch (O(1) per batch, not per item)
@@ -36,14 +36,14 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.11"
+quetzalcoatl = "0.12"
 ```
 
 To enable async support:
 
 ```toml
 [dependencies]
-quetzalcoatl = { version = "0.11", features = ["async"] }
+quetzalcoatl = { version = "0.12", features = ["async"] }
 ```
 
 ## Quick start

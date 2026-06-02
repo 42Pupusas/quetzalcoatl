@@ -52,6 +52,12 @@ impl<T> Drop for Consumer<T> {
         self.queue.consumer_slots[self.slot_index]
             .active
             .store(false, Ordering::Release);
+        // Flush blocking producers parked in push_block/reserve_block.
+        // Going inactive raises `min_head` (this consumer no longer
+        // pins a slot) and may have been the last consumer — either way
+        // every parked producer must re-check `any_consumer_active`
+        // / `min_head` so it can make progress or return Err.
+        self.queue.producer_park.flush();
         // Flush producers parked on push_async so they can re-check
         // any_consumer_active() and either retry or return Err.
         #[cfg(feature = "async")]
@@ -108,6 +114,7 @@ impl<T> Consumer<T> {
                 .head
                 .store(head + 1, Ordering::Release);
 
+            self.queue.wake_producer();
             #[cfg(feature = "async")]
             self.queue.wake_producer_async();
 
@@ -252,6 +259,7 @@ impl<T> Drop for SlotReader<'_, T> {
         self.consumer.queue.consumer_slots[self.consumer.slot_index]
             .head
             .store(self.head + 1, Ordering::Release);
+        self.consumer.queue.wake_producer();
         #[cfg(feature = "async")]
         self.consumer.queue.wake_producer_async();
     }

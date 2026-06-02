@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
+use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 use crate::common::TOMBSTONE;
 
 /// The producer side of a broadcast ring buffer.
@@ -15,24 +16,33 @@ use crate::common::TOMBSTONE;
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_min_head: std::cell::Cell<usize>,
+    /// Stable park slot for this producer handle (mod `PARK_SLOTS`).
+    /// Used by [`Producer::push_block`] / [`Producer::reserve_block`] to
+    /// register on the producer wake bitmap.
+    pub(super) park_slot: usize,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         #[cfg(feature = "async")]
         self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        let park_idx = self
+            .queue
+            .producer_park_idx
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         Self {
             queue: Arc::clone(&self.queue),
             cached_min_head: std::cell::Cell::new(0),
+            park_slot: park_idx & PARK_MASK,
         }
     }
 }
 
 /// Returns true if at least one consumer slot is currently active.
-/// Used by `push_async` to detect "all consumers gone" without an
-/// explicit consumer-count atomic — the per-slot `active` flags are
-/// the existing source of truth.
-#[cfg(feature = "async")]
+/// Used by `push_block` / `push_async` to detect "all consumers gone"
+/// without an explicit consumer-count atomic — the per-slot `active`
+/// flags are the existing source of truth.
 fn any_consumer_active<T>(q: &RingBuffer<T>) -> bool {
     q.consumer_slots
         .iter()
@@ -138,6 +148,151 @@ impl<T> Producer<T> {
                 Ok(())
             }
             None => Err(val),
+        }
+    }
+
+    /// Conservative fullness check used by the blocking variants to
+    /// decide whether a `reserve` would succeed without burning a FAA
+    /// claim. Refreshes the cached `min_head` from the shared cache,
+    /// then a full scan only if still apparently full. Returns `true`
+    /// if there is at least one writable slot.
+    #[inline]
+    fn has_space(&self) -> bool {
+        let current_tail = self.queue.tail.load(Ordering::Relaxed);
+        if current_tail.wrapping_sub(self.cached_min_head.get()) < self.queue.cap {
+            return true;
+        }
+        let shared = self.queue.min_head_cache.load(Ordering::Acquire);
+        self.cached_min_head.set(shared);
+        if current_tail.wrapping_sub(shared) < self.queue.cap {
+            return true;
+        }
+        let min_head = self.queue.min_head();
+        self.queue
+            .min_head_cache
+            .fetch_max(min_head, Ordering::Release);
+        self.cached_min_head.set(min_head);
+        current_tail.wrapping_sub(min_head) < self.queue.cap
+    }
+
+    /// Pushes a value, blocking the calling thread when the ring is full
+    /// (the slowest consumer hasn't caught up) until a consumer advances
+    /// its head. Returns `Err(val)` only when **all** consumers have been
+    /// dropped — a push with no consumer would sit until overwritten, so
+    /// that's treated as a closed channel.
+    ///
+    /// Spins via the shared backoff schedule first, then sets a wake bit
+    /// in the producer wake bitmap and parks. Consumers `wake_one` after
+    /// every head advance (and `flush` on drop). Same wait protocol as
+    /// [`mpsc::Producer::push_block`](crate::mpsc::Producer::push_block).
+    ///
+    /// Note: unlike [`push`](Self::push), the value is moved out and back
+    /// on each retry, so `T` need not be `Clone`.
+    pub fn push_block(&self, mut val: T) -> Result<(), T> {
+        let q = &*self.queue;
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        // Gate on `has_space()` (a real min_head scan) *before* calling
+        // `push`. `push`/`claim_slot` does an unconditional `tail.fetch_add`
+        // and then spins unboundedly on `min_head` if the slot it claimed
+        // is still occupied — so calling it on a full ring busy-spins
+        // forever and never reaches the park below. `has_space` claims
+        // nothing, so we only `push` once a slot is genuinely free.
+        loop {
+            if !any_consumer_active(q) {
+                return Err(val);
+            }
+            if self.has_space() {
+                // Space confirmed; `push` won't block in claim_slot's
+                // min_head spin. A racing producer (SubRepl has N
+                // producers) could still take the last slot first, in
+                // which case `push` returns Err — loop and re-evaluate
+                // rather than recurse.
+                match self.push(val) {
+                    Ok(()) => return Ok(()),
+                    Err(returned) => {
+                        val = returned;
+                        backoff = 0;
+                        continue;
+                    }
+                }
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            q.producer_park.ensure_handle_installed(self.park_slot);
+            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+
+            // Re-check after arming the wake bit: a consumer that advanced
+            // (or dropped) between our has_space check and the fetch_or
+            // would otherwise have nothing left to wake us. Either we make
+            // progress here, or the consumer's wake_one/flush sees the bit.
+            if !any_consumer_active(q) {
+                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                return Err(val);
+            }
+            if self.has_space() {
+                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                backoff = 0;
+                continue;
+            }
+
+            std::thread::park();
+            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            backoff = 0;
+        }
+    }
+
+    /// Reserves a slot for zero-copy writing, blocking the calling thread
+    /// when the ring is full until a consumer advances. Returns `None`
+    /// only when all consumers have been dropped.
+    ///
+    /// Same wait protocol as [`push_block`](Self::push_block).
+    pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let bit_mask = 1u64 << self.park_slot;
+        let mut backoff = 0u32;
+        loop {
+            if !any_consumer_active(&self.queue) {
+                return None;
+            }
+            if self.has_space() {
+                return self.reserve();
+            }
+            if backoff < BACKOFF_PARK_THRESHOLD {
+                crate::common::cas_backoff(&mut backoff);
+                continue;
+            }
+
+            self.queue
+                .producer_park
+                .ensure_handle_installed(self.park_slot);
+            self.queue
+                .producer_park
+                .wake
+                .fetch_or(bit_mask, Ordering::SeqCst);
+
+            if !any_consumer_active(&self.queue) {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return None;
+            }
+            if self.has_space() {
+                self.queue
+                    .producer_park
+                    .wake
+                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                return self.reserve();
+            }
+
+            std::thread::park();
+            self.queue
+                .producer_park
+                .wake
+                .fetch_and(!bit_mask, Ordering::Relaxed);
         }
     }
 
