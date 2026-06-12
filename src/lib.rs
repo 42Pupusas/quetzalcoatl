@@ -146,3 +146,9 @@ pub mod mpmc;
 pub mod mpsc;
 pub mod spmc;
 pub mod spsc;
+
+// Re-export building blocks useful for external ring-buffer
+// implementations (e.g. io_uring adapters).
+pub use common::cas_backoff;
+pub use common::park;
+pub use common::CachePadded;
