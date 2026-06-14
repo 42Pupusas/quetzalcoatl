@@ -1243,7 +1243,7 @@ mod tests {
         // Wait for all producers to complete WITHOUT calling drain
         // or pop again — those would each emit additional wakes and
         // mask the bug.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         for (i, h) in producers.into_iter().enumerate() {
             while !h.is_finished() {
                 assert!(
@@ -1390,21 +1390,16 @@ mod tests {
         // Multiple producers and one consumer on separate threads. Watchdog
         // aborts the process if anything deadlocks within 5s so the test
         // fails fast.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_watchdog = done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !done_watchdog.load(Ordering::Acquire) {
-                if std::time::Instant::now() > deadline {
-                    eprintln!("\n\nmpsc async_push_pop_cross_thread: deadlocked, aborting\n");
-                    std::process::abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
+        let progress = Arc::new(AtomicU64::new(0));
+        let watchdog = crate::common::spawn_progress_watchdog(
+            progress.clone(),
+            done.clone(),
+            "mpsc async_push_pop_cross_thread",
+        );
 
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
         let n_producers: u64 = 4;
@@ -1431,6 +1426,7 @@ mod tests {
             .collect();
         drop(producer);
 
+        let progress_c = progress;
         let ch = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -1440,7 +1436,10 @@ mod tests {
                 let mut received = 0u64;
                 while received < total {
                     match consumer.pop_async().await {
-                        Some(_) => received += 1,
+                        Some(_) => {
+                            received += 1;
+                            progress_c.fetch_add(1, Ordering::Relaxed);
+                        }
                         None => break,
                     }
                 }

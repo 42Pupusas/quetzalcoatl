@@ -131,6 +131,16 @@ pub struct WakerSet {
     /// only one atomic load.
     pub pending: AtomicBool,
     pub slots: AlignedBuf<WakerSlot>,
+    /// Round-robin cursor: index *just after* the last slot we woke.
+    /// `wake_one`/`wake_n` start their scan here so a stuck low-slot
+    /// waiter that re-registers immediately can't monopolize wake
+    /// events and starve a higher-slot waiter that could progress.
+    /// This mirrors [`super::park::WakeSet::cursor`]; without it the
+    /// saturated mpmc async path deadlocks (cap=16, 2 producers + 2
+    /// consumers reliably hits it — a producer parked on a refill
+    /// that can't yet succeed eats every wake while the producer
+    /// holding the needed position stays parked forever).
+    pub cursor: AtomicUsize,
 }
 
 impl WakerSet {
@@ -138,16 +148,24 @@ impl WakerSet {
         Self {
             pending: AtomicBool::new(false),
             slots: AlignedBuf::new_with(PARK_SLOTS, WakerSlot::new),
+            cursor: AtomicUsize::new(0),
         }
     }
 
     /// Registers `cx`'s waker in `slot`. Sets `pending = true`.
     ///
-    /// Called by the future before returning `Poll::Pending`.
+    /// Called by the future before returning `Poll::Pending`. The
+    /// trailing `SeqCst` fence pairs with the fence in `wake_one`/
+    /// `wake_n` so the waker's post-register re-check of the ring and a
+    /// peer's wake-scan are totally ordered — without it the register/
+    /// recheck and free/wake handshake can miss (Dekker), leaving the
+    /// future parked with no further poll. Mirrors the blocking
+    /// waiter's `fetch_or(SeqCst); fence(SeqCst)` in `park::WakeSet`.
     #[inline]
     pub fn register(&self, slot: usize, cx: &std::task::Context<'_>) {
         self.slots[slot & (PARK_SLOTS - 1)].store(cx.waker());
         self.pending.store(true, Ordering::Release);
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Wakes one registered waker. No-op if `pending` is false.
@@ -156,8 +174,17 @@ impl WakerSet {
         if !self.pending.load(Ordering::Relaxed) {
             return;
         }
-        for slot in &*self.slots {
-            if slot.wake() {
+        // Drain the caller's store buffer before scanning — the caller
+        // issued a Release store on the ring (`ready`/`done`) then
+        // called us; without this fence a peer that just registered and
+        // re-checked could be missed. See `park::WakeSet::wake_one`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let n = self.slots.len();
+        let start = self.cursor.load(Ordering::Relaxed);
+        for i in 0..n {
+            let idx = (start + i) & (PARK_SLOTS - 1);
+            if self.slots[idx].wake() {
+                self.cursor.store(idx + 1, Ordering::Relaxed);
                 return;
             }
         }
@@ -169,17 +196,21 @@ impl WakerSet {
     }
 
     /// Wakes up to `n` registered wakers.
-    #[allow(dead_code)]
     #[inline]
     pub fn wake_n(&self, mut n: usize) {
         if !self.pending.load(Ordering::Relaxed) {
             return;
         }
-        for slot in &*self.slots {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let total = self.slots.len();
+        let start = self.cursor.load(Ordering::Relaxed);
+        for i in 0..total {
             if n == 0 {
                 return;
             }
-            if slot.wake() {
+            let idx = (start + i) & (PARK_SLOTS - 1);
+            if self.slots[idx].wake() {
+                self.cursor.store(idx + 1, Ordering::Relaxed);
                 n -= 1;
             }
         }
@@ -188,6 +219,7 @@ impl WakerSet {
 
     /// Wakes every registered waker. Used at close time.
     pub fn flush(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
         for slot in &*self.slots {
             slot.wake();
         }

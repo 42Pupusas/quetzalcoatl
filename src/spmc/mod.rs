@@ -1351,21 +1351,15 @@ mod tests {
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_watchdog = done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !done_watchdog.load(Ordering::Acquire) {
-                if std::time::Instant::now() > deadline {
-                    eprintln!("\n\nspmc async_push_pop_cross_thread: deadlocked, aborting\n");
-                    std::process::abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
 
         let n_consumers: u64 = 4;
         let total: u64 = 10_000;
         let received = Arc::new(AtomicU64::new(0));
+        let watchdog = crate::common::spawn_progress_watchdog(
+            received.clone(),
+            done.clone(),
+            "spmc async_push_pop_cross_thread",
+        );
 
         let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
 

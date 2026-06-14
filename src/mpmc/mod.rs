@@ -1321,7 +1321,7 @@ mod tests {
         let n = c.drain(|_| {});
         assert_eq!(n, CAP as usize);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         for (i, h) in producers.into_iter().enumerate() {
             while !h.is_finished() {
                 assert!(
@@ -1349,23 +1349,17 @@ mod tests {
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_watchdog = done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !done_watchdog.load(Ordering::Acquire) {
-                if std::time::Instant::now() > deadline {
-                    eprintln!("\n\nmpmc async_push_pop_cross_thread: deadlocked, aborting\n");
-                    std::process::abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
 
         let n_producers: u64 = 2;
         let n_consumers: u64 = 2;
         let per_producer: u64 = 2_500;
         let total = n_producers * per_producer;
         let received = Arc::new(AtomicU64::new(0));
+        let watchdog = crate::common::spawn_progress_watchdog(
+            received.clone(),
+            done.clone(),
+            "mpmc async_push_pop_cross_thread",
+        );
 
         let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
 
@@ -1620,17 +1614,14 @@ mod tests {
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_watchdog = done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while !done_watchdog.load(Ordering::Acquire) {
-                if std::time::Instant::now() > deadline {
-                    eprintln!("\n\nmpmc async stress: deadlocked, aborting\n");
-                    std::process::abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
+        // Monotonic across all iterations so the watchdog sees continuous
+        // progress; `received` below is per-iteration (for the assert).
+        let progress = Arc::new(AtomicU64::new(0));
+        let watchdog = crate::common::spawn_progress_watchdog(
+            progress.clone(),
+            done.clone(),
+            "mpmc async stress",
+        );
 
         let n_producers: u64 = 2;
         let n_consumers: u64 = 2;
@@ -1643,6 +1634,7 @@ mod tests {
                 .map(|_| {
                     let c = consumer.clone();
                     let received = received.clone();
+                    let progress = progress.clone();
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .build()
@@ -1651,6 +1643,7 @@ mod tests {
                         rt.block_on(local.run_until(async move {
                             while c.pop_async().await.is_some() {
                                 received.fetch_add(1, Ordering::Relaxed);
+                                progress.fetch_add(1, Ordering::Relaxed);
                             }
                         }));
                     })

@@ -66,11 +66,17 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let current_tail = self.ring().tail.load(Ordering::Relaxed);
-        if current_tail - self.cached_head.get() >= self.ring().cap {
+        // `wrapping_sub`: `current_tail` is a Relaxed (possibly stale)
+        // read, so a concurrently-advanced `head` can momentarily exceed
+        // it. A plain `-` then underflows and panics in debug builds. The
+        // wrap yields a huge "used" count that reads as "full", so we
+        // conservatively reload / return None and the caller retries —
+        // the correct outcome for a transiently-inconsistent snapshot.
+        if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
             let head = self.ring().head.load(Ordering::Acquire);
             self.cached_head.set(head);
 
-            if current_tail - head >= self.ring().cap {
+            if current_tail.wrapping_sub(head) >= self.ring().cap {
                 return None;
             }
         }

@@ -128,49 +128,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// Spins via the shared backoff schedule first, then registers
     /// the producer parker handle and parks. The consumer signals
     /// after every pop, gated on a single `Relaxed` load.
-    pub fn push_block(&self, mut val: T) -> Result<(), T> {
-        let q = self.ring();
-        let mut backoff = 0u32;
-        loop {
-            // Check consumer_closed *before* attempting push. Once
-            // the consumer drops it sets `consumer_closed = true`;
-            // any free space we'd find afterward is permanent and
-            // must not be filled.
-            if q.consumer_closed.0.load(Ordering::Acquire) {
-                return Err(val);
-            }
-            match self.push(val) {
-                Ok(()) => return Ok(()),
-                Err(returned) => val = returned,
-            }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
-                continue;
-            }
-
-            // Idempotently install our parker handle.
-            let _ = q.producer_parker.set(std::thread::current());
-            // SeqCst pairs with the consumer's `producer_parked.load`
-            // after `head.store(Release)`: either we succeed in the
-            // re-check below, or the consumer sees our flag and unparks
-            // us.
-            q.producer_parked.0.store(true, Ordering::SeqCst);
-
-            if q.consumer_closed.0.load(Ordering::Acquire) {
-                q.producer_parked.0.store(false, Ordering::Relaxed);
-                return Err(val);
-            }
-            match self.push(val) {
-                Ok(()) => {
-                    q.producer_parked.0.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(returned) => val = returned,
-            }
-
-            std::thread::park();
-            q.producer_parked.0.store(false, Ordering::Relaxed);
-        }
+    pub fn push_block(&self, val: T) -> Result<(), T> {
+        crate::common::SingleParkerProducer::push_block(self, val)
     }
 
     /// Reserves a slot for zero-copy writing.
@@ -310,6 +269,31 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.ring().is_full()
+    }
+}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
+    for Producer<T, R>
+{
+    fn try_push(&self, val: T) -> Result<(), T> {
+        self.push(val)
+    }
+    fn consumer_gone(&self) -> bool {
+        self.ring().consumer_closed.0.load(Ordering::Acquire)
+    }
+    fn arm_park(&self) {
+        // Idempotently install our parker handle, then publish "parked".
+        // SeqCst pairs with the consumer's `producer_parked.load` after
+        // `head.store(Release)`: either our re-check sees freed space, or
+        // the consumer sees our flag and unparks us.
+        let _ = self.ring().producer_parker.set(std::thread::current());
+        self.ring().producer_parked.0.store(true, Ordering::SeqCst);
+    }
+    fn disarm_park(&self) {
+        self.ring()
+            .producer_parked
+            .0
+            .store(false, Ordering::Relaxed);
     }
 }
 

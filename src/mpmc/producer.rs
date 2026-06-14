@@ -95,73 +95,19 @@ impl<T, C: Config> Producer<T, C> {
         Some((start, unused))
     }
 
-    /// Whole-batch blocked: park on the futex-style wake bitmap and
-    /// wait for any of `unused`'s slots to release. Returns the
-    /// `(bit, pos)` of the slot that became free.
-    ///
-    /// The `SeqCst` on `producer_park.wake.fetch_or` pairs with the
-    /// consumer's `producer_park.wake.load` after `done[s].store
-    /// (Release)` to close the missed-wake window. Close paths flush
-    /// the wake set, so a parked producer always either sees a slot
-    /// release in its re-check or is unparked by a consumer/close.
-    #[cold]
-    fn park_until_slot_free(
-        &self,
-        q: &RingBuffer<T, C>,
-        start: usize,
-        unused: u32,
-    ) -> (u32, usize) {
-        q.producer_park.ensure_handle_installed(self.park_slot);
-        let bit_mask = 1u64 << self.park_slot;
-        let mut backoff = 0u32;
-        loop {
-            if let Some(found) = q.scan_unused(start, unused) {
-                return found;
-            }
-            // Spin until cas_backoff fully escalates (~tens of μs
-            // including yields) before paying for park.
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
-                continue;
-            }
-
-            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
-            // SeqCst fence so the recheck below is totally ordered with
-            // the consumer's `done.store(Release)` in pop. Without the
-            // fence, the recheck's Acquire load of `done` can be hoisted
-            // past the SeqCst fetch_or in the modification order, and
-            // the consumer's wake_one (which loads our wake bit) can
-            // run before we set the bit — leaving us parked while a
-            // freshly-released slot sits in our batch_unused. Same race
-            // class as broadcast::pop_async's register-recheck.
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            // Re-check after publishing our wake bit.
-            if let Some(found) = q.scan_unused(start, unused) {
-                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
-                return found;
-            }
-
-            // park_timeout backstop — see push_block.
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
-        }
-    }
-
     /// Acquires a free slot for a write. Returns the `(bit, pos)`
     /// of a position whose `done[s]` indicates it is free for the
-    /// current round. On success, the corresponding bit is removed
-    /// from `batch_unused` (the caller is now responsible for it —
-    /// either commit by storing `ready[s] = pos+1`, or restore the
-    /// bit to `batch_unused` to abandon the reservation).
+    /// current round, or `None` if no slot in the batch is free. On
+    /// success, the corresponding bit is removed from `batch_unused`
+    /// (the caller is now responsible for it — either commit by storing
+    /// `ready[s] = pos+1`, or restore the bit to `batch_unused` to
+    /// abandon the reservation).
     ///
-    /// `block` selects the wait policy when no slot in the batch
-    /// is free: `false` returns `None` immediately (used by `push`),
-    /// `true` parks until a slot releases (used by `push_block` and
-    /// `reserve_block`-style callers — currently only via `push_block`'s
-    /// loop, which retries `push`/`acquire_slot` after parking).
+    /// Always non-blocking: callers that block (`push_block`,
+    /// `reserve_block`) run their own spin-then-park loop and retry
+    /// this on each lap.
     #[inline]
-    fn acquire_slot(&self, block: bool) -> Option<(u32, usize)> {
+    fn acquire_slot(&self) -> Option<(u32, usize)> {
         let q = &*self.queue;
 
         // Refill the batch if exhausted.
@@ -199,12 +145,7 @@ impl<T, C: Config> Producer<T, C> {
         }
 
         if !found_ready {
-            if !block {
-                return None;
-            }
-            let (b, p) = self.park_until_slot_free(q, start, unused);
-            bit = b;
-            pos = p;
+            return None;
         }
 
         self.batch_unused.set(unused & !(1u32 << bit));
@@ -216,7 +157,7 @@ impl<T, C: Config> Producer<T, C> {
     /// `consumed` watermark, which lags real consumer progress).
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
-        let Some((_bit, pos)) = self.acquire_slot(false) else {
+        let Some((_bit, pos)) = self.acquire_slot() else {
             return Err(val);
         };
         let q = &*self.queue;
@@ -259,7 +200,7 @@ impl<T, C: Config> Producer<T, C> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T, C>> {
-        let (bit, pos) = self.acquire_slot(false)?;
+        let (bit, pos) = self.acquire_slot()?;
         Some(SlotWriter {
             producer: self,
             pos,

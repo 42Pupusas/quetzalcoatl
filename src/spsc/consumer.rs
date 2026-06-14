@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
@@ -171,53 +170,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// after every push, gated on a single `Relaxed` load.
     #[must_use]
     pub fn pop_block(&mut self) -> Option<T> {
-        let mut backoff = 0u32;
-        loop {
-            if let Some(v) = self.pop() {
-                return Some(v);
-            }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                // Re-check after observing closed: producer may have
-                // published just before its drop, and we must drain
-                // that before returning None.
-                if let Some(v) = self.pop() {
-                    return Some(v);
-                }
-                return None;
-            }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
-                continue;
-            }
-
-            let _ = self.ring().consumer_parker.set(std::thread::current());
-            // SeqCst pairs with the producer's `consumer_parked.load`
-            // after `tail.store(Release)`: either we see the published
-            // slot in the re-check below, or the producer sees our flag
-            // and unparks us.
-            self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
-
-            if let Some(v) = self.pop() {
-                self.ring()
-                    .consumer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
-                return Some(v);
-            }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                self.ring()
-                    .consumer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
-                return self.pop();
-            }
-
-            std::thread::park();
-            self.ring()
-                .consumer_parked
-                .0
-                .store(false, Ordering::Relaxed);
-        }
+        crate::common::SingleParkerConsumer::pop_block(self)
     }
 
     /// Pops a value asynchronously, yielding to the executor when the
@@ -304,56 +257,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// [`pop_block`](Self::pop_block) for value-copy reads.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
-        let mut backoff = 0u32;
-        loop {
-            // Non-mutating gate: do NOT call pop_ref() in the gate,
-            // because the discarded SlotReader would advance head on
-            // drop and consume the item we wanted to return.
-            if self.has_item() {
-                return self.pop_ref();
-            }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                // Re-check: producer may have published just before
-                // its drop. Drain that before returning None.
-                if self.has_item() {
-                    return self.pop_ref();
-                }
-                return None;
-            }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
-                continue;
-            }
-
-            let _ = self.ring().consumer_parker.set(std::thread::current());
-            // SeqCst pairs with the producer's `consumer_parked.load`
-            // after `tail.store(Release)`.
-            self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
-
-            if self.has_item() {
-                self.ring()
-                    .consumer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
-                return self.pop_ref();
-            }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                self.ring()
-                    .consumer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
-                if self.has_item() {
-                    return self.pop_ref();
-                }
-                return None;
-            }
-
-            std::thread::park();
-            self.ring()
-                .consumer_parked
-                .0
-                .store(false, Ordering::Relaxed);
-        }
+        crate::common::SingleParkerConsumerRef::pop_ref_block(self)
     }
 
     /// Returns the number of items currently in the buffer.
@@ -372,6 +276,58 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.ring().is_full()
+    }
+}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
+    for Consumer<T, R>
+{
+    fn try_pop(&mut self) -> Option<T> {
+        self.pop()
+    }
+    fn producer_gone(&self) -> bool {
+        self.ring().producer_closed.0.load(Ordering::Acquire)
+    }
+    fn arm_park(&self) {
+        // SeqCst pairs with the producer's `consumer_parked.load` after
+        // `tail.store(Release)`: either our re-check sees the published
+        // slot, or the producer sees our flag and unparks us.
+        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
+    }
+    fn disarm_park(&self) {
+        self.ring()
+            .consumer_parked
+            .0
+            .store(false, Ordering::Relaxed);
+    }
+}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
+    for Consumer<T, R>
+{
+    type Reader<'a>
+        = SlotReader<'a, T, R>
+    where
+        Self: 'a;
+    fn has_item(&self) -> bool {
+        self.has_item()
+    }
+    fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+        self.pop_ref()
+    }
+    fn producer_gone(&self) -> bool {
+        self.ring().producer_closed.0.load(Ordering::Acquire)
+    }
+    fn arm_park(&self) {
+        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
+    }
+    fn disarm_park(&self) {
+        self.ring()
+            .consumer_parked
+            .0
+            .store(false, Ordering::Relaxed);
     }
 }
 

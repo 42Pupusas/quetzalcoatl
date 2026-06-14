@@ -6,6 +6,203 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicUsize;
 
+/// Spawns a *progress-based* deadlock watchdog for the async cross-thread
+/// tests.
+///
+/// The watchdog aborts the process only if `progress` fails to advance for
+/// 30 consecutive seconds — i.e. the test made no forward progress, the
+/// signature of a real deadlock. A plain wall-clock deadline is wrong here:
+/// under coverage instrumentation the lock-free hot loops run orders of
+/// magnitude slower (and tests run heavily thread-oversubscribed), so a
+/// fixed budget false-fires on a test that is merely slow but still
+/// progressing. Tracking progress distinguishes "slow" from "stuck".
+///
+/// Callers bump `progress` on each item produced/consumed, set `done` when
+/// the test finishes, then join the returned handle.
+#[cfg(all(test, feature = "async"))]
+pub fn spawn_progress_watchdog(
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    label: &'static str,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut last = 0u64;
+        let mut last_change = std::time::Instant::now();
+        while !done.load(Ordering::Acquire) {
+            let cur = progress.load(Ordering::Relaxed);
+            if cur != last {
+                last = cur;
+                last_change = std::time::Instant::now();
+            } else if last_change.elapsed() > std::time::Duration::from_secs(30) {
+                eprintln!("\n\n{label}: no progress for 30s, deadlocked — aborting\n");
+                std::process::abort();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    })
+}
+
+/// Shared blocking-push loop for the single-producer topologies (spsc,
+/// spmc). Both park the producer thread with the identical mechanism
+/// (`producer_parker: OnceLock<Thread>` + `producer_parked` flag), so
+/// their `push_block` bodies were byte-for-byte the same. The loop lives
+/// here once; each implementor supplies the four primitives that differ
+/// only in which ring fields they touch.
+pub trait SingleParkerProducer<T> {
+    /// Non-blocking push; `Err(val)` hands the value back when full.
+    fn try_push(&self, val: T) -> Result<(), T>;
+    /// True once the consumer side is gone — stop blocking, return `Err`.
+    fn consumer_gone(&self) -> bool;
+    /// Install this thread's park handle and publish "parked" (`SeqCst`,
+    /// pairing with the consumer's wake-side load).
+    fn arm_park(&self);
+    /// Clear the "parked" flag (`Relaxed`).
+    fn disarm_park(&self);
+
+    /// Push, blocking the thread while the ring is full until a consumer
+    /// frees space. Returns `Err(val)` only when the consumer side is
+    /// gone. Spins via the shared backoff schedule, then parks.
+    fn push_block(&self, mut val: T) -> Result<(), T> {
+        let mut backoff = 0u32;
+        loop {
+            if self.consumer_gone() {
+                return Err(val);
+            }
+            match self.try_push(val) {
+                Ok(()) => return Ok(()),
+                Err(returned) => val = returned,
+            }
+            if backoff < park::BACKOFF_PARK_THRESHOLD {
+                cas_backoff(&mut backoff);
+                continue;
+            }
+            self.arm_park();
+            if self.consumer_gone() {
+                self.disarm_park();
+                return Err(val);
+            }
+            match self.try_push(val) {
+                Ok(()) => {
+                    self.disarm_park();
+                    return Ok(());
+                }
+                Err(returned) => val = returned,
+            }
+            std::thread::park();
+            self.disarm_park();
+        }
+    }
+}
+
+/// Shared blocking-pop loop for the single-consumer topologies (spsc,
+/// mpsc). Both park the consumer thread with the identical mechanism
+/// (`consumer_parker` + `consumer_parked`), so their `pop_block` bodies
+/// were identical. The loop lives here once; implementors supply the
+/// primitives that differ only in which ring fields they touch.
+pub trait SingleParkerConsumer<T> {
+    /// Non-blocking pop.
+    fn try_pop(&mut self) -> Option<T>;
+    /// True once the producer side is gone — drain then return `None`.
+    fn producer_gone(&self) -> bool;
+    /// Install this thread's park handle and publish "parked" (`SeqCst`).
+    fn arm_park(&self);
+    /// Clear the "parked" flag (`Relaxed`).
+    fn disarm_park(&self);
+
+    /// Pop, blocking the thread while the ring is empty until a producer
+    /// publishes. Returns `None` only once the producer is gone and the
+    /// ring has drained.
+    fn pop_block(&mut self) -> Option<T> {
+        let mut backoff = 0u32;
+        loop {
+            if let Some(v) = self.try_pop() {
+                return Some(v);
+            }
+            if self.producer_gone() {
+                // Re-pop: the producer may have published just before its
+                // drop; that item must be drained before returning None.
+                return self.try_pop();
+            }
+            if backoff < park::BACKOFF_PARK_THRESHOLD {
+                cas_backoff(&mut backoff);
+                continue;
+            }
+            self.arm_park();
+            if let Some(v) = self.try_pop() {
+                self.disarm_park();
+                return Some(v);
+            }
+            if self.producer_gone() {
+                self.disarm_park();
+                return self.try_pop();
+            }
+            std::thread::park();
+            self.disarm_park();
+        }
+    }
+}
+
+/// Zero-copy counterpart to [`SingleParkerConsumer`]: the shared blocking
+/// loop for `pop_ref_block` on the single-consumer topologies (spsc,
+/// mpsc). The returned reader borrows `self`, so the trait uses a GAT.
+/// The gate is `has_item` (non-mutating) — never `try_pop_ref` — because
+/// a discarded reader would advance the head on drop and consume the
+/// item we meant to return.
+pub trait SingleParkerConsumerRef {
+    /// The borrowing read guard (e.g. `SlotReader<'a, ..>`).
+    type Reader<'a>
+    where
+        Self: 'a;
+
+    /// Non-mutating "is an item ready?" gate.
+    fn has_item(&self) -> bool;
+    /// Claim the ready item by reference. Only called right after
+    /// `has_item()` returned true.
+    fn try_pop_ref(&mut self) -> Option<Self::Reader<'_>>;
+    /// True once the producer side is gone.
+    fn producer_gone(&self) -> bool;
+    /// Install park handle + publish "parked" (`SeqCst`).
+    fn arm_park(&self);
+    /// Clear the "parked" flag (`Relaxed`).
+    fn disarm_park(&self);
+
+    /// Zero-copy pop, blocking until an item is ready. Returns `None`
+    /// only once the producer is gone and the ring has drained.
+    fn pop_ref_block(&mut self) -> Option<Self::Reader<'_>> {
+        let mut backoff = 0u32;
+        loop {
+            if self.has_item() {
+                return self.try_pop_ref();
+            }
+            if self.producer_gone() {
+                if self.has_item() {
+                    return self.try_pop_ref();
+                }
+                return None;
+            }
+            if backoff < park::BACKOFF_PARK_THRESHOLD {
+                cas_backoff(&mut backoff);
+                continue;
+            }
+            self.arm_park();
+            if self.has_item() {
+                self.disarm_park();
+                return self.try_pop_ref();
+            }
+            if self.producer_gone() {
+                self.disarm_park();
+                if self.has_item() {
+                    return self.try_pop_ref();
+                }
+                return None;
+            }
+            std::thread::park();
+            self.disarm_park();
+        }
+    }
+}
+
 /// Sentinel sequence value marking an abandoned slot (reserved but never
 /// committed). Consumers detect this and silently skip past the slot.
 ///

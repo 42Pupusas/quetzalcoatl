@@ -84,40 +84,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// Pushes a value, blocking the calling thread when the ring is
     /// full until a consumer makes space. Returns `Err(val)` only
     /// when the last [`Consumer`](super::Consumer) has been dropped.
-    pub fn push_block(&self, mut val: T) -> Result<(), T> {
-        let q = self.ring();
-        let mut backoff = 0u32;
-        loop {
-            if q.consumer_closed.0.load(Ordering::Acquire) {
-                return Err(val);
-            }
-            match self.push(val) {
-                Ok(()) => return Ok(()),
-                Err(returned) => val = returned,
-            }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
-                continue;
-            }
-
-            let _ = q.producer_parker.set(std::thread::current());
-            q.producer_parked.0.store(true, Ordering::SeqCst);
-
-            if q.consumer_closed.0.load(Ordering::Acquire) {
-                q.producer_parked.0.store(false, Ordering::Relaxed);
-                return Err(val);
-            }
-            match self.push(val) {
-                Ok(()) => {
-                    q.producer_parked.0.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(returned) => val = returned,
-            }
-
-            std::thread::park();
-            q.producer_parked.0.store(false, Ordering::Relaxed);
-        }
+    pub fn push_block(&self, val: T) -> Result<(), T> {
+        crate::common::SingleParkerProducer::push_block(self, val)
     }
 
     /// Pushes a value asynchronously, yielding to the executor when the
@@ -231,6 +199,27 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.ring().is_full()
+    }
+}
+
+impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
+    for Producer<T, R>
+{
+    fn try_push(&self, val: T) -> Result<(), T> {
+        self.push(val)
+    }
+    fn consumer_gone(&self) -> bool {
+        self.ring().consumer_closed.0.load(Ordering::Acquire)
+    }
+    fn arm_park(&self) {
+        let _ = self.ring().producer_parker.set(std::thread::current());
+        self.ring().producer_parked.0.store(true, Ordering::SeqCst);
+    }
+    fn disarm_park(&self) {
+        self.ring()
+            .producer_parked
+            .0
+            .store(false, Ordering::Relaxed);
     }
 }
 

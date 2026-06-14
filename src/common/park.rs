@@ -22,12 +22,13 @@ use std::thread::Thread;
 
 use super::AlignedBuf;
 
-/// Park-slot count. Each waiter (producer or consumer) takes a stable
-/// slot at clone time; bit `i` of the wake bitmap flags "slot `i`
-/// parked." 64 fits in a single [`AtomicU64`]. Beyond 64 waiters of
-/// one kind, slots alias and a wake on bit `i` rouses any waiter
-/// mapped there (benign false wake; the woken waiter re-checks and
-/// re-parks).
+/// Park-slot count.
+///
+/// Each waiter (producer or consumer) takes a stable slot at clone time;
+/// bit `i` of the wake bitmap flags "slot `i` parked." 64 fits in a
+/// single [`AtomicU64`]. Beyond 64 waiters of one kind, slots alias and
+/// a wake on bit `i` rouses any waiter mapped there (benign false wake;
+/// the woken waiter re-checks and re-parks).
 pub const PARK_SLOTS: usize = 64;
 pub const PARK_MASK: usize = PARK_SLOTS - 1;
 /// 32-bit version of [`PARK_MASK`] for `u32::rotate_right` shift
@@ -36,11 +37,12 @@ pub const PARK_MASK: usize = PARK_SLOTS - 1;
 const PARK_MASK_U32: u32 = (PARK_SLOTS as u32) - 1;
 
 /// `cas_backoff` failure-counter threshold past which the slow path
-/// stops spinning and parks. The schedule in
-/// [`crate::common::cas_backoff`] saturates at f=12 (64 pauses per
-/// call + sparse `yield_now`); waiting that long means we've already
-/// burned ~tens of microseconds and a futex round-trip (1–10μs) is
-/// amortized.
+/// stops spinning and parks.
+///
+/// The schedule in [`crate::common::cas_backoff`] saturates at f=12
+/// (64 pauses per call + sparse `yield_now`); waiting that long means
+/// we've already burned ~tens of microseconds and a futex round-trip
+/// (1–10μs) is amortized.
 pub const BACKOFF_PARK_THRESHOLD: u32 = 12;
 
 /// One side's park state — a 64-bit wake bitmap plus a parker table

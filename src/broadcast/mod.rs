@@ -1149,7 +1149,7 @@ mod tests {
     #[test]
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread() {
-        async_push_pop_cross_thread_run(1, 5_000, 8, 30);
+        async_push_pop_cross_thread_run(1, 5_000, 8, 60);
     }
 
     #[test]
@@ -1162,23 +1162,17 @@ mod tests {
     }
 
     #[cfg(feature = "async")]
-    fn async_push_pop_cross_thread_run(iters: usize, total: u64, cap: usize, deadline_secs: u64) {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    fn async_push_pop_cross_thread_run(iters: usize, total: u64, cap: usize, _deadline_secs: u64) {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
 
         let done = Arc::new(AtomicBool::new(false));
-        let done_watchdog = done.clone();
-        let watchdog = std::thread::spawn(move || {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
-            while !done_watchdog.load(Ordering::Acquire) {
-                if std::time::Instant::now() > deadline {
-                    eprintln!("\n\nbroadcast async_push_pop_cross_thread: deadlocked, aborting\n");
-                    std::process::abort();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
+        let progress = Arc::new(AtomicU64::new(0));
+        let watchdog = crate::common::spawn_progress_watchdog(
+            progress.clone(),
+            done.clone(),
+            "broadcast async_push_pop_cross_thread",
+        );
 
         for _ in 0..iters {
             let (producer, c1) = RingBuffer::<u64>::new(Capacity::exact(cap), 4).split();
@@ -1187,6 +1181,7 @@ mod tests {
             let consumer_threads: Vec<_> = [c1, c2]
                 .into_iter()
                 .map(|mut c| {
+                    let progress = progress.clone();
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread()
                             .build()
@@ -1196,6 +1191,7 @@ mod tests {
                             let mut received = 0u64;
                             while c.pop_async().await.is_some() {
                                 received += 1;
+                                progress.fetch_add(1, Ordering::Relaxed);
                             }
                             assert_eq!(received, total);
                         }));
