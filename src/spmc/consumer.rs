@@ -163,10 +163,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Drains all currently available items, calling `f` for each.
     pub fn drain(&self, mut f: impl FnMut(T)) -> usize {
         let mut count = 0usize;
-        loop {
-            let Some((data_ptr, slot_done, head)) = self.claim_slot() else {
-                break;
-            };
+        while let Some((data_ptr, slot_done, head)) = self.claim_slot() {
             let val = unsafe { data_ptr.cast::<T>().read() };
             slot_done.store(head + self.ring().cap, Ordering::Release);
             count += 1;

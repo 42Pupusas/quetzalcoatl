@@ -215,7 +215,7 @@ impl<C: Config> ConfigBounds<C> {
             C::PRODUCER_BATCH >= 1 && C::PRODUCER_BATCH <= 32,
             "Config::PRODUCER_BATCH must be in 1..=32 (bounded by the u32 per-batch bitmap)",
         );
-        assert!(C::CAS_FAIL_SKIP >= 1, "Config::CAS_FAIL_SKIP must be >= 1",);
+        assert!(C::CAS_FAIL_SKIP >= 1, "Config::CAS_FAIL_SKIP must be >= 1");
         assert!(
             C::CONSUMED_FLUSH >= 1,
             "Config::CONSUMED_FLUSH must be >= 1",
