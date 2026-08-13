@@ -202,11 +202,16 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Wakes the parked producer, if any. Gated on a `Relaxed` load
-    /// of `producer_parked` so the no-park hot path stays branch-free.
+    /// Wakes the parked producer, if any.
+    ///
+    /// The `SeqCst` load pairs with the producer's `SeqCst` store of
+    /// `producer_parked = true` in `arm_park` to form a Dekker
+    /// handshake. A `Relaxed` load here cannot order this load against
+    /// the caller's preceding close store or slot release, so both
+    /// sides could miss and the producer parked forever.
     #[inline]
     pub(crate) fn wake_producer(&self) {
-        if !self.producer_parked.0.load(Ordering::Relaxed) {
+        if !self.producer_parked.0.load(Ordering::SeqCst) {
             return;
         }
         self.producer_parked.0.store(false, Ordering::Relaxed);

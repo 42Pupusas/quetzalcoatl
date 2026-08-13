@@ -160,7 +160,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             let _ = self.ring().producer_parker.set(std::thread::current());
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
 
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake.
+            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
                 self.ring()
                     .producer_parked
                     .0
@@ -209,7 +210,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.push(val)
     }
     fn consumer_gone(&self) -> bool {
-        self.ring().consumer_closed.0.load(Ordering::Acquire)
+        // SeqCst: post-arm half of the close handshake.
+        self.ring().consumer_closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
         let _ = self.ring().producer_parker.set(std::thread::current());
@@ -225,7 +227,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
-        self.ring().closed.0.store(true, Ordering::Release);
+        // SeqCst: pairs with each consumer's post-arm SeqCst load.
+        self.ring().closed.0.store(true, Ordering::SeqCst);
         self.ring().consumer_park.flush();
         #[cfg(feature = "async")]
         self.ring().consumer_waker.flush();

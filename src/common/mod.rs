@@ -55,6 +55,9 @@ pub trait SingleParkerProducer<T> {
     /// Non-blocking push; `Err(val)` hands the value back when full.
     fn try_push(&self, val: T) -> Result<(), T>;
     /// True once the consumer side is gone — stop blocking, return `Err`.
+    ///
+    /// Implementors must load the close flag with `SeqCst`; see
+    /// [`SingleParkerConsumer::producer_gone`].
     fn consumer_gone(&self) -> bool;
     /// Install this thread's park handle and publish "parked" (`SeqCst`,
     /// pairing with the consumer's wake-side load).

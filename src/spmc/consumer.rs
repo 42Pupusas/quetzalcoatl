@@ -257,7 +257,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Some(v);
             }
-            if q.closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake.
+            if q.closed.0.load(Ordering::SeqCst) {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return self.pop();
             }
@@ -341,7 +342,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                     .fetch_and(!bit_mask, Ordering::Relaxed);
                 return self.pop_ref();
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake, paired
+            // with the SeqCst fetch_or on the park bitmask above.
+            if self.ring().closed.0.load(Ordering::SeqCst) {
                 self.ring()
                     .consumer_park
                     .wake
@@ -398,10 +401,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             q.done_slot(pos).0.store(pos + cap, Ordering::Release);
         }
         if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
-            q.consumer_closed.0.store(true, Ordering::Release);
-            if let Some(handle) = q.producer_parker.get() {
-                handle.unpark();
-            }
+            // SeqCst store + wake_producer's SeqCst load of
+            // producer_parked are the two halves of the close
+            // handshake. Reading the parker OnceLock directly skips
+            // the load and lets the producer park after we decide not
+            // to wake it.
+            q.consumer_closed.0.store(true, Ordering::SeqCst);
+            q.wake_producer();
             #[cfg(feature = "async")]
             q.producer_waker.flush();
         }
