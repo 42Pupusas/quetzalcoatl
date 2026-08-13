@@ -153,6 +153,7 @@ impl<T> RingBuffer<T> {
         }
     }
 
+
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_producer_async(&self) {
@@ -876,21 +877,22 @@ mod tests {
 
     #[test]
     fn push_block_returns_err_on_consumer_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
         for i in 0..4 {
             p.push(i).unwrap();
         }
         assert!(p.push(99).is_err());
         let h = std::thread::spawn(move || p.push_block(99));
-        // Drain the buffer so consumer's Drop only sets consumer_closed
-        // after push_block has committed to parking. The parker OnceLock
-        // latches; producer_parked does not.
-        ParkProbe::new().expect_until("push_block to install its parker", || {
-            c.queue.producer_parker.get().is_some()
+        ParkProbe::new().expect_until("push_block to arm its park", || {
+            c.queue.producer_parked.0.load(Ordering::SeqCst)
         });
-        while c.pop().is_some() {}
-        drop(c);
+        // Close without freeing a slot. Consumer::drop drains first, and
+        // a parked producer that gets real space legitimately pushes into
+        // it and returns Ok, which is not the path under test here.
+        c.queue.consumer_closed.0.store(true, Ordering::Release);
+        c.queue.wake_producer();
         assert_eq!(h.join().unwrap(), Err(99));
+        drop(c);
     }
 
     #[test]
@@ -924,18 +926,19 @@ mod tests {
 
     #[test]
     fn reserve_block_returns_none_on_consumer_close() {
-        let (mut p, mut c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (mut p, c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
         let h = std::thread::spawn(move || p.reserve_block().is_some());
-        // Drain so consumer drop only signals after the producer has
-        // committed to parking.
-        ParkProbe::new().expect_until("reserve_block to install its parker", || {
-            c.queue.producer_parker.get().is_some()
+        ParkProbe::new().expect_until("reserve_block to arm its park", || {
+            c.queue.producer_parked.0.load(Ordering::SeqCst)
         });
-        while c.pop().is_some() {}
-        drop(c);
+        // Close without freeing a slot, as in
+        // push_block_returns_err_on_consumer_close.
+        c.queue.consumer_closed.0.store(true, Ordering::Release);
+        c.queue.wake_producer();
         assert!(!h.join().unwrap());
+        drop(c);
     }
 
     #[test]
