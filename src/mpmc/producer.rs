@@ -309,7 +309,9 @@ impl<T, C: Config> Producer<T, C> {
                 }
                 Err(returned) => val = returned,
             }
-            if q.consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake, for the
+            // same reason pop_block's closed.load is SeqCst.
+            if q.consumer_closed.0.load(Ordering::SeqCst) {
                 q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Err(val);
             }

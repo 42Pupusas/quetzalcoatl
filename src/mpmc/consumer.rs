@@ -443,7 +443,9 @@ impl<T, C: Config> Consumer<T, C> {
                     .fetch_and(!bit_mask, Ordering::Relaxed);
                 return self.pop_ref();
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake, paired
+            // with the SeqCst fetch_or on the park bitmask above.
+            if self.queue.closed.0.load(Ordering::SeqCst) {
                 self.queue
                     .consumer_park
                     .wake
@@ -505,7 +507,8 @@ impl<T, C: Config> Drop for Consumer<T, C> {
             .fetch_sub(1, Ordering::AcqRel)
             == 1
         {
-            self.queue.consumer_closed.0.store(true, Ordering::Release);
+            // SeqCst: pairs with each producer's post-arm SeqCst load.
+        self.queue.consumer_closed.0.store(true, Ordering::SeqCst);
             self.queue.producer_park.flush();
             #[cfg(feature = "async")]
             self.queue.producer_waker.flush();
