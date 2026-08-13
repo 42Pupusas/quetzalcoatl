@@ -335,7 +335,7 @@ mod tests {
         for i in 0..n {
             producer
                 .push(i)
-                .unwrap_or_else(|_| panic!("Failed to push {i}",));
+                .unwrap_or_else(|_| panic!("Failed to push {i}"));
         }
         println!("Took {}ms", instant.elapsed().as_millis());
     }
