@@ -4,7 +4,7 @@ pub mod wake_async;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Spawns a *progress-based* deadlock watchdog for the async cross-thread
 /// tests.
@@ -219,6 +219,69 @@ pub const TOMBSTONE: usize = usize::MAX;
 pub struct SeqSlot<T> {
     pub data: UnsafeCell<MaybeUninit<T>>,
     pub sequence: AtomicUsize,
+}
+
+impl<T> SeqSlot<T> {
+    /// Classifies this slot for logical position `pos` from a single
+    /// atomic load. See [`SlotSnapshot::classify`] for the shared logic
+    /// (also used by the broadcast ring's `BroadcastSlot`, which reuses
+    /// the same `pos * 2 + 1` / `TOMBSTONE` encoding).
+    #[inline]
+    pub fn classify(&self, pos: usize) -> SlotSnapshot<*const MaybeUninit<T>> {
+        SlotSnapshot::classify(&self.sequence, &self.data, pos)
+    }
+}
+
+/// Ephemeral, zero-cost view of a slot's synchronization state.
+///
+/// Never stored — [`SlotSnapshot::classify`] computes it from a single
+/// atomic load and callers match on it immediately, so it costs nothing beyond
+/// the load + comparisons the old hand-rolled `if seq == TOMBSTONE {..}
+/// else if seq != pos * 2 + 1 {..} else {..}` chains already performed.
+/// This exists purely to de-duplicate that chain (it was repeated
+/// verbatim across `pop`/`pop_ref`/`drain`/`drain_up_to` in both the
+/// mpsc and broadcast consumers) — it is not an alternative in-memory
+/// representation for the slot itself (see the module-level rationale
+/// for why the payload still lives behind `UnsafeCell<MaybeUninit<T>>`
+/// rather than inside this enum).
+pub enum SlotSnapshot<D> {
+    /// Slot holds a value published at this logical position. Carries
+    /// a raw pointer (not `&T`) because callers disagree on what to do
+    /// with it: `pop`/`drain` move the value out (`assume_init_read`),
+    /// while `pop_ref` borrows it (`assume_init_ref`) for a `SlotReader`.
+    Ready(D),
+    /// Slot was reserved but abandoned (a `SlotWriter`/`WrittenSlot`
+    /// dropped without committing) — consumers must skip it, typically
+    /// by releasing it and advancing past.
+    Tombstoned,
+    /// Not yet published at this position (free, or a producer is
+    /// mid-write) — nothing to read yet.
+    NotReady,
+}
+
+impl<T> SlotSnapshot<*const MaybeUninit<T>> {
+    /// Shared classification logic for the `seq == pos * 2 + 1` /
+    /// `TOMBSTONE` slot encoding used by both `SeqSlot` (mpsc) and
+    /// `BroadcastSlot` (broadcast). The two differ only in what the
+    /// "free" value looks like (`pos * 2` vs. always `0`) — irrelevant
+    /// here, since classification only ever tests for `Ready` or
+    /// `Tombstoned` and treats everything else (including either flavor
+    /// of "free") as `NotReady`.
+    #[inline]
+    pub fn classify(
+        seq: &AtomicUsize,
+        data: &UnsafeCell<MaybeUninit<T>>,
+        pos: usize,
+    ) -> Self {
+        let seq = seq.load(Ordering::Acquire);
+        if seq == TOMBSTONE {
+            Self::Tombstoned
+        } else if seq == pos * 2 + 1 {
+            Self::Ready(data.get().cast_const())
+        } else {
+            Self::NotReady
+        }
+    }
 }
 
 /// Buffer with cache-line-aligned allocation.

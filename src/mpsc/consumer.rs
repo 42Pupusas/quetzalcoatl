@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::TOMBSTONE;
+use crate::common::SlotSnapshot;
 
 /// The consumer side of an MPSC ring buffer.
 ///
@@ -34,8 +34,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     fn has_item(&self) -> bool {
         let head = self.ring().head.load(Ordering::Relaxed);
-        let seq = self.ring().slot(head).sequence.load(Ordering::Acquire);
-        seq == head * 2 + 1 || seq == TOMBSTONE
+        !matches!(
+            self.ring().slot(head).classify(head),
+            SlotSnapshot::NotReady
+        )
     }
 
     #[inline]
@@ -46,21 +48,20 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let slot = self.ring().slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    slot.sequence
+                        .store((head + self.ring().cap) * 2, Ordering::Release);
+                    self.ring().head.store(head + 1, Ordering::Release);
+                    continue;
+                }
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
-            if seq == TOMBSTONE {
-                slot.sequence
-                    .store((head + self.ring().cap) * 2, Ordering::Release);
-                self.ring().head.store(head + 1, Ordering::Release);
-                continue;
-            }
-
-            if seq != head * 2 + 1 {
-                return None;
-            }
-
-            // SAFETY: We checked that the slot is ready
-            let val = unsafe { (*slot.data.get()).assume_init_read() };
+            // SAFETY: classify() returned Ready, meaning this slot is
+            // initialized and synchronized via the Acquire load inside it.
+            let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
                 .store((head + self.ring().cap) * 2, Ordering::Release);
@@ -83,21 +84,17 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let slot = self.ring().slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    slot.sequence
+                        .store((head + self.ring().cap) * 2, Ordering::Release);
+                    self.ring().head.store(head + 1, Ordering::Release);
+                    continue;
+                }
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
-            if seq == TOMBSTONE {
-                slot.sequence
-                    .store((head + self.ring().cap) * 2, Ordering::Release);
-                self.ring().head.store(head + 1, Ordering::Release);
-                continue;
-            }
-
-            if seq != head * 2 + 1 {
-                return None;
-            }
-
-            // SAFETY: seq == head * 2 + 1 guarantees the slot has been initialized.
-            let data_ptr = slot.data.get().cast_const();
             let seq_ptr = &raw const slot.sequence;
 
             return Some(SlotReader {
@@ -116,21 +113,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         loop {
             let slot = self.ring().slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    slot.sequence
+                        .store((head + self.ring().cap) * 2, Ordering::Release);
+                    head += 1;
+                    continue;
+                }
+                SlotSnapshot::NotReady => break,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
-            if seq == TOMBSTONE {
-                slot.sequence
-                    .store((head + self.ring().cap) * 2, Ordering::Release);
-                head += 1;
-                continue;
-            }
-
-            if seq != head * 2 + 1 {
-                break;
-            }
-
-            // SAFETY: We checked that the slot is ready
-            let val = unsafe { (*slot.data.get()).assume_init_read() };
+            // SAFETY: classify() returned Ready.
+            let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
                 .store((head + self.ring().cap) * 2, Ordering::Release);
@@ -157,20 +152,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         while count < limit {
             let slot = self.ring().slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    slot.sequence
+                        .store((head + self.ring().cap) * 2, Ordering::Release);
+                    head += 1;
+                    continue;
+                }
+                SlotSnapshot::NotReady => break,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
-            if seq == TOMBSTONE {
-                slot.sequence
-                    .store((head + self.ring().cap) * 2, Ordering::Release);
-                head += 1;
-                continue;
-            }
-
-            if seq != head * 2 + 1 {
-                break;
-            }
-
-            let val = unsafe { (*slot.data.get()).assume_init_read() };
+            // SAFETY: classify() returned Ready.
+            let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
                 .store((head + self.ring().cap) * 2, Ordering::Release);

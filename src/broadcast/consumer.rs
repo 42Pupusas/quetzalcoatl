@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::TOMBSTONE;
+use crate::common::SlotSnapshot;
 
 /// The consumer side of a broadcast ring buffer.
 ///
@@ -87,27 +87,23 @@ impl<T> Consumer<T> {
 
             let slot = self.queue.slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    // Abandoned slot — skip it by advancing this consumer's head.
+                    self.queue.consumer_slots[self.slot_index]
+                        .head
+                        .store(head + 1, Ordering::Release);
+                    continue;
+                }
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
-            if seq == TOMBSTONE {
-                // Abandoned slot — skip it by advancing this consumer's head.
-                self.queue.consumer_slots[self.slot_index]
-                    .head
-                    .store(head + 1, Ordering::Release);
-                continue;
-            }
-
-            // The sequence number is the sole synchronization point.
-            // seq == head * 2 + 1 means the producer has written data at this position.
-            // Any other value means either empty or not-yet-committed.
-            if seq != head * 2 + 1 {
-                return None;
-            }
-
-            // SAFETY: sequence == head * 2 + 1 synchronizes with producer's Release,
-            // ensuring the data write is visible. The data won't be overwritten
-            // because this consumer's head hasn't advanced (min_head blocks producer).
-            let val = unsafe { (*slot.data.get()).assume_init_ref().clone() };
+            // SAFETY: classify() returned Ready, which synchronizes with the
+            // producer's Release, ensuring the data write is visible. The
+            // data won't be overwritten because this consumer's head hasn't
+            // advanced (min_head blocks the producer).
+            let val = unsafe { (*data_ptr).assume_init_ref().clone() };
 
             // Advance this consumer's head
             self.queue.consumer_slots[self.slot_index]
@@ -181,21 +177,17 @@ impl<T> Consumer<T> {
 
             let slot = self.queue.slot(head);
 
-            let seq = slot.sequence.load(Ordering::Acquire);
-
-            if seq == TOMBSTONE {
-                // Abandoned slot — skip it.
-                self.queue.consumer_slots[self.slot_index]
-                    .head
-                    .store(head + 1, Ordering::Release);
-                continue;
-            }
-
-            if seq != head * 2 + 1 {
-                return None;
-            }
-
-            let data_ptr = slot.data.get().cast_const();
+            let data_ptr = match slot.classify(head) {
+                SlotSnapshot::Tombstoned => {
+                    // Abandoned slot — skip it.
+                    self.queue.consumer_slots[self.slot_index]
+                        .head
+                        .store(head + 1, Ordering::Release);
+                    continue;
+                }
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Ready(data_ptr) => data_ptr,
+            };
 
             return Some(SlotReader {
                 data_ptr,

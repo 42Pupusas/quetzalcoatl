@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-13
+
+### Fixed
+- **`spsc::RingBuffer::split_borrowed` doc example** — the example
+  borrowed the handles into `thread::scope` closures, but `spsc::Producer`
+  holds a `Cell<usize>` and is therefore not `Sync`, so `&Producer` is not
+  `Send`. The example failed to compile. The closures now take `move`,
+  which is what the surrounding prose already described.
+
+### Changed
+- **Internal slot classification** — the `seq == pos * 2 + 1` /
+  `TOMBSTONE` decode was repeated verbatim across `pop`, `pop_ref`,
+  `drain`, and `drain_up_to` in both the mpsc and broadcast consumers.
+  It now lives in one place, `common::SlotSnapshot::classify`, with
+  `SeqSlot::classify` and `BroadcastSlot::classify` as the per-ring
+  entry points. `common` is `pub(crate)`, so there is no public API
+  change; the emitted work is the same single `Acquire` load plus the
+  same comparisons.
+
 ## [0.12.0] - 2026-06-02
 
 ### Added

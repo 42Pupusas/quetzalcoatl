@@ -51,6 +51,21 @@ pub(super) struct BroadcastSlot<T> {
     pub sequence: AtomicUsize,
 }
 
+impl<T> BroadcastSlot<T> {
+    /// Classifies this slot for logical position `pos` - see
+    /// `crate::common::SlotSnapshot::classify` for the shared logic (the
+    /// "free" sentinel here is always `0` rather than `pos * 2`, but
+    /// classification only distinguishes Ready/Tombstoned from
+    /// everything else, so the difference is immaterial).
+    #[inline]
+    pub(super) fn classify(
+        &self,
+        pos: usize,
+    ) -> crate::common::SlotSnapshot<*const MaybeUninit<T>> {
+        crate::common::SlotSnapshot::classify(&self.sequence, &self.data, pos)
+    }
+}
+
 /// Per-consumer slot in the fixed-size consumer registry.
 pub(super) struct ConsumerSlot {
     pub head: CachePadded<AtomicUsize>,

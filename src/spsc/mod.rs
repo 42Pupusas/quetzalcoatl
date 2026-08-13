@@ -249,10 +249,10 @@ impl<T> RingBuffer<T> {
     /// let (producer, mut consumer) = ring.split_borrowed();
     ///
     /// std::thread::scope(|s| {
-    ///     s.spawn(|| {
+    ///     s.spawn(move || {
     ///         producer.push("hello").unwrap();
     ///     });
-    ///     s.spawn(|| {
+    ///     s.spawn(move || {
     ///         loop {
     ///             if let Some(v) = consumer.pop() {
     ///                 assert_eq!(v, "hello");
