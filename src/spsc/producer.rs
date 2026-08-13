@@ -192,7 +192,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             // after `head.store(Release)`.
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
 
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: the post-arm re-check is the second half of the
+            // close handshake with Consumer::drop.
+            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
                 self.ring()
                     .producer_parked
                     .0
@@ -299,10 +301,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
-        self.ring().producer_closed.0.store(true, Ordering::Release);
-        if let Some(handle) = self.ring().consumer_parker.get() {
-            handle.unpark();
-        }
+        // SeqCst store + the SeqCst load inside wake_consumer are both
+        // halves of the close handshake. A bare unpark here reads the
+        // parker OnceLock without ever loading consumer_parked, so the
+        // store and the consumer's re-check stay unordered and the
+        // consumer can park after we decide not to wake it.
+        self.ring().producer_closed.0.store(true, Ordering::SeqCst);
+        self.ring().wake_consumer();
         #[cfg(feature = "async")]
         self.ring().consumer_waker.flush();
     }

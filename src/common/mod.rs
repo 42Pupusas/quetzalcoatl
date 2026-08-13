@@ -106,6 +106,13 @@ pub trait SingleParkerConsumer<T> {
     /// Non-blocking pop.
     fn try_pop(&mut self) -> Option<T>;
     /// True once the producer side is gone — drain then return `None`.
+    ///
+    /// Implementors must load the close flag with `SeqCst`. The
+    /// post-arm call is one half of a Dekker handshake with the
+    /// closing peer; `Acquire` orders a store against a later load of
+    /// the *same* location and leaves this store/load pair on two
+    /// different locations unordered, so both sides can miss and the
+    /// waiter parks forever.
     fn producer_gone(&self) -> bool;
     /// Install this thread's park handle and publish "parked" (`SeqCst`).
     fn arm_park(&self);
@@ -382,10 +389,13 @@ unsafe impl<T: Sync> Sync for AlignedBuf<T> {}
 pub fn cas_backoff(failures: &mut u32) {
     // Under Miri, spin_loop() is an interleaving point. Exponential
     // spin counts explode the state space, so we just yield instead.
+    // The counter still advances: it gates the park branch, and pinning
+    // it at zero makes every waiter spin forever and hides all
+    // park/unpark logic from Miri.
     #[cfg(miri)]
     {
-        let _ = failures;
         std::thread::yield_now();
+        *failures = failures.saturating_add(1).min(12);
     }
     #[cfg(not(miri))]
     {

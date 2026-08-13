@@ -286,7 +286,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
         self.pop()
     }
     fn producer_gone(&self) -> bool {
-        self.ring().producer_closed.0.load(Ordering::Acquire)
+        // SeqCst, not Acquire: this load is the second half of the
+        // close handshake and must sit in the same total order as the
+        // closer's producer_closed store and its consumer_parked load.
+        self.ring().producer_closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
         // SeqCst pairs with the producer's `consumer_parked.load` after
@@ -317,7 +320,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         self.pop_ref()
     }
     fn producer_gone(&self) -> bool {
-        self.ring().producer_closed.0.load(Ordering::Acquire)
+        // SeqCst: see the SingleParkerConsumer impl above.
+        self.ring().producer_closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
         let _ = self.ring().consumer_parker.set(std::thread::current());
@@ -334,10 +338,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     fn drop(&mut self) {
         while self.pop().is_some() {}
-        self.ring().consumer_closed.0.store(true, Ordering::Release);
-        if let Some(handle) = self.ring().producer_parker.get() {
-            handle.unpark();
-        }
+        // Symmetric to Producer::drop.
+        self.ring().consumer_closed.0.store(true, Ordering::SeqCst);
+        self.ring().wake_producer();
         #[cfg(feature = "async")]
         self.ring().producer_waker.flush();
     }
