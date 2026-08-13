@@ -331,6 +331,7 @@ impl<T> RingBuffer<T> {
 mod tests {
     use super::*;
     use crate::capacity::Capacity;
+    use crate::common::park_probe::ParkProbe;
 
     #[test]
     fn capacity_one() {
@@ -881,9 +882,12 @@ mod tests {
         }
         assert!(p.push(99).is_err());
         let h = std::thread::spawn(move || p.push_block(99));
-        std::thread::sleep(std::time::Duration::from_millis(50));
         // Drain the buffer so consumer's Drop only sets consumer_closed
-        // after we've seen push_block parked.
+        // after push_block has committed to parking. The parker OnceLock
+        // latches; producer_parked does not.
+        ParkProbe::new().expect_until("push_block to install its parker", || {
+            c.queue.producer_parker.get().is_some()
+        });
         while c.pop().is_some() {}
         drop(c);
         assert_eq!(h.join().unwrap(), Err(99));
@@ -924,8 +928,11 @@ mod tests {
         p.push(1).unwrap();
         p.push(2).unwrap();
         let h = std::thread::spawn(move || p.reserve_block().is_some());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Drain so consumer drop only signals after producer is parked.
+        // Drain so consumer drop only signals after the producer has
+        // committed to parking.
+        ParkProbe::new().expect_until("reserve_block to install its parker", || {
+            c.queue.producer_parker.get().is_some()
+        });
         while c.pop().is_some() {}
         drop(c);
         assert!(!h.join().unwrap());

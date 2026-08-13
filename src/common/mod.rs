@@ -1,4 +1,6 @@
 pub mod park;
+#[cfg(test)]
+pub mod park_probe;
 #[cfg(feature = "async")]
 pub mod wake_async;
 

@@ -420,6 +420,7 @@ impl<T, C: Config> Drop for RingBuffer<T, C> {
 mod tests {
     use super::*;
     use crate::capacity::Capacity;
+    use crate::common::park_probe::ParkProbe;
 
     #[test]
     #[should_panic(expected = "mpmc requires capacity >= 4")]
@@ -1314,7 +1315,12 @@ mod tests {
             })
             .collect();
         drop(p);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Every producer must set its wake bit before the drain runs.
+        // Otherwise a producer still spinning can push into a slot the
+        // drain just freed, and the drain collects more than CAP.
+        ParkProbe::new().expect_until("all producers to set their wake bit", || {
+            c.queue.producer_park.wake.load(Ordering::SeqCst).count_ones() == N_PRODUCERS
+        });
 
         // Single drain — releases done[s] for all 4 slots and wakes
         // up to 4 producers via wake_n.
