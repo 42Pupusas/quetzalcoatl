@@ -154,7 +154,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             q.producer_park.ensure_handle_installed(self.park_slot);
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
 
-            if q.consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake.
+            if q.consumer_closed.0.load(Ordering::SeqCst) {
                 q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
                 return Err(val);
             }
@@ -260,7 +261,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
 
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake.
+            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
                 self.ring()
                     .producer_park
                     .wake
@@ -305,7 +307,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
         if self.ring().producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.ring().closed.0.store(true, Ordering::Release);
+            // SeqCst: pairs with the consumer's post-arm SeqCst load
+            // and with wake_consumer's SeqCst load of consumer_parked.
+            self.ring().closed.0.store(true, Ordering::SeqCst);
             self.ring().wake_consumer();
             #[cfg(feature = "async")]
             self.ring().consumer_waker.flush();

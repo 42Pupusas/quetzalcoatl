@@ -163,7 +163,8 @@ impl<T> RingBuffer<T> {
     /// Externally closes the ring, causing any blocked `pop_block` to
     /// return `None`. Subsequent pushes are silently dropped.
     pub fn close(&self) {
-        self.closed.0.store(true, Ordering::Release);
+        // SeqCst: see Producer::drop.
+        self.closed.0.store(true, Ordering::SeqCst);
         self.wake_consumer();
         #[cfg(feature = "async")]
         self.consumer_waker.flush();
