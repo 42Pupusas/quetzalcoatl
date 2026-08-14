@@ -1237,7 +1237,7 @@ mod tests {
         // Wait for all producers to complete WITHOUT calling drain
         // or pop again — those would each emit additional wakes and
         // mask the bug.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         for (i, h) in producers.into_iter().enumerate() {
             while !h.is_finished() {
                 assert!(

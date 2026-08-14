@@ -201,6 +201,9 @@ mod cmp_mpsc {
 #[path = "comparison/spmc_split.rs"]
 mod cmp_spmc_split;
 
+#[path = "comparison/mpsc_split.rs"]
+mod cmp_mpsc_split;
+
 mod cmp_spmc {
     use super::*;
 
