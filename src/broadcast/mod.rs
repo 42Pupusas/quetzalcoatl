@@ -1386,6 +1386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow for Miri")]
     fn push_block_streams_far_past_capacity() {
         // Regression for the relay burst hang: a single producer pushes
         // many multiples of capacity through push_block while two
@@ -1430,6 +1431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow for Miri")]
     fn push_block_multi_producer_streams_past_capacity() {
         // Mirrors the SubRepl ring: N producers (one per shard) sharing
         // one broadcast ring, blocking-pushing concurrently while
