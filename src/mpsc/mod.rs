@@ -230,13 +230,6 @@ impl<T> RingBuffer<T> {
     /// load of `consumer_parked` so the no-park hot path stays
     /// branch-free in the common case.
     ///
-    /// Soundness depends on the caller having performed a `SeqCst`
-    /// commit on `tail` (in `push`/commit) before calling this. That
-    /// store and the consumer's `SeqCst` store of `consumer_parked = true`
-    /// in `pop_block`/`pop_ref_block` form a Dekker pair: either the
-    /// consumer observes the new `tail` in its post-store re-check and
-    /// skips parking, or we observe `parked == true` here and unpark.
-    ///
     /// Idempotent: clearing the flag means any racing producer that
     /// observes it already cleared simply skips the unpark. The
     /// post-clear unpark is still issued by the winner — a stale
@@ -245,10 +238,10 @@ impl<T> RingBuffer<T> {
     /// consumer re-checks the queue after every wake).
     #[inline]
     pub(crate) fn wake_consumer(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
         if !self.consumer_parked.0.load(Ordering::SeqCst) {
             return;
         }
-        // Clear the flag first so concurrent producers all skip past it.
         self.consumer_parked.0.store(false, Ordering::Relaxed);
         if let Some(handle) = self.consumer_parker.get() {
             handle.unpark();

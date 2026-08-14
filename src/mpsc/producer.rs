@@ -115,7 +115,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         match self.claim_slot() {
             Some((data_ptr, slot_seq, pos)) => {
                 unsafe { (*data_ptr).write(val) };
-                slot_seq.store(pos * 2 + 1, Ordering::SeqCst);
+                slot_seq.store(pos * 2 + 1, Ordering::Release);
                 self.ring().wake_consumer();
                 #[cfg(feature = "async")]
                 self.ring().wake_consumer_async();
@@ -379,9 +379,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        // SeqCst: see Producer::push. Pairs with the consumer's SeqCst
-        // `parked.store(true)` to close the missed-wakeup race.
-        self.slot_seq.store(self.pos * 2 + 1, Ordering::SeqCst);
+        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -391,10 +389,7 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        // SeqCst: same Dekker pairing as a real publication — the
-        // tombstone is what the parked consumer needs to observe to
-        // skip the abandoned slot, so it must close the wakeup race.
-        self.slot_seq.store(TOMBSTONE, Ordering::SeqCst);
+        self.slot_seq.store(TOMBSTONE, Ordering::Release);
         // Wake the consumer: it must observe the tombstone and skip
         // past it, otherwise pop_block could hang on a stale slot.
         self.queue.wake_consumer();
@@ -423,8 +418,7 @@ impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to the consumer.
     #[inline]
     pub fn commit(mut self) {
-        // SeqCst: see Producer::push.
-        self.slot_seq.store(self.pos * 2 + 1, Ordering::SeqCst);
+        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
@@ -439,8 +433,7 @@ impl<T> Drop for WrittenSlot<'_, T> {
             unsafe {
                 self.slot_data.cast::<T>().drop_in_place();
             }
-            // SeqCst: same Dekker pairing as a real publication.
-            self.slot_seq.store(TOMBSTONE, Ordering::SeqCst);
+            self.slot_seq.store(TOMBSTONE, Ordering::Release);
             self.queue.wake_consumer();
             #[cfg(feature = "async")]
             self.queue.wake_consumer_async();

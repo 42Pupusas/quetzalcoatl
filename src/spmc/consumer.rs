@@ -26,7 +26,7 @@ pub struct Consumer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     park_slot: usize,
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 4;
 
 // Clone only for the Arc variant.
 impl<T> Clone for Consumer<T> {

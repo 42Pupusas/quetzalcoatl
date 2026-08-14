@@ -18,7 +18,7 @@
 //!   delivered in the order they were pushed.
 //! * **Cross-consumer order is best-effort**: the interleaving between
 //!   consumers' streams is determined by who wins each batch CAS, not by
-//!   item-arrival order. With `BATCH_SIZE = 32`, one consumer can grab 32
+//!   item-arrival order. With `BATCH_SIZE = 4`, one consumer can grab four
 //!   consecutive items before another sees any.
 //! * **Each item is delivered to exactly one consumer.** No duplication,
 //!   no loss.

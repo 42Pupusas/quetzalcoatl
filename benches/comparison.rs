@@ -198,6 +198,9 @@ mod cmp_mpsc {
 // SPMC: quetzalcoatl vs crossbeam (1 producer, N consumers)
 // =============================================================================
 
+#[path = "comparison/spmc_split.rs"]
+mod cmp_spmc_split;
+
 mod cmp_spmc {
     use super::*;
 
