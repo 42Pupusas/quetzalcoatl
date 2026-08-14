@@ -66,9 +66,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             slot.sequence
                 .store((head + self.ring().cap) * 2, Ordering::Release);
 
-            self.ring().head.store(head + 1, Ordering::Release);
+            // SeqCst (not Release): `xchg` drains the store buffer,
+            // publishing this store and the `sequence` store above
+            // before the bitmap load inside `wake_one_published`.
+            // That makes `wake_one`'s leading fence redundant, so we
+            // pay one barrier per pop instead of two. Same idiom as
+            // `mpmc::Consumer::pop`.
+            self.ring().head.store(head + 1, Ordering::SeqCst);
 
-            self.ring().producer_park.wake_one();
+            self.ring().producer_park.wake_one_published();
             #[cfg(feature = "async")]
             self.ring().wake_producer_async();
 

@@ -106,7 +106,25 @@ impl WakeSet {
         // from `wake` and skip the unpark. SeqCst load alone is insufficient
         // — it doesn't drain the store buffer; only an mfence (or RMW)
         // does.
+        //
+        // Callers that publish with a `SeqCst` *store* (an `xchg` on
+        // x86, which drains the store buffer itself) already satisfy
+        // this and must call [`wake_one_published`] instead.
         std::sync::atomic::fence(Ordering::SeqCst);
+        self.wake_one_published();
+    }
+
+    /// [`wake_one`](Self::wake_one) without the leading `SeqCst` fence.
+    ///
+    /// For callers whose publish store is itself `SeqCst` (`xchg` on
+    /// x86) and therefore already drains the store buffer, making the
+    /// fence redundant. The bitmap load stays `SeqCst` so the pairing
+    /// with the waiter's `fetch_or(bit, SeqCst)` is unchanged.
+    ///
+    /// Calling this after a mere `Release` publish reopens the
+    /// Dekker-style missed wake described on [`wake_one`].
+    #[inline]
+    pub fn wake_one_published(&self) {
         // Round-robin: rotate the bitmap so the slot just past
         // `cursor` is the new lowest bit, and pick its trailing
         // zero. Without this, `trailing_zeros` always picks the
