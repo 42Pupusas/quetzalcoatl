@@ -67,6 +67,10 @@ harness = false
 name = "mpmc"
 harness = false
 
+[[bench]]
+name = "matched"
+harness = false
+
 [dev-dependencies]
 anyhow = "1.0.102"
 io-uring = "0.7.12"
