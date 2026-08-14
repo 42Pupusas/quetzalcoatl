@@ -18,8 +18,7 @@ use crate::common::TOMBSTONE;
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
 /// (when `R = Arc`) — each clone shares the same underlying buffer and
-/// claims slots via atomic fetch-and-add (FAA), eliminating inter-producer
-/// cache-line contention on the tail pointer.
+/// claims slots through an atomic compare-and-exchange operation on the tail.
 pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     pub(super) queue: R,
     pub(super) cached_head: std::cell::Cell<usize>,
@@ -65,46 +64,34 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
-        let current_tail = self.ring().tail.load(Ordering::Relaxed);
-        // `wrapping_sub`: `current_tail` is a Relaxed (possibly stale)
-        // read, so a concurrently-advanced `head` can momentarily exceed
-        // it. A plain `-` then underflows and panics in debug builds. The
-        // wrap yields a huge "used" count that reads as "full", so we
-        // conservatively reload / return None and the caller retries —
-        // the correct outcome for a transiently-inconsistent snapshot.
-        if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
-            let head = self.ring().head.load(Ordering::Acquire);
-            self.cached_head.set(head);
+        let mut current_tail = self.ring().tail.load(Ordering::Relaxed);
+        let mut backoff = 0u32;
+        loop {
+            if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
+                let head = self.ring().head.load(Ordering::Acquire);
+                self.cached_head.set(head);
 
-            if current_tail.wrapping_sub(head) >= self.ring().cap {
-                return None;
+                if current_tail.wrapping_sub(head) >= self.ring().cap {
+                    return None;
+                }
+            }
+
+            match self.ring().tail.compare_exchange_weak(
+                current_tail,
+                current_tail + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(pos) => {
+                    let slot = self.ring().slot(pos);
+                    return Some((slot.data.get(), &slot.sequence, pos));
+                }
+                Err(observed_tail) => {
+                    current_tail = observed_tail;
+                    crate::common::cas_backoff(&mut backoff);
+                }
             }
         }
-
-        let pos = self.ring().tail.fetch_add(1, Ordering::Relaxed);
-
-        let slot = self.ring().slot(pos);
-
-        let seq = slot.sequence.load(Ordering::Acquire);
-        if seq != pos * 2 {
-            let mut backoff = 0u32;
-            while slot.sequence.load(Ordering::Acquire) != pos * 2 {
-                crate::common::cas_backoff(&mut backoff);
-            }
-        }
-
-        Some((slot.data.get(), &slot.sequence, pos))
-    }
-
-    #[inline]
-    fn has_space(&self) -> bool {
-        let current_tail = self.ring().tail.load(Ordering::Relaxed);
-        if current_tail - self.cached_head.get() < self.ring().cap {
-            return true;
-        }
-        let head = self.ring().head.load(Ordering::Acquire);
-        self.cached_head.set(head);
-        current_tail - head < self.ring().cap
     }
 
     /// Pushes a value into the ring buffer.
@@ -176,6 +163,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             std::thread::park();
             q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            backoff = 0;
         }
     }
 
@@ -246,14 +234,25 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// Same wait protocol as [`push_block`](Self::push_block). Useful
     /// when you want zero-copy writes plus blocking.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let queue = self.ring();
+        self.claim_slot_block()
+            .map(|(data_ptr, slot_seq, pos)| SlotWriter {
+                slot_data: data_ptr,
+                slot_seq,
+                pos,
+                queue,
+            })
+    }
+
+    fn claim_slot_block(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let bit_mask = 1u64 << self.park_slot;
         let mut backoff = 0u32;
         loop {
             if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                 return None;
             }
-            if self.has_space() {
-                return self.reserve();
+            if let Some(claim) = self.claim_slot() {
+                return Some(claim);
             }
             if backoff < BACKOFF_PARK_THRESHOLD {
                 crate::common::cas_backoff(&mut backoff);
@@ -267,11 +266,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 .producer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
-            // See push_block: pairs with WakeSet::wake_one's fence so
-            // the has_space() re-check below cannot read a stale head.
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // SeqCst: post-arm half of the close handshake.
             if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
                 self.ring()
                     .producer_park
@@ -279,12 +275,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                     .fetch_and(!bit_mask, Ordering::Relaxed);
                 return None;
             }
-            if self.has_space() {
+            if let Some(claim) = self.claim_slot() {
                 self.ring()
                     .producer_park
                     .wake
                     .fetch_and(!bit_mask, Ordering::Relaxed);
-                return self.reserve();
+                return Some(claim);
             }
 
             std::thread::park();
@@ -292,6 +288,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 .producer_park
                 .wake
                 .fetch_and(!bit_mask, Ordering::Relaxed);
+            backoff = 0;
         }
     }
 
@@ -341,7 +338,7 @@ pub struct SlotWriter<'a, T> {
     queue: &'a RingBuffer<T>,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
+// SAFETY: SlotWriter holds exclusive access to the claimed slot.
 // The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send> Send for SlotWriter<'_, T> {}
 
@@ -351,7 +348,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: Exclusive access via FAA claim. The pointer is valid
+        // SAFETY: The claim gives exclusive access. The pointer is valid
         // because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
@@ -360,7 +357,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
         let mut this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: Exclusive access via FAA claim, valid pointer.
+        // SAFETY: The claim gives exclusive access and a valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,
@@ -390,8 +387,6 @@ impl<'a, T> SlotWriter<'a, T> {
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
         self.slot_seq.store(TOMBSTONE, Ordering::Release);
-        // Wake the consumer: it must observe the tombstone and skip
-        // past it, otherwise pop_block could hang on a stale slot.
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();

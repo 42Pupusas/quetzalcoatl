@@ -7,10 +7,10 @@
 //!
 //! This bench keeps the two policies apart:
 //!
-//! - `spin_*` modules: every arm retries a try-operation and spins.
-//! - `block_*` modules: every arm parks when it cannot proceed.
+//! - `nonblocking_*` modules: every arm retries a try-operation and spins.
+//! - `blocking_*` modules: every arm parks when it cannot proceed.
 //!
-//! The `block_*` modules are also the only comparison arms that reach
+//! The `blocking_*` modules are also the only comparison arms that reach
 //! the park-arming slow path, so they are the ones that exercise the
 //! SeqCst fences.
 
@@ -28,9 +28,9 @@ const SPSC_ITEMS: u64 = 100_000;
 
 const MPSC_CAPACITY: usize = 8192;
 const MPSC_ITEMS_PER_PRODUCER: u64 = 5_000;
-const PRODUCERS: &[u64] = &[1, 2, 4, 8];
+const PRODUCERS: &[u64] = &[1, 2, 4, 8, 12, 16];
 
-mod spin_spsc {
+mod nonblocking_spsc {
     use super::*;
 
     #[divan::bench]
@@ -58,7 +58,7 @@ mod spin_spsc {
     }
 }
 
-mod block_spsc {
+mod blocking_spsc {
     use super::*;
 
     #[divan::bench]
@@ -86,7 +86,7 @@ mod block_spsc {
     }
 }
 
-mod spin_mpsc {
+mod nonblocking_mpsc {
     use super::*;
 
     #[divan::bench(args = PRODUCERS)]
@@ -114,7 +114,7 @@ mod spin_mpsc {
     }
 }
 
-mod block_mpsc {
+mod blocking_mpsc {
     use super::*;
 
     #[divan::bench(args = PRODUCERS)]

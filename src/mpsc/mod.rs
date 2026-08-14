@@ -1,14 +1,11 @@
 //! Multi-producer, single-consumer (MPSC) lock-free ring buffer.
 //!
-//! Multiple producers push concurrently via atomic fetch-and-add (FAA);
-//! a single consumer pops items in FIFO order. The producer handle is
+//! Multiple producers push concurrently through one atomic tail cursor.
+//! A single consumer pops items in FIFO order. The producer handle is
 //! [`Clone`], so new producers can be created at any time.
 //!
-//! FAA eliminates inter-producer contention on the tail pointer — each
-//! producer claims a unique position on the first try, then spins on its
-//! own slot's sequence number (a separate cache line) until the slot is
-//! free. This scales significantly better than CAS under high producer
-//! counts (8+).
+//! A compare-and-exchange operation checks capacity and advances the tail
+//! as one operation. Thus, a non-blocking push cannot claim a full slot.
 //!
 //! # Example
 //!
@@ -96,7 +93,7 @@ pub struct RingBuffer<T> {
     pub(crate) consumer_waker: WakerSet,
 }
 
-// Safety: Multiple producers use FAA to atomically claim tail slots.
+// Safety: Multiple producers atomically claim unique tail slots.
 // Single consumer touches head. Sequence numbers ensure proper synchronization.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
@@ -628,7 +625,7 @@ mod tests {
         assert_eq!(received, n);
     }
 
-    /// Two producers, tiny buffer — checks FAA + sequence synchronization.
+    /// Two producers, tiny buffer — checks tail + sequence synchronization.
     #[test]
     fn concurrent_mpsc_data_race_check() {
         let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
@@ -1248,6 +1245,126 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             h.join().unwrap();
+        }
+    }
+
+    /// One round of concurrent [`Producer::push`] calls on a ring that
+    /// no consumer drains.
+    ///
+    /// A [`std::sync::Barrier`] releases every producer at the same
+    /// moment, which is what makes them race for the same slot.
+    /// Producers that spawn one after another do not overlap, and the
+    /// overclaim never happens.
+    struct FullRingProbe {
+        capacity: usize,
+        producers: usize,
+    }
+
+    /// Result of one [`FullRingProbe`] round.
+    struct ProbeOutcome {
+        stuck: usize,
+        accepted: usize,
+    }
+
+    impl FullRingProbe {
+        const fn new(capacity: usize, producers: usize) -> Self {
+            Self {
+                capacity,
+                producers,
+            }
+        }
+
+        /// Runs one round and waits up to `deadline` for the producers
+        /// to return.
+        ///
+        /// The threads are detached on purpose. A producer stuck
+        /// inside `push` never returns, so a join would hang the test
+        /// instead of failing it. The counters report the outcome.
+        fn run(&self, deadline: std::time::Duration) -> ProbeOutcome {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::{Arc, Barrier};
+
+            let (producer, _consumer) =
+                RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            let gate = Arc::new(Barrier::new(self.producers));
+            let returned = Arc::new(AtomicUsize::new(0));
+            let accepted = Arc::new(AtomicUsize::new(0));
+
+            for id in 0..self.producers {
+                let handle = producer.clone();
+                let gate = Arc::clone(&gate);
+                let returned = Arc::clone(&returned);
+                let accepted = Arc::clone(&accepted);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    if handle.push(id as u64).is_ok() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    returned.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            drop(producer);
+
+            let start = std::time::Instant::now();
+            while start.elapsed() < deadline && returned.load(Ordering::Relaxed) != self.producers {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            ProbeOutcome {
+                stuck: self.producers - returned.load(Ordering::Relaxed),
+                accepted: accepted.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// [`Producer::push`] must return on a full ring instead of
+    /// waiting for a consumer.
+    ///
+    /// `push` is documented non-blocking: it returns `Err(val)` when
+    /// the ring is full. Only `push_block` may wait.
+    ///
+    /// Test design: start more producers than the ring can hold, gate
+    /// them on a barrier, and never pop. Every producer must return,
+    /// and the ring must accept no more values than its capacity.
+    ///
+    /// The former bug: `claim_slot` checked fullness and then advanced
+    /// `tail` with a separate fetch-and-add. Other producers could move
+    /// `tail` between those steps. A producer then waited for a full slot.
+    ///
+    /// Measured overclaim rate on the unfixed code: 0% at 1-2
+    /// producers, 5.4% at 4, 42.9% at 8, 63.7% at 16. The race needs
+    /// several rounds and several shapes to show up reliably, so this
+    /// test runs a small matrix.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow for Miri: 16 spinning producers")]
+    fn push_returns_on_full_ring_without_consumer() {
+        const ROUNDS: usize = 8;
+        const SHAPES: [(usize, usize); 5] = [(1, 8), (1, 16), (2, 16), (4, 16), (16, 32)];
+
+        for round in 0..ROUNDS {
+            for (capacity, producers) in SHAPES {
+                let outcome =
+                    FullRingProbe::new(capacity, producers).run(std::time::Duration::from_secs(2));
+
+                assert_eq!(
+                    outcome.stuck, 0,
+                    "round {round}, capacity {capacity}, {producers} producers: \
+                     {} producer(s) never returned from push(). push() is \
+                     non-blocking and must return Err(val) when the ring is full",
+                    outcome.stuck
+                );
+                assert!(
+                    outcome.accepted <= capacity,
+                    "round {round}, capacity {capacity}, {producers} producers: \
+                     push() accepted {} values into {capacity} slot(s)",
+                    outcome.accepted
+                );
+                assert!(
+                    outcome.accepted > 0,
+                    "round {round}, capacity {capacity}, {producers} producers: \
+                     an empty ring accepted no values at all"
+                );
+            }
         }
     }
 
