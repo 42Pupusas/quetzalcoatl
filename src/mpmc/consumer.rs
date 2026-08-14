@@ -435,6 +435,8 @@ impl<T, C: Config> Consumer<T, C> {
                 .consumer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
+            // See pop_block: pairs with WakeSet::wake_one's fence.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.has_item() {
                 self.queue

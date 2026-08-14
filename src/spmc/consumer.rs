@@ -252,6 +252,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             q.consumer_park.ensure_handle_installed(self.park_slot);
             q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // Pairs with WakeSet::wake_one's fence: the pop() re-check
+            // below reads the slot sequence with Acquire, which the
+            // SeqCst RMW above does not place in the total order.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
                 q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
@@ -334,6 +338,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 .consumer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
+            // See pop_block: pairs with WakeSet::wake_one's fence.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.has_item() {
                 self.ring()

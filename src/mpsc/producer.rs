@@ -153,6 +153,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             q.producer_park.ensure_handle_installed(self.park_slot);
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // Pairs with the SeqCst fence in WakeSet::wake_one. The
+            // re-check below reads `head`/`sequence` with Acquire from
+            // inside push(); a SeqCst RMW above does not place those
+            // loads in the total order, so without this fence the
+            // consumer can load the wake bitmap as 0 while we read a
+            // stale full ring, and both sides sleep.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
             if q.consumer_closed.0.load(Ordering::SeqCst) {
@@ -260,6 +267,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 .producer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
+            // See push_block: pairs with WakeSet::wake_one's fence so
+            // the has_space() re-check below cannot read a stale head.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
             if self.ring().consumer_closed.0.load(Ordering::SeqCst) {

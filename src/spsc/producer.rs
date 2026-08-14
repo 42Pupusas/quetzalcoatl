@@ -191,6 +191,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             // SeqCst pairs with the consumer's `producer_parked.load`
             // after `head.store(Release)`.
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
+            // The has_space() re-check below loads `head` with Acquire,
+            // which the SeqCst store above does not order. Without this
+            // fence the consumer can read parked == false while we read
+            // a stale full ring, and both sides sleep.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: the post-arm re-check is the second half of the
             // close handshake with Consumer::drop.

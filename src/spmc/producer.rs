@@ -159,6 +159,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             let _ = self.ring().producer_parker.set(std::thread::current());
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
+            // The has_space() re-check below loads `head` with Acquire,
+            // which the SeqCst store above does not order.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
             if self.ring().consumer_closed.0.load(Ordering::SeqCst) {

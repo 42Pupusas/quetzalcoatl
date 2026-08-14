@@ -224,6 +224,10 @@ impl<T> Producer<T> {
 
             q.producer_park.ensure_handle_installed(self.park_slot);
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // Pairs with WakeSet::wake_one's fence: the re-checks below
+            // load consumer state with Acquire, which the SeqCst RMW
+            // above does not place in the total order.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             // Re-check after arming the wake bit: a consumer that advanced
             // (or dropped) between our has_space check and the fetch_or
@@ -272,6 +276,8 @@ impl<T> Producer<T> {
                 .producer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
+            // See push_block: pairs with WakeSet::wake_one's fence.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
             if !any_consumer_active(&self.queue) {
                 self.queue

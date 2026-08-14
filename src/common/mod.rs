@@ -83,6 +83,11 @@ pub trait SingleParkerProducer<T> {
                 continue;
             }
             self.arm_park();
+            // Pairs with the consumer's wake-path fence. arm_park's
+            // SeqCst store does not order the Acquire loads inside
+            // try_push, so without this fence the consumer can read
+            // parked == false while we read a stale full ring.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if self.consumer_gone() {
                 self.disarm_park();
                 return Err(val);
@@ -141,6 +146,11 @@ pub trait SingleParkerConsumer<T> {
                 continue;
             }
             self.arm_park();
+            // Pairs with the SeqCst fence in the producer's wake path.
+            // arm_park's SeqCst store does not order the Acquire loads
+            // inside try_pop, so without this fence the producer can
+            // read `parked == false` while we read a stale empty ring.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if let Some(v) = self.try_pop() {
                 self.disarm_park();
                 return Some(v);
@@ -198,6 +208,8 @@ pub trait SingleParkerConsumerRef {
                 continue;
             }
             self.arm_park();
+            // See pop_block: pairs with the producer's wake-path fence.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if self.has_item() {
                 self.disarm_park();
                 return self.try_pop_ref();

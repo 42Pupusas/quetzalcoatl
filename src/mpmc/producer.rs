@@ -240,8 +240,11 @@ impl<T, C: Config> Producer<T, C> {
                 .producer_park
                 .wake
                 .fetch_or(bit_mask, Ordering::SeqCst);
+            // See pop_block: pairs with WakeSet::wake_one's fence.
+            std::sync::atomic::fence(Ordering::SeqCst);
 
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+            // SeqCst: post-arm half of the close handshake.
+            if self.queue.consumer_closed.0.load(Ordering::SeqCst) {
                 self.queue
                     .producer_park
                     .wake
