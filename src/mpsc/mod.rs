@@ -1387,6 +1387,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "async")]
+    #[cfg_attr(miri, ignore = "too slow for Miri: 10k items through a 4-slot ring")]
     fn async_push_pop_cross_thread() {
         // Multiple producers and one consumer on separate threads. Watchdog
         // aborts the process if anything deadlocks within 5s so the test
@@ -1454,6 +1455,58 @@ mod tests {
         ch.join().unwrap();
         done.store(true, Ordering::Release);
         watchdog.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "async")]
+    fn async_push_pop_cross_thread_small() {
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let n_producers: u64 = 2;
+        let per_producer: u64 = 3;
+        let total = n_producers * per_producer;
+
+        let producer_threads: Vec<_> = (0..n_producers)
+            .map(|tid| {
+                let p = producer.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        for i in 0..per_producer {
+                            p.push_async(tid * per_producer + i)
+                                .await
+                                .expect("consumer dropped");
+                        }
+                    }));
+                })
+            })
+            .collect();
+        drop(producer);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let received = rt.block_on(local.run_until(async move {
+            let mut seen = Vec::new();
+            while (seen.len() as u64) < total {
+                match consumer.pop_async().await {
+                    Some(v) => seen.push(v),
+                    None => break,
+                }
+            }
+            seen
+        }));
+
+        for h in producer_threads {
+            h.join().unwrap();
+        }
+
+        let mut sorted = received;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..total).collect::<Vec<_>>());
     }
 
     #[test]
