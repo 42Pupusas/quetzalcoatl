@@ -6,7 +6,7 @@ const TOTAL_ITEMS: u64 = 20_000;
 
 struct QuetzalcoatlSteady {
     producer: quetzalcoatl::spmc::Producer<u64>,
-    received: Arc<AtomicU64>,
+    producer_done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
     finish: Arc<Barrier>,
@@ -19,14 +19,14 @@ impl QuetzalcoatlSteady {
             quetzalcoatl::capacity::Capacity::exact(CAPACITY),
         )
         .split();
-        let received = Arc::new(AtomicU64::new(0));
+        let producer_done = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let start = Arc::new(Barrier::new(num_consumers as usize + 1));
         let finish = Arc::new(Barrier::new(num_consumers as usize + 1));
         let workers = (0..num_consumers)
             .map(|_| {
                 let consumer = consumer.clone();
-                let received = Arc::clone(&received);
+                let producer_done = Arc::clone(&producer_done);
                 let stop = Arc::clone(&stop);
                 let start = Arc::clone(&start);
                 let finish = Arc::clone(&finish);
@@ -35,12 +35,15 @@ impl QuetzalcoatlSteady {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    while received.load(Ordering::Relaxed) < TOTAL_ITEMS {
+                    loop {
                         if consumer.pop().is_some() {
-                            received.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            std::hint::spin_loop();
+                            continue;
                         }
+                        if producer_done.load(Ordering::Acquire) {
+                            while consumer.pop().is_some() {}
+                            break;
+                        }
+                        std::hint::spin_loop();
                     }
                     finish.wait();
                 })
@@ -49,7 +52,7 @@ impl QuetzalcoatlSteady {
 
         Self {
             producer,
-            received,
+            producer_done,
             stop,
             start,
             finish,
@@ -58,13 +61,14 @@ impl QuetzalcoatlSteady {
     }
 
     fn transfer(&self) {
-        self.received.store(0, Ordering::Relaxed);
+        self.producer_done.store(false, Ordering::Relaxed);
         self.start.wait();
         for item in 0..TOTAL_ITEMS {
             while self.producer.push(black_box(item)).is_err() {
                 std::hint::spin_loop();
             }
         }
+        self.producer_done.store(true, Ordering::Release);
         self.finish.wait();
     }
 }
@@ -81,7 +85,7 @@ impl Drop for QuetzalcoatlSteady {
 
 struct CrossbeamSteady {
     sender: crossbeam_channel::Sender<u64>,
-    received: Arc<AtomicU64>,
+    producer_done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     start: Arc<Barrier>,
     finish: Arc<Barrier>,
@@ -91,14 +95,14 @@ struct CrossbeamSteady {
 impl CrossbeamSteady {
     fn new(num_consumers: u64) -> Self {
         let (sender, receiver) = crossbeam_channel::bounded::<u64>(CAPACITY);
-        let received = Arc::new(AtomicU64::new(0));
+        let producer_done = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let start = Arc::new(Barrier::new(num_consumers as usize + 1));
         let finish = Arc::new(Barrier::new(num_consumers as usize + 1));
         let workers = (0..num_consumers)
             .map(|_| {
                 let receiver = receiver.clone();
-                let received = Arc::clone(&received);
+                let producer_done = Arc::clone(&producer_done);
                 let stop = Arc::clone(&stop);
                 let start = Arc::clone(&start);
                 let finish = Arc::clone(&finish);
@@ -107,12 +111,15 @@ impl CrossbeamSteady {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    while received.load(Ordering::Relaxed) < TOTAL_ITEMS {
+                    loop {
                         if receiver.try_recv().is_ok() {
-                            received.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            std::hint::spin_loop();
+                            continue;
                         }
+                        if producer_done.load(Ordering::Acquire) {
+                            while receiver.try_recv().is_ok() {}
+                            break;
+                        }
+                        std::hint::spin_loop();
                     }
                     finish.wait();
                 })
@@ -121,7 +128,7 @@ impl CrossbeamSteady {
 
         Self {
             sender,
-            received,
+            producer_done,
             stop,
             start,
             finish,
@@ -130,11 +137,12 @@ impl CrossbeamSteady {
     }
 
     fn transfer(&self) {
-        self.received.store(0, Ordering::Relaxed);
+        self.producer_done.store(false, Ordering::Relaxed);
         self.start.wait();
         for item in 0..TOTAL_ITEMS {
             self.sender.send(black_box(item)).unwrap();
         }
+        self.producer_done.store(true, Ordering::Release);
         self.finish.wait();
     }
 }

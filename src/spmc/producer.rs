@@ -38,25 +38,24 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         &self.queue
     }
 
-    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
+    fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, usize)> {
         let pos = self.write_pos.get();
 
         let done = self.ring().done_slot(pos);
-        if done.0.load(Ordering::Acquire) != pos {
+        if done.load(Ordering::Acquire) != pos {
             return None;
         }
 
-        let ready = self.ring().ready_slot(pos);
         let data_ptr = self.ring().data_slot(pos).get();
 
         self.write_pos.set(pos + 1);
-        Some((data_ptr, &ready.0, pos))
+        Some((data_ptr, pos))
     }
 
     #[inline]
     fn has_space(&self) -> bool {
         let pos = self.write_pos.get();
-        self.ring().done_slot(pos).0.load(Ordering::Acquire) == pos
+        self.ring().done_slot(pos).load(Ordering::Acquire) == pos
     }
 
     /// Pushes a value into the ring buffer.
@@ -65,10 +64,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.try_claim() {
-            Some((data_ptr, slot_ready, pos)) => {
+            Some((data_ptr, _pos)) => {
                 // SAFETY: We are the sole producer and the slot is free.
                 unsafe { (*data_ptr).write(val) };
-                slot_ready.store(pos + 1, Ordering::Release);
                 self.ring()
                     .tail
                     .store(self.write_pos.get(), Ordering::Release);
@@ -129,9 +127,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.try_claim()
-            .map(|(data_ptr, slot_ready, pos)| SlotWriter {
+            .map(|(data_ptr, pos)| SlotWriter {
                 slot_data: data_ptr,
-                slot_ready,
                 tail: &self.ring().tail,
                 write_pos: &self.write_pos,
                 pos,
@@ -247,7 +244,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
 /// Dropped without writing → silently rolled back.
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_ready: &'a AtomicUsize,
     tail: &'a AtomicUsize,
     write_pos: &'a std::cell::Cell<usize>,
     pos: usize,
@@ -275,7 +271,6 @@ impl<'a, T> SlotWriter<'a, T> {
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,
-            slot_ready: this.slot_ready,
             tail: this.tail,
             write_pos: this.write_pos,
             pos: this.pos,
@@ -292,7 +287,6 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.slot_ready.store(self.pos + 1, Ordering::Release);
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
         #[cfg(feature = "async")]
@@ -313,7 +307,6 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// committing → value is dropped and reservation rolled back.
 pub struct WrittenSlot<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_ready: &'a AtomicUsize,
     tail: &'a AtomicUsize,
     write_pos: &'a std::cell::Cell<usize>,
     pos: usize,
@@ -329,7 +322,6 @@ impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to consumers.
     #[inline]
     pub fn commit(mut self) {
-        self.slot_ready.store(self.pos + 1, Ordering::Release);
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
         #[cfg(feature = "async")]

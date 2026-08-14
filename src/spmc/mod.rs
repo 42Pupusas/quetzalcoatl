@@ -71,43 +71,19 @@ use std::thread::Thread;
 ///
 /// # Layout
 ///
-/// Data and per-slot readiness markers live in **separate arrays**. Data
-/// is packed (one element per slot, no padding); the readiness array is
-/// cache-line padded so a consumer's release-store on slot `s` does not
-/// invalidate the producer's lines for adjacent slots.
+/// Data and completion markers use separate packed arrays.
 ///
-/// # Synchronization (split-plane protocol)
+/// # Synchronization
 ///
-/// Two per-slot atomic arrays, on separate cache lines:
-///
-/// * `ready[s]` — **producer-write, consumer-read**. Producer Release-stores
-///   `ready[s] = p + 1` to publish data at logical position `p`; consumer
-///   Acquire-loads to see when data is available.
-///
-/// * `done[s]` — **consumer-write, producer-read**. Consumer Release-stores
-///   `done[s] = h + cap` after reading data, telling the producer the slot
-///   is free for reuse at logical position `h + cap` (the next lap).
-///   Initial: `done[s] = s` so the first lap is free.
-///
-/// Crucially, the producer's hot path never writes the `done` line and the
-/// consumer's release-store never touches the `ready` line. The two
-/// producer↔consumer handoff streams ping-pong on **different** physical
-/// cache lines, eliminating the symmetric ping-pong of the previous design
-/// where both directions wrote `ready[s]`.
-///
-/// The producer never reads `head`; consumers never read `tail` except
-/// to bound their batched CAS claim (see `Consumer::claim_batch`) and for
-/// `len()` diagnostics.
+/// The producer writes data and then Release-stores the next position to
+/// `tail`. Consumers Acquire-load `tail` before they claim published positions.
+/// A consumer Release-stores `done[s] = p + cap` after it reads position `p`.
+/// The producer Acquire-loads this marker before it reuses the slot.
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
-    /// Producer-write, consumer-read publish marker. Each on its own
-    /// cache line so a producer write to ready[s] does not invalidate
-    /// adjacent slots.
-    pub(crate) ready: AlignedBuf<CachePadded<AtomicUsize>>,
-    /// Consumer-write, producer-read free-for-reuse marker. Distinct
-    /// cache lines from `ready` to break the producer↔consumer ping-pong.
-    pub(crate) done: AlignedBuf<CachePadded<AtomicUsize>>,
+    /// Consumer-write, producer-read free-for-reuse marker.
+    pub(crate) done: AlignedBuf<AtomicUsize>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
     pub(crate) head: CachePadded<AtomicUsize>,
@@ -151,9 +127,8 @@ pub struct RingBuffer<T> {
     pub(crate) consumer_waker: WakerSet,
 }
 
-// Safety: Single producer writes to slot data, gated by per-slot `ready`
-// markers. Multiple consumers CAS on `head` to claim slots and synchronize
-// with the producer via Acquire/Release on `ready`.
+// Safety: The single producer writes slot data before it publishes tail.
+// Multiple consumers acquire tail and CAS head before they read distinct slots.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
@@ -163,26 +138,19 @@ impl<T> RingBuffer<T> {
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
-        // ready[s] = 0 — producer doesn't read this for freeness, only
-        // writes it for publish. Consumers Acquire-load and compare
-        // against (h + 1), so the initial 0 just means "not yet
-        // published"; consumers won't reach it until the producer has
-        // pushed at least s+1 items (head can't FAA past tail==0).
-        let ready = AlignedBuf::new_with(cap, || CachePadded(AtomicUsize::new(0)));
         // done[s] = s — slot s is "free for producer at logical position
         // s" on the first lap. After a consumer at position p reads slot
         // s, it stores done[s] = p + cap, marking it free for the next
         // lap (logical position p + cap == s + cap == s + cap).
         let mut idx = 0usize;
         let done = AlignedBuf::new_with(cap, || {
-            let d = CachePadded(AtomicUsize::new(idx));
+            let d = AtomicUsize::new(idx);
             idx += 1;
             d
         });
 
         Self {
             data,
-            ready,
             done,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
@@ -265,8 +233,7 @@ impl<T> RingBuffer<T> {
     /// Returns a reference to the data slot at logical position `pos`.
     ///
     /// Single point of unsafety for indexing: `pos & mask < cap == buf.len()`
-    /// because `mask = cap - 1`. The three per-slot arrays (`data`, `ready`,
-    /// `done`) all have length `cap`, so the same index is valid for each.
+    /// because `mask = cap - 1`. Both per-slot arrays have length `cap`.
     #[inline]
     pub(crate) fn data_slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
         let idx = pos & self.mask;
@@ -275,18 +242,9 @@ impl<T> RingBuffer<T> {
         &self.data[idx]
     }
 
-    /// Returns a reference to the ready marker at logical position `pos`.
-    #[inline]
-    pub(crate) fn ready_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = ready.len(), so idx < ready.len().
-        unsafe { std::hint::assert_unchecked(idx < self.ready.len()) };
-        &self.ready[idx]
-    }
-
     /// Returns a reference to the done marker at logical position `pos`.
     #[inline]
-    pub(crate) fn done_slot(&self, pos: usize) -> &CachePadded<AtomicUsize> {
+    pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
         let idx = pos & self.mask;
         // SAFETY: mask = cap - 1, cap = done.len(), so idx < done.len().
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
@@ -344,23 +302,13 @@ impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();
         let tail = *self.tail.0.get_mut();
-        // With FAA-based consumers, `head` can transiently exceed
-        // `tail` if consumers overshot (abandoned slots). The actual
-        // live-data range is positions `pos in head..tail` whose slot
-        // has `ready[s] == pos + 1` (i.e. producer published, consumer
-        // hasn't claimed). Slots with any other `ready` value are
-        // either consumed (`pos + cap`) or not yet published.
         if head >= tail {
             return;
         }
         for pos in head..tail {
             let s = pos & self.mask;
-            let r = *self.ready[s].0.get_mut();
-            let d = *self.done[s].0.get_mut();
-            // Slot at logical position `pos` holds live data iff the
-            // producer published (ready == pos+1) AND no consumer has
-            // released it yet (done < pos+cap).
-            if r == pos + 1 && d != pos + self.cap {
+            let d = *self.done[s].get_mut();
+            if d != pos + self.cap {
                 // SAFETY: data is initialized and unconsumed.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();

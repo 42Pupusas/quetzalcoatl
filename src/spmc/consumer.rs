@@ -157,7 +157,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let q = self.ring();
         let data_ptr = q.data_slot(h).get().cast_const();
         let slot_done = q.done_slot(h);
-        (data_ptr, &slot_done.0, h)
+        (data_ptr, slot_done, h)
     }
 
     /// Drains all currently available items, calling `f` for each.
@@ -404,7 +404,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             unsafe {
                 q.data_slot(pos).get().cast::<T>().drop_in_place();
             }
-            q.done_slot(pos).0.store(pos + cap, Ordering::Release);
+            q.done_slot(pos).store(pos + cap, Ordering::Release);
         }
         if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst store + wake_producer's SeqCst load of
@@ -432,7 +432,7 @@ pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T
 impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, R> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: ready[s] == head+1 was verified before construction.
+        // SAFETY: The consumer claimed this published position.
         unsafe { (*self.data_ptr).assume_init_ref() }
     }
 }
