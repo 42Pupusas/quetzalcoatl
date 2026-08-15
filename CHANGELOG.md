@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-14
+
+### Fixed
+- **Async wake path woke one waiter per progress event** — that is
+  unsound, because a registered waiter cannot always use the position
+  that was just freed. An mpmc producer publishes into a per-producer
+  batch, so the freed position can belong to a different producer than
+  the one the scan reaches first. The scanned producer re-registers and
+  returns `Pending`, which consumes the wake, while the producer that
+  owns the position stays parked. The consumers then find the ring
+  empty and send no more wake events. A parked *thread* survives this
+  (the `WakeSet` park sites keep a 1 ms `park_timeout` backstop), but
+  an async waiter has no backstop: after `Poll::Pending`, only its
+  waker can poll it again. `WakerSet::wake_one` becomes `wake_all`, and
+  `wake_n` is now an alias for it. A waiter that cannot progress
+  re-registers, which costs one extra poll. The round-robin cursor was
+  a partial mitigation for the same failure and is removed.
+- **`mpsc::Producer::push` could wait on a full ring** — `claim_slot`
+  checked capacity and then advanced `tail` with a separate
+  fetch-and-add, so a concurrent producer could move `tail` between the
+  two steps. The producer then waited on a slot that no consumer would
+  free, although `push` is documented non-blocking. A
+  compare-and-exchange loop now checks capacity and advances `tail` as
+  one operation. Measured overclaim rate on the old code: 0% at 1-2
+  producers, 5.4% at 4, 42.9% at 8, 63.7% at 16.
+- **Lost wakeups between a parked waiter and a departing peer** — the
+  close handshake and the DATA/SPACE handshake have the same Dekker
+  shape, and the arm-park re-check was not in the `SeqCst` total order.
+  Both sides could sleep. The close flag is now `SeqCst` on both sides
+  in spsc, mpsc, spmc, and mpmc, and every arm-park site carries the
+  matching fence.
+- **Data race on the async waker slot** — `WakerSlot` guarded an
+  `UnsafeCell<Option<Waker>>` with a seqlock. A `Waker` is not
+  trivially copyable, so the reader dereferenced a vtable pointer
+  before it validated the sequence, and `store`'s drop of the previous
+  waker raced that read. Miri reported the race on mpsc async
+  push/pop. The waker now lives in an `AtomicPtr`: `store` and `wake`
+  each swap the pointer once, so the thread that removes a pointer is
+  its sole owner and is the only one that frees it.
+
+### Changed
+- **spmc slot completion metadata is compact** — the per-slot
+  completion state moves into the existing sequence word.
+- **Contended spmc claim batches are smaller** — this reduces the time
+  a consumer holds positions that its peers wait for.
+
 ## [0.13.1] - 2026-08-13
 
 ### Fixed
