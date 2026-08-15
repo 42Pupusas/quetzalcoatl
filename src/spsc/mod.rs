@@ -153,7 +153,6 @@ impl<T> RingBuffer<T> {
         }
     }
 
-
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_producer_async(&self) {

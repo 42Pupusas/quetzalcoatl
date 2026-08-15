@@ -126,14 +126,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
-        self.try_claim()
-            .map(|(data_ptr, pos)| SlotWriter {
-                slot_data: data_ptr,
-                tail: &self.ring().tail,
-                write_pos: &self.write_pos,
-                pos,
-                queue: self.ring(),
-            })
+        self.try_claim().map(|(data_ptr, pos)| SlotWriter {
+            slot_data: data_ptr,
+            tail: &self.ring().tail,
+            write_pos: &self.write_pos,
+            pos,
+            queue: self.ring(),
+        })
     }
 
     /// Reserves a slot for zero-copy writing, blocking the calling

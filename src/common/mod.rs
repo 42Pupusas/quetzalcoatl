@@ -292,11 +292,7 @@ impl<T> SlotSnapshot<*const MaybeUninit<T>> {
     /// `Tombstoned` and treats everything else (including either flavor
     /// of "free") as `NotReady`.
     #[inline]
-    pub fn classify(
-        seq: &AtomicUsize,
-        data: &UnsafeCell<MaybeUninit<T>>,
-        pos: usize,
-    ) -> Self {
+    pub fn classify(seq: &AtomicUsize, data: &UnsafeCell<MaybeUninit<T>>, pos: usize) -> Self {
         let seq = seq.load(Ordering::Acquire);
         if seq == TOMBSTONE {
             Self::Tombstoned

@@ -510,7 +510,7 @@ impl<T, C: Config> Drop for Consumer<T, C> {
             == 1
         {
             // SeqCst: pairs with each producer's post-arm SeqCst load.
-        self.queue.consumer_closed.0.store(true, Ordering::SeqCst);
+            self.queue.consumer_closed.0.store(true, Ordering::SeqCst);
             self.queue.producer_park.flush();
             #[cfg(feature = "async")]
             self.queue.producer_waker.flush();

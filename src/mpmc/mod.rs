@@ -1319,7 +1319,12 @@ mod tests {
         // Otherwise a producer still spinning can push into a slot the
         // drain just freed, and the drain collects more than CAP.
         ParkProbe::new().expect_until("all producers to set their wake bit", || {
-            c.queue.producer_park.wake.load(Ordering::SeqCst).count_ones() == N_PRODUCERS
+            c.queue
+                .producer_park
+                .wake
+                .load(Ordering::SeqCst)
+                .count_ones()
+                == N_PRODUCERS
         });
 
         // Single drain — releases done[s] for all 4 slots and wakes
