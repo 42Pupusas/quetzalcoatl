@@ -1,5 +1,5 @@
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::task::Waker;
 
 use super::park::PARK_SLOTS;
@@ -89,16 +89,6 @@ pub struct WakerSet {
     /// only one atomic load.
     pub pending: AtomicBool,
     pub slots: AlignedBuf<WakerSlot>,
-    /// Round-robin cursor: index *just after* the last slot we woke.
-    /// `wake_one`/`wake_n` start their scan here so a stuck low-slot
-    /// waiter that re-registers immediately can't monopolize wake
-    /// events and starve a higher-slot waiter that could progress.
-    /// This mirrors [`super::park::WakeSet::cursor`]; without it the
-    /// saturated mpmc async path deadlocks (cap=16, 2 producers + 2
-    /// consumers reliably hits it — a producer parked on a refill
-    /// that can't yet succeed eats every wake while the producer
-    /// holding the needed position stays parked forever).
-    pub cursor: AtomicUsize,
 }
 
 impl WakerSet {
@@ -106,7 +96,6 @@ impl WakerSet {
         Self {
             pending: AtomicBool::new(false),
             slots: AlignedBuf::new_with(PARK_SLOTS, WakerSlot::new),
-            cursor: AtomicUsize::new(0),
         }
     }
 
@@ -126,9 +115,29 @@ impl WakerSet {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Wakes one registered waker. No-op if `pending` is false.
+    /// Wakes every registered waker. No-op if `pending` is false.
+    ///
+    /// # Why every waker, and not one
+    ///
+    /// A thread parked by [`super::park::WakeSet`] re-checks the ring
+    /// on a 1 ms `park_timeout`, so a wake sent to a waiter that cannot
+    /// progress costs latency only. An async waiter has no such
+    /// backstop. Once it returns `Poll::Pending`, only its waker can
+    /// poll it again. A wake spent on the wrong waiter is lost for good.
+    ///
+    /// A registered waiter cannot always use the position that was just
+    /// freed. An mpmc producer publishes into a per-producer batch, so
+    /// the freed position can belong to a different producer than the
+    /// one this scan reaches first. That producer re-registers and
+    /// returns `Pending`, which consumes the wake, while the producer
+    /// that owns the position stays parked. The consumers then find the
+    /// ring empty and send no more wake events, and the ring stalls.
+    ///
+    /// A wake of every registered waiter removes this class of
+    /// misdirected wake. A waiter that cannot progress re-registers,
+    /// which costs one extra poll and never loses a wakeup.
     #[inline]
-    pub fn wake_one(&self) {
+    pub fn wake_all(&self) {
         if !self.pending.load(Ordering::Relaxed) {
             return;
         }
@@ -137,14 +146,8 @@ impl WakerSet {
         // called us; without this fence a peer that just registered and
         // re-checked could be missed. See `park::WakeSet::wake_one`.
         std::sync::atomic::fence(Ordering::SeqCst);
-        let n = self.slots.len();
-        let start = self.cursor.load(Ordering::Relaxed);
-        for i in 0..n {
-            let idx = (start + i) & (PARK_SLOTS - 1);
-            if self.slots[idx].wake() {
-                self.cursor.store(idx + 1, Ordering::Relaxed);
-                return;
-            }
+        for slot in &*self.slots {
+            slot.wake();
         }
         // Don't clear pending: a waiter may register between the load and
         // the end of this scan. Leave pending=true so the next call
@@ -153,26 +156,14 @@ impl WakerSet {
         // a missed wake.
     }
 
-    /// Wakes up to `n` registered wakers.
+    /// Wakes every registered waker. `n` is advisory only.
+    ///
+    /// Batched callers free `n` positions at once. This code cannot
+    /// know which waiter owns each freed position, so it wakes all of
+    /// them — see [`wake_all`](Self::wake_all).
     #[inline]
-    pub fn wake_n(&self, mut n: usize) {
-        if !self.pending.load(Ordering::Relaxed) {
-            return;
-        }
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let total = self.slots.len();
-        let start = self.cursor.load(Ordering::Relaxed);
-        for i in 0..total {
-            if n == 0 {
-                return;
-            }
-            let idx = (start + i) & (PARK_SLOTS - 1);
-            if self.slots[idx].wake() {
-                self.cursor.store(idx + 1, Ordering::Relaxed);
-                n -= 1;
-            }
-        }
-        // Same reasoning as wake_one: don't clear pending.
+    pub fn wake_n(&self, _n: usize) {
+        self.wake_all();
     }
 
     /// Wakes every registered waker. Used at close time.

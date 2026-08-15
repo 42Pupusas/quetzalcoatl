@@ -156,13 +156,13 @@ impl<T> RingBuffer<T> {
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_producer_async(&self) {
-        self.producer_waker.wake_one();
+        self.producer_waker.wake_all();
     }
 
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_consumer_async(&self) {
-        self.consumer_waker.wake_one();
+        self.consumer_waker.wake_all();
     }
 
     /// Returns the approximate number of items currently in the buffer.

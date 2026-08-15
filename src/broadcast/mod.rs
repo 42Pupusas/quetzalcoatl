@@ -188,14 +188,14 @@ impl<T> RingBuffer<T> {
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_producer_async(&self) {
-        self.producer_waker.wake_one();
+        self.producer_waker.wake_all();
     }
 
     /// Wakes one async consumer task, if any. Self-gates on `pending`.
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_consumer_async(&self) {
-        self.consumer_waker.wake_one();
+        self.consumer_waker.wake_all();
     }
 
     /// Returns a reference to the slot at logical position `pos`.

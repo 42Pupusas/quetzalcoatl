@@ -285,7 +285,7 @@ impl<T, C: Config> RingBuffer<T, C> {
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_producer_async(&self) {
-        self.producer_waker.wake_one();
+        self.producer_waker.wake_all();
     }
 
     /// Wakes up to `n` async producer tasks, if any. Self-gates.
@@ -299,7 +299,7 @@ impl<T, C: Config> RingBuffer<T, C> {
     #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn wake_consumer_async(&self) {
-        self.consumer_waker.wake_one();
+        self.consumer_waker.wake_all();
     }
 
     /// Wakes up to `n` async consumer tasks, if any. Self-gates.
