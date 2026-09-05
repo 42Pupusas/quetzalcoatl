@@ -56,8 +56,16 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         &self.queue
     }
 
-    /// Claims the next slot using the local write cursor.
-    /// Returns the write position on success, or `None` if the buffer is full.
+    /// Returns the next writable position, or `None` if the buffer is
+    /// full.
+    ///
+    /// Does **not** advance `write_pos`. The cursor moves only once a
+    /// value has been written and published (`push`, `commit`,
+    /// `commit_unchecked`), so an abandoned reservation — including one
+    /// leaked via [`std::mem::forget`], which runs no destructor —
+    /// leaves the cursor on the uninitialized slot and the next claim
+    /// reuses it. Advancing here instead would let a forgotten
+    /// `SlotWriter` push `tail` past a slot no one ever initialized.
     #[inline]
     fn try_claim(&self) -> Option<usize> {
         let pos = self.write_pos.get();
@@ -71,7 +79,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             }
         }
 
-        self.write_pos.set(pos + 1);
         Some(pos)
     }
 
@@ -103,6 +110,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         unsafe {
             self.ring().slot(pos).get().write(MaybeUninit::new(val));
         }
+
+        self.write_pos.set(pos + 1);
 
         // SeqCst: stronger than Release on two grounds. (1) Release alone
         // ensures the data write above is visible to the consumer through
@@ -139,7 +148,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// The slot is not visible to the consumer until committed.
     ///
     /// Takes `&mut self` to guarantee at most one outstanding reservation.
-    /// If dropped without writing, the reservation is silently rolled back.
+    /// If dropped or forgotten without committing, the slot is left
+    /// uninitialized and the next claim reuses it.
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
@@ -176,9 +186,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 return None;
             }
             // Non-mutating gate: avoids constructing-then-dropping a
-            // SlotWriter twice per loop iteration. Drop is benign for
-            // SlotWriter (it just rolls back write_pos), but it's
-            // wasted work.
+            // SlotWriter twice per loop iteration.
             if self.has_space() {
                 return self.reserve();
             }
@@ -327,7 +335,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
 /// the raw `MaybeUninit<T>`, then [`commit_unchecked`](Self::commit_unchecked)
 /// (unsafe) to publish.
 ///
-/// If dropped, the reservation is silently rolled back.
+/// If dropped or forgotten without committing, the slot is left
+/// uninitialized for the next claim to reuse.
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     tail: &'a AtomicUsize,
@@ -359,7 +368,6 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Writes a value into the slot, consuming this `SlotWriter` and
     /// returning a [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
-        // Prevent SlotWriter::drop from rolling back write_pos.
         let mut this = std::mem::ManuallyDrop::new(self);
         // SAFETY: Exclusive access, valid pointer.
         unsafe { (*this.slot_data).write(val) };
@@ -383,6 +391,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// uninitialized memory (undefined behavior).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
+        self.write_pos.set(self.pos + 1);
         // SeqCst: see Producer::push for the full explanation. Pairs with
         // the consumer's SeqCst `parked.store(true)` to close the missed-
         // wakeup race; subsumes the Release semantics for data publication.
@@ -396,16 +405,22 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        // No data was written (write() consumes self) — just roll back.
-        self.write_pos.set(self.pos);
+        // Nothing to undo: `try_claim` never advanced `write_pos`, and
+        // no value was written (`write` consumes `self`). The slot stays
+        // uninitialized and the next claim reuses this position.
     }
 }
 
 /// A slot that has been initialized via [`SlotWriter::write`].
 ///
 /// Call [`commit`](Self::commit) to make the data visible to the consumer.
-/// If dropped without committing, the value is dropped and the
-/// reservation is rolled back.
+/// If dropped without committing, the value is dropped and the slot is
+/// left free for the next claim.
+///
+/// Forgetting this guard (e.g. [`std::mem::forget`]) leaks the value in
+/// place without publishing it; the slot is later overwritten by the
+/// next claim. That leaks, which is safe, and never exposes
+/// uninitialized or aliased data to the consumer.
 pub struct WrittenSlot<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     tail: &'a AtomicUsize,
@@ -421,26 +436,31 @@ unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to the consumer.
+    /// Once `tail` is published the consumer owns the value, so the
+    /// guard is disarmed first: a panic in the wake path must not let
+    /// `Drop` drop a value the consumer can already see.
     #[inline]
     pub fn commit(mut self) {
+        self.committed = true;
+        self.write_pos.set(self.pos + 1);
         // SeqCst: see Producer::push. Pairs with the consumer's SeqCst
         // `parked.store(true)` to close the missed-wakeup race.
         self.tail.store(self.pos + 1, Ordering::SeqCst);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
-        self.committed = true;
     }
 }
 
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
         if !self.committed {
-            // SAFETY: write() initialized this slot.
+            // SAFETY: write() initialized this slot, and it was never
+            // published, so the consumer cannot have observed it.
             unsafe {
                 self.slot_data.cast::<T>().drop_in_place();
             }
-            self.write_pos.set(self.pos);
+            // `write_pos` was never advanced — nothing to roll back.
         }
     }
 }
