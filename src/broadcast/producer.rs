@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::consumer_floor::ConsumerFloor;
 use super::RingBuffer;
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 use crate::common::TOMBSTONE;
@@ -12,7 +13,7 @@ use crate::common::TOMBSTONE;
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
 /// — each clone shares the same underlying buffer and competes for slots
-/// via atomic fetch-and-add (FAA).
+/// by compare-and-swap on the tail.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_min_head: std::cell::Cell<usize>,
@@ -69,58 +70,45 @@ impl<T> Drop for Producer<T> {
 }
 
 impl<T> Producer<T> {
+    /// Claims a position, or returns `None` if the ring is full.
+    ///
+    /// The claim is a CAS rather than a `fetch_add`. A `fetch_add`
+    /// always succeeds, so a fullness check before it is only a hint:
+    /// with `k` free slots, any number of concurrent producers can pass
+    /// the check and claim positions past capacity. The losers would
+    /// then wait inside a non-blocking `push` for a consumer that may
+    /// never advance. Validating the position as part of the claim means
+    /// a producer only ever owns a slot it is allowed to write.
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
-        // Pre-check with L1/L2/L3 min_head cache: avoid a wasted FAA
-        // when the buffer is clearly full.
-        let current_tail = self.queue.tail.load(Ordering::Relaxed);
-        if current_tail.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
-            let shared = self.queue.min_head_cache.load(Ordering::Acquire);
-            self.cached_min_head.set(shared);
-
-            if current_tail.wrapping_sub(shared) >= self.queue.cap {
-                let min_head = self.queue.min_head();
-                self.queue
-                    .min_head_cache
-                    .fetch_max(min_head, Ordering::Release);
-                self.cached_min_head.set(min_head);
-
-                if current_tail.wrapping_sub(min_head) >= self.queue.cap {
-                    return None;
+        let mut backoff = 0u32;
+        let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
+        let pos = loop {
+            if !self.permits_with_refresh(current_tail) {
+                return None;
+            }
+            match self.queue.tail.compare_exchange_weak(
+                current_tail,
+                current_tail + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break current_tail,
+                Err(observed) => {
+                    current_tail = observed;
+                    crate::common::cas_backoff(&mut backoff);
                 }
             }
-        }
-
-        // Claim a unique position via FAA — always succeeds on the first
-        // try, eliminating inter-producer cache-line contention entirely.
-        let pos = self.queue.tail.fetch_add(1, Ordering::Relaxed);
+        };
 
         let slot = self.queue.slot(pos);
-
-        // Wait for all consumers to advance past the slot's previous
-        // occupant (pos - cap). Each producer spins on min_head — no
-        // inter-producer contention on the tail cache line.
-        if pos.wrapping_sub(self.cached_min_head.get()) >= self.queue.cap {
-            let mut backoff = 0u32;
-            loop {
-                let min_head = self.queue.min_head();
-                self.queue
-                    .min_head_cache
-                    .fetch_max(min_head, Ordering::Release);
-                self.cached_min_head.set(min_head);
-                if pos.wrapping_sub(min_head) < self.queue.cap {
-                    break;
-                }
-                crate::common::cas_backoff(&mut backoff);
-            }
-        }
 
         // Drop old value if this slot was previously written.
         if std::mem::needs_drop::<T>() {
             let old_seq = slot.sequence.swap(0, Ordering::Acquire);
             if old_seq > 0 && old_seq != TOMBSTONE {
                 // SAFETY: old_seq > 0 means data was initialized
-                // by a prior push. We own the slot via FAA claim.
+                // by a prior push. We own the slot via our CAS claim.
                 unsafe {
                     slot.data.get().cast::<T>().drop_in_place();
                 }
@@ -134,13 +122,17 @@ impl<T> Producer<T> {
 
     /// Pushes a value into the broadcast ring buffer.
     ///
-    /// Multiple producers can push concurrently. Returns `Err(val)` if
-    /// the buffer is full.
+    /// Multiple producers can push concurrently. Never blocks.
+    ///
+    /// Returns `Err(val)` if the buffer is full, or if no consumers are
+    /// registered — a broadcast with no subscribers has nowhere to
+    /// deliver to, and accepting the write would let concurrent
+    /// producers lap the ring and overwrite each other.
     #[inline]
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.claim_slot() {
             Some((data_ptr, slot_seq, pos)) => {
-                // SAFETY: We exclusively own this slot via FAA claim.
+                // SAFETY: We exclusively own this slot via our CAS claim.
                 unsafe { (*data_ptr).write(val) };
                 slot_seq.store(pos * 2 + 1, Ordering::Release);
                 #[cfg(feature = "async")]
@@ -152,27 +144,57 @@ impl<T> Producer<T> {
     }
 
     /// Conservative fullness check used by the blocking variants to
-    /// decide whether a `reserve` would succeed without burning a FAA
+    /// decide whether a `reserve` would succeed without attempting a
     /// claim. Refreshes the cached `min_head` from the shared cache,
     /// then a full scan only if still apparently full. Returns `true`
     /// if there is at least one writable slot.
     #[inline]
     fn has_space(&self) -> bool {
-        let current_tail = self.queue.tail.load(Ordering::Relaxed);
-        if current_tail.wrapping_sub(self.cached_min_head.get()) < self.queue.cap {
-            return true;
+        self.permits_with_refresh(self.queue.tail.load(Ordering::Relaxed))
+    }
+
+    /// Whether `pos` is writable, consulting the per-producer cache,
+    /// then the shared cache, then a full registry scan — stopping at
+    /// the first level that says yes.
+    ///
+    /// Both caches hold a bare position and cannot represent "no
+    /// consumers", so they are only consulted while a consumer is
+    /// registered. Otherwise a cache seeded at 0 would permit the first
+    /// `cap` positions with no consumer ever having existed.
+    #[inline]
+    fn permits_with_refresh(&self, pos: usize) -> bool {
+        if any_consumer_active(&self.queue) {
+            if self.cached_floor().permits(pos, self.queue.cap) {
+                return true;
+            }
+            let shared = self.queue.min_head_cache.load(Ordering::Acquire);
+            self.cached_min_head.set(shared);
+            if ConsumerFloor::At(shared).permits(pos, self.queue.cap) {
+                return true;
+            }
         }
-        let shared = self.queue.min_head_cache.load(Ordering::Acquire);
-        self.cached_min_head.set(shared);
-        if current_tail.wrapping_sub(shared) < self.queue.cap {
-            return true;
+        self.refresh_floor().permits(pos, self.queue.cap)
+    }
+
+    /// The last floor this producer observed, as a constraint.
+    ///
+    /// The cache holds a plain position, so it is always treated as
+    /// constraining; a stale floor only costs a redundant scan.
+    #[inline]
+    const fn cached_floor(&self) -> ConsumerFloor {
+        ConsumerFloor::At(self.cached_min_head.get())
+    }
+
+    /// Rescans the registry and republishes the result to both cache
+    /// levels.
+    #[inline]
+    fn refresh_floor(&self) -> ConsumerFloor {
+        let floor = self.queue.consumer_floor();
+        if let ConsumerFloor::At(head) = floor {
+            self.queue.min_head_cache.fetch_max(head, Ordering::Release);
+            self.cached_min_head.set(head);
         }
-        let min_head = self.queue.min_head();
-        self.queue
-            .min_head_cache
-            .fetch_max(min_head, Ordering::Release);
-        self.cached_min_head.set(min_head);
-        current_tail.wrapping_sub(min_head) < self.queue.cap
+        floor
     }
 
     /// Pushes a value, blocking the calling thread when the ring is full
@@ -349,6 +371,9 @@ impl<T> Producer<T> {
     /// Takes `&mut self` to guarantee at most one outstanding reservation
     /// per producer handle. If dropped without writing, the slot is
     /// tombstoned and consumers silently skip it.
+    ///
+    /// Returns `None` if the buffer is full or no consumers are
+    /// registered.
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
@@ -396,7 +421,7 @@ pub struct SlotWriter<'a, T> {
     queue: &'a RingBuffer<T>,
 }
 
-// SAFETY: SlotWriter holds exclusive access to the slot (FAA claim).
+// SAFETY: SlotWriter holds exclusive access to the slot (CAS claim).
 // The raw pointer points into the RingBuffer kept alive by the Producer's Arc.
 unsafe impl<T: Send + Sync> Send for SlotWriter<'_, T> {}
 
@@ -406,7 +431,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// Requires [`commit_unchecked`](Self::commit_unchecked) (unsafe) to publish.
     #[must_use]
     pub fn slot_mut(&mut self) -> &mut MaybeUninit<T> {
-        // SAFETY: Exclusive access via FAA claim. The pointer is valid
+        // SAFETY: Exclusive access via CAS claim. The pointer is valid
         // because the Producer's Arc keeps the RingBuffer alive.
         unsafe { &mut *self.slot_data }
     }
@@ -415,7 +440,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T> {
         let mut this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: Exclusive access via FAA claim, valid pointer.
+        // SAFETY: Exclusive access via CAS claim, valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
             slot_data: this.slot_data,

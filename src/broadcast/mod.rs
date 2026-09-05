@@ -1,12 +1,24 @@
 //! Multi-producer, multi-consumer (MPMC) broadcast ring buffer.
 //!
-//! Every consumer sees every item published after it subscribes. Multiple
-//! producers push via atomic fetch-and-add (FAA); consumers are dynamically created by cloning
-//! an existing [`Consumer`].
+//! Every consumer sees every item published after it subscribes.
+//! Multiple producers push via an atomic compare-and-swap on the tail;
+//! consumers are dynamically created by cloning an existing
+//! [`Consumer`].
 //!
 //! Items require `T: Clone` for [`Consumer::pop`], or use
 //! [`Consumer::pop_ref`] for zero-copy reads. For large types with many
 //! consumers, see the [`arc`] sub-module which wraps values in `Arc<T>`.
+//!
+//! # No consumers
+//!
+//! A buffer with no registered consumers rejects pushes: [`push`] and
+//! [`reserve`] return `Err`/`None`, and the blocking variants return
+//! `Err` immediately. Consumer progress is what proves a slot's previous
+//! occupant has been read, so without it producers would lap the ring
+//! and overwrite one another.
+//!
+//! [`push`]: Producer::push
+//! [`reserve`]: Producer::reserve
 //!
 //! # Example
 //!
@@ -28,6 +40,7 @@
 
 pub mod arc;
 mod consumer;
+mod consumer_floor;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
@@ -38,6 +51,8 @@ use crate::common::park::WakeSet;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
+
+use consumer_floor::ConsumerFloor;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -75,7 +90,8 @@ pub(super) struct ConsumerSlot {
 /// Lock-free MPMC broadcast ring buffer.
 ///
 /// Every consumer sees every item published after it subscribes.
-/// Multiple producers push via atomic FAA. Consumers clone to subscribe.
+/// Multiple producers claim positions by CAS on the tail. Consumers
+/// clone to subscribe.
 // repr(C) locks field order: shared immutable fields first (same cache
 // line), then the contended tail on its own cache-padded line.
 #[repr(C)]
@@ -85,9 +101,10 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     pub(crate) consumer_slots: Box<[ConsumerSlot]>,
     pub(crate) tail: CachePadded<AtomicUsize>,
-    /// Shared L2 cache of `min_head()`. Updated by any producer after a full
-    /// scan; read by all producers to avoid redundant O(N) scans.
-    /// Always ≤ actual `min_head` (conservative), so a stale value is safe.
+    /// Shared L2 cache of the consumer floor's position. Updated by any
+    /// producer after a full scan; read by all producers to avoid
+    /// redundant O(N) scans. Always ≤ the actual floor (conservative),
+    /// so a stale value is safe.
     pub(crate) min_head_cache: CachePadded<AtomicUsize>,
     /// Sync producer-side park state. Bit `i` of `producer_park.wake` is
     /// set while the producer in park slot `i` is blocked in
@@ -230,11 +247,13 @@ impl<T> RingBuffer<T> {
         (producer, consumer)
     }
 
-    /// Scans all active consumer heads and returns the minimum.
+    /// Scans the consumer registry for the slowest active head.
     ///
-    /// Returns `tail` if no consumers are active (black hole mode —
-    /// the producer can always write).
-    pub(crate) fn min_head(&self) -> usize {
+    /// Returns [`ConsumerFloor::NoConsumers`] when no consumer is
+    /// active. That case is kept distinct from a position so callers
+    /// cannot compare an already-claimed slot against a floor ahead of
+    /// it; see [`ConsumerFloor`].
+    pub(super) fn consumer_floor(&self) -> ConsumerFloor {
         let mut min = usize::MAX;
         for slot in &*self.consumer_slots {
             if slot.active.load(Ordering::Relaxed) {
@@ -245,9 +264,9 @@ impl<T> RingBuffer<T> {
             }
         }
         if min == usize::MAX {
-            self.tail.load(Ordering::Relaxed)
+            ConsumerFloor::NoConsumers
         } else {
-            min
+            ConsumerFloor::At(min)
         }
     }
 
@@ -255,8 +274,8 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.tail.load(Ordering::Relaxed);
-        let min_head = self.min_head();
-        tail.wrapping_sub(min_head)
+        let floor = self.consumer_floor().position_or_tail(tail);
+        tail.wrapping_sub(floor)
     }
 
     /// Returns `true` if no items are pending for any consumer.
@@ -511,13 +530,37 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
+    /// A broadcast with no consumers refuses writes rather than
+    /// discarding them. Only a consumer's progress proves a slot's
+    /// previous occupant has been read; without that, producers would
+    /// lap the ring and two of them would write the same slot.
     #[test]
-    fn no_consumers_black_hole() {
+    fn no_consumers_rejects_push() {
         let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
         drop(consumer);
-        // With no consumers, push should succeed (buffer acts as black hole)
         for i in 0..100 {
-            assert!(producer.push(i).is_ok());
+            assert_eq!(producer.push(i), Err(i));
+        }
+    }
+
+    /// Producers racing the last consumer's departure must all finish,
+    /// and must never write the same slot concurrently. Run under Miri
+    /// this is the data-race check; run natively it is a liveness check.
+    #[test]
+    fn concurrent_push_with_no_consumers_is_race_free() {
+        let (seed, consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 2).split();
+        drop(consumer);
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let p = seed.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..8u64 {
+                    assert_eq!(p.push(i), Err(i));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
@@ -1353,6 +1396,109 @@ mod tests {
         assert_eq!(consumer.pop(), Some(20));
         assert_eq!(consumer.pop(), Some(30));
         drop(producer);
+    }
+
+    /// Several producers push concurrently while the only consumer is
+    /// dropped mid-flight.
+    ///
+    /// A producer that has already claimed `pos`, but is waiting
+    /// for the slot's previous occupant to be released, asks `min_head()`
+    /// whether it may proceed. With no consumer left, `min_head()`
+    /// reports `tail` — which by then is *past* `pos` — so the
+    /// `pos - min_head` backlog check underflows to a huge value that is
+    /// always `>= cap`, and the producer spins forever.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "detects an infinite spin via a wall-clock budget, which Miri's interpretation speed invalidates"
+    )]
+    fn push_races_last_consumer_drop_and_terminates() {
+        const PRODUCERS: usize = 16;
+
+        for _ in 0..20 {
+            let (seed, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 2).split();
+
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..PRODUCERS {
+                let p = seed.clone();
+                let done_in = std::sync::Arc::clone(&done);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..2000u64 {
+                        let _ = p.push(i);
+                    }
+                    done_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }));
+            }
+
+            for _ in 0..64 {
+                let _ = consumer.pop();
+            }
+            drop(consumer);
+
+            for _ in 0..500 {
+                if done.load(std::sync::atomic::Ordering::SeqCst) == PRODUCERS {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                done.load(std::sync::atomic::Ordering::SeqCst),
+                PRODUCERS,
+                "a producer spun forever after the last consumer went away"
+            );
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// `push` is documented to return `Err(val)` when the ring is full,
+    /// so it must not block. The fullness pre-check is not atomic with
+    /// the `tail.fetch_add` that follows it, so concurrent producers can
+    /// all pass the check and claim positions beyond capacity; the
+    /// losers then wait for a consumer that may never advance.
+    #[test]
+    fn push_does_not_block_when_full_under_contention() {
+        const PRODUCERS: usize = 8;
+
+        // Exactly one free slot, and a consumer that never advances.
+        // Every producer's pre-check sees room, so they all reach the
+        // `fetch_add`; only one can legitimately have it.
+        let (seed, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 2).split();
+        seed.push(1).unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..PRODUCERS {
+            let p = seed.clone();
+            let done_in = std::sync::Arc::clone(&done);
+            let start_in = std::sync::Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                while !start_in.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+                let _ = p.push(99);
+                done_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        start.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        for _ in 0..200 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) == PRODUCERS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            PRODUCERS,
+            "non-blocking push blocked on a full ring"
+        );
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

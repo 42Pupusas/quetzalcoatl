@@ -129,12 +129,14 @@
 //!   share a CAS loop to claim items. Each item goes to exactly one
 //!   consumer. Use for work-distribution / fan-out patterns.
 //!
-//! - **[`broadcast`]**: Multiple producers (FAA) and multiple consumers.
-//!   Each consumer maintains its own read cursor. Items require
-//!   `T: Clone` for `pop()`, or use `pop_ref()` for zero-copy reads.
-//!   Use for pub/sub or event fan-out. For large types with many
-//!   consumers, see [`broadcast::arc::ArcRingBuffer`] which wraps values
-//!   in `Arc<T>` for O(1) consumer clones.
+//! - **[`broadcast`]**: Multiple producers (CAS on the tail) and
+//!   multiple consumers. Each consumer maintains its own read cursor.
+//!   Items require `T: Clone` for `pop()`, or use `pop_ref()` for
+//!   zero-copy reads. Use for pub/sub or event fan-out. With no
+//!   consumers registered, pushes fail rather than being discarded.
+//!   For large types with many consumers, see
+//!   [`broadcast::arc::ArcRingBuffer`] which wraps values in `Arc<T>`
+//!   for O(1) consumer clones.
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::perf)]
 #![allow(clippy::missing_errors_doc)]
