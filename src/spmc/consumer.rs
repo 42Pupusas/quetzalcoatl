@@ -17,7 +17,7 @@ use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 /// lifetimes shorter than `'static`.
 ///
 /// Cloneable when `R = Arc<RingBuffer<T>>`. For borrowed consumers, create
-/// additional handles via [`RingBuffer::new_consumer`].
+/// additional handles via [`Consumer::new_consumer`].
 pub struct Consumer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     pub(super) queue: R,
     cached_tail: Cell<usize>,
@@ -62,6 +62,31 @@ impl<T> Consumer<T> {
             batch_end: Cell::new(0),
             park_slot: 0,
         }
+    }
+}
+
+impl<'a, T> Consumer<T, &'a RingBuffer<T>> {
+    /// Creates an additional consumer handle for the same ring.
+    ///
+    /// The borrowed counterpart to `Clone`, which is only available when
+    /// `R = Arc`. The new handle gets its own park slot and batch
+    /// cursors.
+    ///
+    /// This hangs off the consumer rather than the ring because
+    /// [`RingBuffer::split_borrowed`](super::RingBuffer::split_borrowed)
+    /// takes `&mut self`: while these handles are alive the ring is
+    /// mutably borrowed and cannot be borrowed again. An existing handle
+    /// already holds the shared reference, so it can hand out siblings
+    /// with the same lifetime.
+    #[must_use]
+    pub fn new_consumer(&self) -> Self {
+        let queue: &'a RingBuffer<T> = self.queue;
+        let park_idx = queue
+            .consumer_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        queue.consumer_count_live.fetch_add(1, Ordering::Relaxed);
+        Self::new_with(queue, park_idx & PARK_MASK)
     }
 }
 

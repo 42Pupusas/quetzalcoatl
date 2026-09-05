@@ -239,6 +239,13 @@ impl<T> RingBuffer<T> {
     /// outlives both handles, so pushing `T<'a>` is safe as long as
     /// `'a` outlives the ring.
     ///
+    /// Takes `&mut self` so the ring can be split only once: a second
+    /// split would mint a second producer *and* a second consumer, and
+    /// two producers each writing from their own private cursor publish
+    /// a `tail` past a slot neither initialized — the consumer then
+    /// reads uninitialized memory as a `T`. The exclusive borrow makes
+    /// that a borrow-check error rather than undefined behavior.
+    ///
     /// Use with [`std::thread::scope`] to move the handles into scoped
     /// threads:
     ///
@@ -246,7 +253,7 @@ impl<T> RingBuffer<T> {
     /// use quetzalcoatl::spsc::RingBuffer;
     /// use quetzalcoatl::capacity::Capacity;
     ///
-    /// let ring = RingBuffer::<&str>::new(Capacity::exact(4));
+    /// let mut ring = RingBuffer::<&str>::new(Capacity::exact(4));
     /// let (producer, mut consumer) = ring.split_borrowed();
     ///
     /// std::thread::scope(|s| {
@@ -264,11 +271,24 @@ impl<T> RingBuffer<T> {
     ///     });
     /// });
     /// ```
+    ///
+    /// Splitting the same ring twice is rejected at compile time:
+    ///
+    /// ```compile_fail
+    /// use quetzalcoatl::spsc::RingBuffer;
+    /// use quetzalcoatl::capacity::Capacity;
+    ///
+    /// let mut ring = RingBuffer::<String>::new(Capacity::exact(4));
+    /// let (p1, mut c1) = ring.split_borrowed();
+    /// let (p2, mut c2) = ring.split_borrowed();
+    /// p1.push("a".to_string()).unwrap();
+    /// ```
     #[must_use]
-    pub const fn split_borrowed(&self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
-        let producer = Producer::new_with(self);
+    pub const fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+        let shared: &Self = self;
+        let producer = Producer::new_with(shared);
         let consumer = Consumer {
-            queue: self,
+            queue: shared,
             cached_tail: std::cell::Cell::new(0),
         };
         (producer, consumer)
@@ -746,6 +766,205 @@ mod tests {
         assert_eq!(consumer.pop(), None);
     }
 
+    /// A `SlotWriter` leaked with `mem::forget` runs no destructor. If
+    /// the reservation had already advanced the producer cursor, the
+    /// next push would land past the uninitialized slot and publishing
+    /// `tail` would expose it to the consumer as a valid item.
+    #[test]
+    fn forgotten_writer_does_not_publish_uninitialized_slot() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap());
+
+        producer.push(7).unwrap();
+
+        assert_eq!(
+            consumer.pop(),
+            Some(7),
+            "the forgotten slot must be reused, not published uninitialized"
+        );
+        assert_eq!(consumer.pop(), None, "no phantom item may become visible");
+    }
+
+    /// Same hazard on the written-but-uncommitted guard: forgetting it
+    /// must leak the value in place (safe) rather than publish it or
+    /// leave a gap the consumer reads as initialized.
+    // The leaked value is the point of this test; Miri's leak checker
+    // would otherwise flag the deliberate `mem::forget`.
+    #[cfg_attr(miri, ignore = "intentional leak")]
+    #[test]
+    fn forgotten_written_slot_leaks_without_publishing() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut producer, mut consumer) =
+            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap().write(crate::common::DropCounter {
+            counter: counter.clone(),
+        }));
+
+        assert!(
+            consumer.pop().is_none(),
+            "an uncommitted value must not be visible"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a forgotten guard runs no destructor — the value leaks in place"
+        );
+
+        producer
+            .push(crate::common::DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .unwrap();
+        assert!(consumer.pop().is_some(), "the slot must be reusable");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the popped value is dropped; the leaked one is never freed"
+        );
+    }
+
+    /// A forgotten reservation must not permanently consume capacity:
+    /// the position is reusable, so the ring still holds `cap` items.
+    #[test]
+    fn forgotten_writer_does_not_consume_capacity() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap());
+
+        for i in 0..4 {
+            producer.push(i).unwrap();
+        }
+        assert!(producer.push(99).is_err(), "ring should now be full");
+
+        let mut got = vec![];
+        while let Some(v) = consumer.pop() {
+            got.push(v);
+        }
+        assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+
+    /// A panicking `drain` callback must not lose track of the items
+    /// already taken. If `head` stayed stale, `Consumer::drop` would
+    /// drop those values a second time.
+    #[test]
+    fn drain_callback_panic_does_not_double_drop() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+
+        for _ in 0..4 {
+            producer
+                .push(DropCounter {
+                    counter: std::sync::Arc::clone(&counter),
+                })
+                .unwrap();
+        }
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_in = std::sync::Arc::clone(&seen);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain(|item| {
+                drop(item);
+                assert!(
+                    seen_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1,
+                    "callback failure"
+                );
+            });
+        }));
+        assert!(result.is_err(), "the panic must propagate to the caller");
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "each item must be dropped exactly once"
+        );
+    }
+
+    /// Same hazard reached through `drain_up_to`.
+    #[test]
+    fn drain_up_to_callback_panic_does_not_double_drop() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+
+        for _ in 0..4 {
+            producer
+                .push(DropCounter {
+                    counter: std::sync::Arc::clone(&counter),
+                })
+                .unwrap();
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain_up_to(3, |item| {
+                drop(item);
+                panic!("callback failure");
+            });
+        }));
+        assert!(result.is_err());
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "each item must be dropped exactly once"
+        );
+    }
+
+    /// A `T` whose destructor panics must still hand its slot back, or
+    /// `Consumer::drop` would drop it again.
+    #[test]
+    fn slot_reader_panicking_drop_does_not_double_drop() {
+        struct PanicOnDrop {
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: true,
+            })
+            .is_ok());
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: false,
+            })
+            .is_ok());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = consumer.pop_ref().unwrap();
+            drop(r);
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each item must be dropped exactly once"
+        );
+    }
+
     #[test]
     fn reserve_drop_does_not_leak() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1186,7 +1405,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_push_pop() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(1).unwrap();
@@ -1201,7 +1420,7 @@ mod tests {
         let wire_buf = [10u8, 20, 30, 40];
 
         // T = &[u8] — borrows from wire_buf, not 'static.
-        let ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(&wire_buf[0..2]).unwrap();
@@ -1217,7 +1436,7 @@ mod tests {
     fn borrowed_split_scoped_threads() {
         // data declared before ring so it outlives the borrowed split.
         let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
-        let ring = RingBuffer::<&[u64]>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<&[u64]>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
         let data_ref = &data;
 
@@ -1248,7 +1467,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_zero_copy_reserve() {
-        let ring = RingBuffer::<[u8; 64]>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<[u8; 64]>::new(Capacity::exact(4));
         let (mut producer, mut consumer) = ring.split_borrowed();
 
         let mut writer = producer.reserve().unwrap();
@@ -1262,7 +1481,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_blocking() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         std::thread::scope(|s| {
@@ -1286,7 +1505,7 @@ mod tests {
 
         // wire declared before ring so it outlives the borrowed split.
         let wire = vec![0xAA; 128];
-        let ring = RingBuffer::<StorageReq<'_>>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<StorageReq<'_>>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
         let wire_ref = &wire;
 
@@ -1335,7 +1554,7 @@ mod tests {
         // `results` again — the &mut borrow is live for the ring's
         // lifetime. Scoping achieves this.
         {
-            let ring = RingBuffer::<Req<'_, '_>>::new(Capacity::exact(4));
+            let mut ring = RingBuffer::<Req<'_, '_>>::new(Capacity::exact(4));
             let (producer, mut consumer) = ring.split_borrowed();
 
             producer

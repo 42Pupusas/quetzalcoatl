@@ -48,6 +48,31 @@ impl<T> Clone for Producer<T> {
 // RingBuffer is Sync.
 unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Producer<T, R> {}
 
+impl<'a, T> Producer<T, &'a RingBuffer<T>> {
+    /// Creates an additional producer handle for the same ring.
+    ///
+    /// The borrowed counterpart to `Clone`, which is only available when
+    /// `R = Arc`. The new handle gets its own park slot and cursor
+    /// cache.
+    ///
+    /// This hangs off the producer rather than the ring because
+    /// [`RingBuffer::split_borrowed`](super::RingBuffer::split_borrowed)
+    /// takes `&mut self`: while these handles are alive the ring is
+    /// mutably borrowed and cannot be borrowed again. An existing handle
+    /// already holds the shared reference, so it can hand out siblings
+    /// with the same lifetime.
+    #[must_use]
+    pub fn new_producer(&self) -> Self {
+        let queue: &'a RingBuffer<T> = self.queue;
+        queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        let park_idx = queue
+            .producer_park_idx
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        Self::new_with(queue, park_idx & PARK_MASK)
+    }
+}
+
 impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub(super) const fn new_with(queue: R, park_slot: usize) -> Self {
         Self {

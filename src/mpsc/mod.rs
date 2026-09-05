@@ -200,25 +200,31 @@ impl<T> RingBuffer<T> {
     /// shorter than `'static`.
     ///
     /// The returned producer is not `Clone`. Create additional producers
-    /// via [`new_producer`](Self::new_producer).
-    #[must_use]
-    pub const fn split_borrowed(&self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
-        let producer = Producer::new_with(self, 0);
-        let consumer = Consumer { queue: self };
-        (producer, consumer)
-    }
-
-    /// Creates an additional borrowed producer handle.
+    /// via [`Producer::new_producer`], which assigns each one its own
+    /// park slot.
     ///
-    /// Use this instead of `Clone` when working with borrowed splits,
-    /// since `Clone` requires `Arc`.
-    pub fn new_producer(&self) -> Producer<T, &Self> {
-        self.producer_count.fetch_add(1, Ordering::Relaxed);
-        let park_idx = self
-            .producer_park_idx
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        Producer::new_with(self, park_idx & crate::common::park::PARK_MASK)
+    /// Takes `&mut self` so the ring can be split only once. A second
+    /// split would mint a second *consumer* — breaking the single-
+    /// consumer contract this queue's `head` protocol relies on — and a
+    /// second producer sharing park slot 0 with the first. The exclusive
+    /// borrow makes that a borrow-check error rather than undefined
+    /// behavior.
+    ///
+    /// ```compile_fail
+    /// use quetzalcoatl::mpsc::RingBuffer;
+    /// use quetzalcoatl::capacity::Capacity;
+    ///
+    /// let mut ring = RingBuffer::<String>::new(Capacity::exact(4));
+    /// let (p1, mut c1) = ring.split_borrowed();
+    /// let (p2, mut c2) = ring.split_borrowed();
+    /// p1.push("a".to_string()).unwrap();
+    /// ```
+    #[must_use]
+    pub const fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+        let shared: &Self = self;
+        let producer = Producer::new_with(shared, 0);
+        let consumer = Consumer { queue: shared };
+        (producer, consumer)
     }
 }
 
@@ -1665,7 +1671,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_push_pop() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(1).unwrap();
@@ -1678,7 +1684,7 @@ mod tests {
     #[test]
     fn borrowed_split_non_static_lifetime() {
         let wire_buf = [10u8, 20, 30, 40];
-        let ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(&wire_buf[0..2]).unwrap();
@@ -1690,9 +1696,9 @@ mod tests {
 
     #[test]
     fn borrowed_split_multiple_producers() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(8));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(8));
         let (p1, mut consumer) = ring.split_borrowed();
-        let p2 = ring.new_producer();
+        let p2 = p1.new_producer();
 
         std::thread::scope(|s| {
             s.spawn(move || {
@@ -1733,7 +1739,7 @@ mod tests {
         }
 
         let wire = vec![0xBB; 128];
-        let ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
         let wire_ref = &wire;
 

@@ -275,26 +275,31 @@ impl<T> RingBuffer<T> {
     /// shorter than `'static`.
     ///
     /// The returned consumer is not `Clone`. Create additional consumers
-    /// via [`new_consumer`](Self::new_consumer).
-    #[must_use]
-    pub fn split_borrowed(&self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
-        self.consumer_count_live.fetch_add(1, Ordering::Relaxed);
-        let producer = Producer::new_with(self);
-        let consumer = Consumer::new_with(self, 0);
-        (producer, consumer)
-    }
-
-    /// Creates an additional borrowed consumer handle.
+    /// via [`Consumer::new_consumer`].
     ///
-    /// Use this instead of `Clone` when working with borrowed splits,
-    /// since `Clone` requires `Arc`.
-    pub fn new_consumer(&self) -> Consumer<T, &Self> {
-        let park_idx = self
-            .consumer_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+    /// Takes `&mut self` so the ring can be split only once. A second
+    /// split would mint a second *producer* — breaking the single-
+    /// producer contract, since each producer keeps a private write
+    /// cursor and two of them publish a `tail` past a slot neither
+    /// initialized. The exclusive borrow makes that a borrow-check error
+    /// rather than undefined behavior.
+    ///
+    /// ```compile_fail
+    /// use quetzalcoatl::spmc::RingBuffer;
+    /// use quetzalcoatl::capacity::Capacity;
+    ///
+    /// let mut ring = RingBuffer::<String>::new(Capacity::exact(4));
+    /// let (p1, c1) = ring.split_borrowed();
+    /// let (p2, c2) = ring.split_borrowed();
+    /// p1.push("a".to_string()).unwrap();
+    /// ```
+    #[must_use]
+    pub fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
         self.consumer_count_live.fetch_add(1, Ordering::Relaxed);
-        Consumer::new_with(self, park_idx & crate::common::park::PARK_MASK)
+        let shared: &Self = self;
+        let producer = Producer::new_with(shared);
+        let consumer = Consumer::new_with(shared, 0);
+        (producer, consumer)
     }
 }
 
@@ -775,6 +780,79 @@ mod tests {
     // -----------------------------------------------------------------------
     // Zero-copy API tests
     // -----------------------------------------------------------------------
+
+    /// See the spsc twin: a `SlotWriter` leaked with `mem::forget` runs
+    /// no destructor, so the reservation must not have advanced the
+    /// producer cursor or `tail` would publish an uninitialized slot.
+    #[test]
+    fn forgotten_writer_does_not_publish_uninitialized_slot() {
+        let (mut producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap());
+
+        producer.push(7).unwrap();
+
+        assert_eq!(
+            consumer.pop(),
+            Some(7),
+            "the forgotten slot must be reused, not published uninitialized"
+        );
+        assert_eq!(consumer.pop(), None, "no phantom item may become visible");
+    }
+
+    // The leaked value is the point of this test; Miri's leak checker
+    // would otherwise flag the deliberate `mem::forget`.
+    #[cfg_attr(miri, ignore = "intentional leak")]
+    #[test]
+    fn forgotten_written_slot_leaks_without_publishing() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut producer, consumer) =
+            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap().write(crate::common::DropCounter {
+            counter: counter.clone(),
+        }));
+
+        assert!(
+            consumer.pop().is_none(),
+            "an uncommitted value must not be visible"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a forgotten guard runs no destructor — the value leaks in place"
+        );
+
+        producer
+            .push(crate::common::DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .unwrap();
+        assert!(consumer.pop().is_some(), "the slot must be reusable");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the popped value is dropped; the leaked one is never freed"
+        );
+    }
+
+    #[test]
+    fn forgotten_writer_does_not_consume_capacity() {
+        let (mut producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        std::mem::forget(producer.reserve().unwrap());
+
+        for i in 0..4 {
+            producer.push(i).unwrap();
+        }
+        assert!(producer.push(99).is_err(), "ring should now be full");
+
+        let mut got = vec![];
+        while let Some(v) = consumer.pop() {
+            got.push(v);
+        }
+        assert_eq!(got, vec![0, 1, 2, 3]);
+    }
 
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
@@ -1403,7 +1481,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_push_pop() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
         let (producer, consumer) = ring.split_borrowed();
 
         producer.push(1).unwrap();
@@ -1416,7 +1494,7 @@ mod tests {
     #[test]
     fn borrowed_split_non_static_lifetime() {
         let wire_buf = [10u8, 20, 30, 40];
-        let ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
         let (producer, consumer) = ring.split_borrowed();
 
         producer.push(&wire_buf[0..2]).unwrap();
@@ -1428,9 +1506,9 @@ mod tests {
 
     #[test]
     fn borrowed_split_multiple_consumers() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(8));
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(8));
         let (producer, c1) = ring.split_borrowed();
-        let c2 = ring.new_consumer();
+        let c2 = c1.new_consumer();
 
         std::thread::scope(|s| {
             s.spawn(move || {
@@ -1481,7 +1559,7 @@ mod tests {
         }
 
         let wire = vec![0xCC; 128];
-        let ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
+        let mut ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
         let (producer, consumer) = ring.split_borrowed();
         let wire_ref = &wire;
 

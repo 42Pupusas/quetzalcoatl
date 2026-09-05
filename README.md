@@ -25,7 +25,7 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 - **Zero-copy API** — typestate `reserve()` → `write()` → `commit()` on the producer side, `pop_ref()` on the consumer side (all five variants)
 - **Blocking variants** — `push_block` / `pop_block` / `reserve_block` / `pop_ref_block` across all rings park on backpressure instead of forcing the caller to spin (broadcast has the producer-side `push_block` / `reserve_block`; its consumers never block)
 - **Async variants** — `push_async` / `pop_async` across all five variants (behind the `async` feature flag) integrate with any `Waker`-based executor
-- **Borrowed split** — `split_borrowed()` on SPSC/MPSC/SPMC lets the ring buffer own the storage while handing out `&`-tied producer/consumer handles, removing the `'static` bound on `T` for zero-copy APIs
+- **Borrowed split** — `split_borrowed()` on SPSC/MPSC/SPMC lets the ring buffer own the storage while handing out `&`-tied producer/consumer handles, removing the `'static` bound on `T` for zero-copy APIs. It takes `&mut self`, so the borrow checker rejects a second split that would duplicate a single-writer or single-reader endpoint; extra handles on the *many* side come from `Producer::new_producer` / `Consumer::new_consumer`
 - **Batch drain** — `drain()` / `drain_up_to()` / `drain_block()` amortize cache-line invalidations across the batch (O(1) per batch, not per item)
 - **Compile-time tuning** — `mpmc::Config` trait + `Cfg<B, S, F>` helper let you customize batch / scan / flush behavior at the type level
 - **Sound by construction** — `commit()` is only available on `WrittenSlot` (after `write()`), so safe code cannot cause UB
