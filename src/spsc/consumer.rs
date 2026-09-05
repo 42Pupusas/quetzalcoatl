@@ -3,6 +3,7 @@ use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use super::head_publisher::HeadPublisher;
 use super::RingBuffer;
 #[cfg(feature = "async")]
 use std::task::Poll;
@@ -86,27 +87,24 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// between consumer and producer from O(n) to O(1). The single
     /// post-batch `wake_producer` is sufficient because spsc has
     /// only one producer.
+    /// If `f` panics, the items already taken stay consumed: the head
+    /// cursor is published while unwinding, so `Consumer::drop` will
+    /// not read those slots a second time.
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
-        let mut head = self.ring().head.load(Ordering::Relaxed);
+        let ring = self.ring();
+        let mut publisher = HeadPublisher::new(ring, ring.head.load(Ordering::Relaxed));
         let mut count = 0usize;
         loop {
+            let head = publisher.position();
             if !self.available(head) {
                 break;
             }
             // SAFETY: available(head) returned true → tail > head with
             // Acquire, so the slot at `head` is initialized.
-            let val = unsafe { (*self.ring().slot(head).get()).assume_init_read() };
-            head += 1;
+            let val = unsafe { (*ring.slot(head).get()).assume_init_read() };
+            publisher.advance();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            // SeqCst: see Consumer::pop. Pairs with the producer's SeqCst
-            // `parked.store(true)` to close the missed-wakeup race.
-            self.ring().head.store(head, Ordering::SeqCst);
-            self.ring().wake_producer();
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async();
         }
         count
     }
@@ -114,24 +112,21 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Drains up to `limit` items, calling `f` for each. Returns the
     /// number drained. Useful for fairness in multi-source consumer
     /// loops.
+    /// Panic behaviour matches [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
-        let mut head = self.ring().head.load(Ordering::Relaxed);
+        let ring = self.ring();
+        let mut publisher = HeadPublisher::new(ring, ring.head.load(Ordering::Relaxed));
         let mut count = 0usize;
         while count < limit {
+            let head = publisher.position();
             if !self.available(head) {
                 break;
             }
-            let val = unsafe { (*self.ring().slot(head).get()).assume_init_read() };
-            head += 1;
+            // SAFETY: as in `drain`.
+            let val = unsafe { (*ring.slot(head).get()).assume_init_read() };
+            publisher.advance();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            // SeqCst: see Consumer::pop.
-            self.ring().head.store(head, Ordering::SeqCst);
-            self.ring().wake_producer();
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async();
         }
         count
     }
@@ -370,16 +365,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, 
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
     fn drop(&mut self) {
+        // The publisher is armed before the value is dropped so that a
+        // panicking `T::drop` still hands this slot back. Leaving `head`
+        // stale would make `Consumer::drop` drop the same value again.
+        let mut publisher = HeadPublisher::new(self.consumer.ring(), self.head);
+        publisher.advance();
+        // SAFETY: `pop_ref` verified the slot is initialized, and the
+        // `&mut Consumer` borrow gives us exclusive access to it.
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
-        // SeqCst: see Consumer::pop.
-        self.consumer
-            .ring()
-            .head
-            .store(self.head + 1, Ordering::SeqCst);
-        self.consumer.ring().wake_producer();
-        #[cfg(feature = "async")]
-        self.consumer.ring().wake_producer_async();
     }
 }

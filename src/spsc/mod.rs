@@ -25,6 +25,7 @@
 //! ```
 
 mod consumer;
+mod head_publisher;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
