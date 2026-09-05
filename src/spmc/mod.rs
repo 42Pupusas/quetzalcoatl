@@ -800,18 +800,22 @@ mod tests {
         assert_eq!(consumer.pop(), None, "no phantom item may become visible");
     }
 
-    // The leaked value is the point of this test; Miri's leak checker
-    // would otherwise flag the deliberate `mem::forget`.
-    #[cfg_attr(miri, ignore = "intentional leak")]
     #[test]
     fn forgotten_written_slot_leaks_without_publishing() {
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (mut producer, consumer) =
-            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+        // `BorrowedDropCounter` owns no heap memory, so the deliberate
+        // `mem::forget` below leaks only the destructor call this test
+        // asserts about — nothing for Miri's leak checker to flag.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let mut ring =
+            RingBuffer::<crate::common::BorrowedDropCounter<'_>>::new(Capacity::exact(4));
+        let (mut producer, consumer) = ring.split_borrowed();
 
-        std::mem::forget(producer.reserve().unwrap().write(crate::common::DropCounter {
-            counter: counter.clone(),
-        }));
+        std::mem::forget(
+            producer
+                .reserve()
+                .unwrap()
+                .write(crate::common::BorrowedDropCounter::new(&counter)),
+        );
 
         assert!(
             consumer.pop().is_none(),
@@ -824,9 +828,7 @@ mod tests {
         );
 
         producer
-            .push(crate::common::DropCounter {
-                counter: std::sync::Arc::clone(&counter),
-            })
+            .push(crate::common::BorrowedDropCounter::new(&counter))
             .unwrap();
         assert!(consumer.pop().is_some(), "the slot must be reusable");
         assert_eq!(

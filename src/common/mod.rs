@@ -454,6 +454,35 @@ impl Drop for DropCounter {
     }
 }
 
+/// A [`DropCounter`] that borrows its counter instead of sharing an
+/// `Arc`.
+///
+/// For tests that deliberately `mem::forget` a value: forgetting a
+/// `DropCounter` also leaks its `Arc` allocation, which forces the test
+/// to be skipped under Miri's leak checker. This type owns no heap
+/// memory, so the intended leak (the destructor never running) is
+/// observable while Miri still checks the test.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct BorrowedDropCounter<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl<'a> BorrowedDropCounter<'a> {
+    pub const fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        Self { counter }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BorrowedDropCounter<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

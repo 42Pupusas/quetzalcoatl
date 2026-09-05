@@ -26,6 +26,8 @@
 
 mod consumer;
 mod head_publisher;
+#[cfg(test)]
+mod pinned_ring;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
@@ -353,6 +355,7 @@ mod tests {
     use super::*;
     use crate::capacity::Capacity;
     use crate::common::park_probe::ParkProbe;
+    use crate::spsc::pinned_ring::PinnedRing;
 
     #[test]
     fn capacity_one() {
@@ -789,18 +792,22 @@ mod tests {
     /// Same hazard on the written-but-uncommitted guard: forgetting it
     /// must leak the value in place (safe) rather than publish it or
     /// leave a gap the consumer reads as initialized.
-    // The leaked value is the point of this test; Miri's leak checker
-    // would otherwise flag the deliberate `mem::forget`.
-    #[cfg_attr(miri, ignore = "intentional leak")]
     #[test]
     fn forgotten_written_slot_leaks_without_publishing() {
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (mut producer, mut consumer) =
-            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+        // `BorrowedDropCounter` owns no heap memory, so the deliberate
+        // `mem::forget` below leaks only the destructor call this test
+        // asserts about — nothing for Miri's leak checker to flag.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let mut ring =
+            RingBuffer::<crate::common::BorrowedDropCounter<'_>>::new(Capacity::exact(4));
+        let (mut producer, mut consumer) = ring.split_borrowed();
 
-        std::mem::forget(producer.reserve().unwrap().write(crate::common::DropCounter {
-            counter: counter.clone(),
-        }));
+        std::mem::forget(
+            producer
+                .reserve()
+                .unwrap()
+                .write(crate::common::BorrowedDropCounter::new(&counter)),
+        );
 
         assert!(
             consumer.pop().is_none(),
@@ -813,9 +820,7 @@ mod tests {
         );
 
         producer
-            .push(crate::common::DropCounter {
-                counter: std::sync::Arc::clone(&counter),
-            })
+            .push(crate::common::BorrowedDropCounter::new(&counter))
             .unwrap();
         assert!(consumer.pop().is_some(), "the slot must be reusable");
         assert_eq!(
@@ -1351,56 +1356,58 @@ mod tests {
 
     #[test]
     fn raw_split_push_pop() {
-        // Mirrors the shared-memory usage: leak the ring so it's `'static`,
-        // then reconstruct producer and consumer independently from its
-        // address (as the worker and main thread each would).
-        let ring: &'static RingBuffer<u32> =
-            Box::leak(Box::new(RingBuffer::new(Capacity::exact(4))));
-        let ptr = std::ptr::from_ref(ring);
+        // Mirrors the shared-memory usage: pin the ring at a stable
+        // address, then reconstruct producer and consumer independently
+        // from it (as the worker and main thread each would).
+        PinnedRing::<u32>::with(Capacity::exact(4), |ring| {
+            let ptr = ring.as_ptr();
 
-        // SAFETY: `ring` is leaked (`'static`, never moved/dropped); we make
-        // exactly one producer and one consumer, each used on this thread.
-        let producer = unsafe { RingBuffer::producer_from_raw(ptr) };
-        let mut consumer = unsafe { RingBuffer::consumer_from_raw(ptr) };
+            // SAFETY: the ring stays live and unmoved for this closure; we
+            // make exactly one producer and one consumer, each used on this
+            // thread, and both are dropped before `with` frees the ring.
+            let producer = unsafe { RingBuffer::producer_from_raw(ptr) };
+            let mut consumer = unsafe { RingBuffer::consumer_from_raw(ptr) };
 
-        producer.push(1).unwrap();
-        producer.push(2).unwrap();
-        assert_eq!(consumer.pop(), Some(1));
-        assert_eq!(consumer.pop(), Some(2));
-        assert_eq!(consumer.pop(), None);
+            producer.push(1).unwrap();
+            producer.push(2).unwrap();
+            assert_eq!(consumer.pop(), Some(1));
+            assert_eq!(consumer.pop(), Some(2));
+            assert_eq!(consumer.pop(), None);
+        });
     }
 
     #[test]
     fn raw_split_cross_thread() {
         // The handles travel to a separate thread, as producer and consumer
         // would live in separate execution contexts sharing the ring's memory.
-        let ring: &'static RingBuffer<u64> =
-            Box::leak(Box::new(RingBuffer::new(Capacity::exact(4))));
-        let ptr = std::ptr::from_ref(ring) as usize; // pointer crosses as bits
-        let n = 256u64;
+        PinnedRing::<u64>::with(Capacity::exact(4), |ring| {
+            let addr = ring.shared();
+            let n = 256u64;
 
-        let handle = std::thread::spawn(move || {
-            // SAFETY: single producer, leaked `'static` ring at `ptr`.
-            let producer = unsafe { RingBuffer::<u64>::producer_from_raw(ptr as *const _) };
-            for i in 0..n {
-                while producer.push(i).is_err() {
+            let handle = std::thread::spawn(move || {
+                // SAFETY: single producer on the pinned ring at `addr`,
+                // joined below while the ring is still live.
+                let producer = unsafe { RingBuffer::<u64>::producer_from_raw(addr.get()) };
+                for i in 0..n {
+                    while producer.push(i).is_err() {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+
+            // SAFETY: single consumer, same pinned ring.
+            let mut consumer = unsafe { RingBuffer::<u64>::consumer_from_raw(addr.get()) };
+            let mut received = 0u64;
+            while received < n {
+                if let Some(v) = consumer.pop() {
+                    assert_eq!(v, received);
+                    received += 1;
+                } else {
                     std::thread::yield_now();
                 }
             }
+            handle.join().unwrap();
         });
-
-        // SAFETY: single consumer, same leaked ring.
-        let mut consumer = unsafe { RingBuffer::<u64>::consumer_from_raw(ptr as *const _) };
-        let mut received = 0u64;
-        while received < n {
-            if let Some(v) = consumer.pop() {
-                assert_eq!(v, received);
-                received += 1;
-            } else {
-                std::thread::yield_now();
-            }
-        }
-        handle.join().unwrap();
     }
 
     #[test]
