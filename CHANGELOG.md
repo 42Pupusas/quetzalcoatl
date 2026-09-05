@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING: `split_borrowed` now takes `&mut self`** on SPSC, MPSC and
+  SPMC. It previously took `&self`, so safe code could call it twice on
+  one ring and mint a second copy of a *single* endpoint — two SPSC
+  producers *and* two SPSC consumers, two SPMC producers, or two MPSC
+  consumers. Two producers each write from a private cursor, so both
+  claim position 0 and `tail` advances past a slot neither initialized;
+  the consumer then reads uninitialized memory as a `T`. With
+  `T = String` this is confirmed undefined behavior under Miri, reachable
+  with no `unsafe` in the calling code. `split(self)` already prevented
+  this by consuming the ring; the exclusive borrow gives the borrowed
+  split the same guarantee, checked at compile time. Callers add `mut` to
+  the ring binding.
+- **BREAKING: `RingBuffer::new_producer` (MPSC) and
+  `RingBuffer::new_consumer` (SPMC) moved onto the handles** as
+  [`Producer::new_producer`] and [`Consumer::new_consumer`]. The handles
+  returned by `split_borrowed` borrow the ring for as long as they live,
+  so with the `&mut self` split above the ring can no longer be borrowed
+  again to create siblings. An existing handle already holds the shared
+  reference and can hand out siblings with the same lifetime. Replace
+  `ring.new_producer()` with `producer.new_producer()`, and
+  `ring.new_consumer()` with `consumer.new_consumer()`. The many-side
+  fan-out these enable is unchanged; only the single-writer/single-reader
+  duplication is now rejected.
+- **BREAKING: a broadcast buffer with no consumers now rejects pushes**
+  instead of accepting and discarding them ("black hole" mode).
+  `Producer::push` returns `Err(val)` and `Producer::reserve` returns
+  `None` when no consumer is registered; the blocking and async variants
+  already reported this as a closed channel. A consumer's progress is the
+  only proof that a slot's previous occupant has been read, so with no
+  consumer the previous behaviour let concurrent producers lap the ring
+  and write the same slot — a data race, confirmed under Miri. Code that
+  relied on pushing into a subscriber-less broadcast must now keep a
+  consumer alive or handle the `Err`.
+
+### Fixed
+- **`cargo +nightly miri test` now passes clean.** The README instructs
+  users to run exactly that command, but it aborted with four
+  leak-checker errors. Two SPSC tests exercising the raw-pointer seam
+  (`raw_split_push_pop`, `raw_split_cross_thread`) used `Box::leak` to
+  obtain the `'static` ring that `producer_from_raw` /
+  `consumer_from_raw` require. The leak is correct in production — the
+  ring really does outlive the program — but in a test it left an
+  unreclaimed allocation on every run. A `PinnedRing` RAII owner now
+  gives the same guarantee the `unsafe` contract asks for (a live ring at
+  a fixed address, never moved) and frees it when the test ends.
+- **Miri now checks two tests it had been skipping.** The
+  `forgotten_written_slot_leaks_without_publishing` tests in SPSC and
+  SPMC were `#[cfg_attr(miri, ignore)]` because the `DropCounter` they
+  deliberately `mem::forget` holds an `Arc` whose allocation then leaks.
+  The un-run *destructor* is the property under test; the leaked *heap
+  block* was incidental. They now use a `BorrowedDropCounter` that owns
+  no heap memory, so the assertions are unchanged and Miri covers them.
+- Reconstructing the cross-thread handle in `raw_split_cross_thread` no
+  longer round-trips the ring address through a `usize`. The integer cast
+  erased the pointer's provenance, and Miri warned it "might miss pointer
+  bugs" there; a provenance-preserving `SharedAddr` keeps those checks
+  live.
+- **Producers could overclaim slots and block in the non-blocking
+  `push`** — a position was claimed with an unconditional
+  `tail.fetch_add`, which always succeeds, so the fullness check before
+  it was only a hint. With one free slot, every concurrent producer
+  passed the check and claimed a position; the losers then waited inside
+  `push` — documented never to block — for a consumer that might never
+  advance. Observed as 3 of 8 producers wedged permanently. The claim is
+  now a compare-and-swap that validates the position as part of taking
+  it, so a producer only ever owns a slot it may write. This also
+  removes an unbounded O(N) registry scan from the contended path:
+  8-producer throughput rose from ~15 to ~55 Mitem/s, with
+  single-producer throughput unchanged.
+- **A broadcast producer could spin forever after the last consumer
+  dropped** — the consumer floor was reported as `tail` when the
+  registry was empty. A producer that had already claimed `pos` then
+  compared it against a floor *ahead* of itself, and the backlog
+  computation `pos - floor` wrapped to a huge value that was always
+  `>= cap`, so the "is my slot free yet" loop never exited. Reachable
+  from safe code whenever at least `cap` producers claimed positions
+  between one producer's fullness check and its own claim. The floor is
+  now a `ConsumerFloor` that distinguishes "no consumers" from a
+  position, and the comparison tests the ordering before subtracting.
+- **A panic could cause a double drop in SPSC** — three paths moved a
+  value out of a slot before publishing the consumer's `head` cursor,
+  and skipped that publication when the thread unwound between the two.
+  `Consumer::drop` then drained from the stale cursor and dropped the
+  same values a second time; with a heap-allocating `T` this aborted the
+  process with heap corruption. Affected a panicking callback in
+  `drain` and `drain_up_to`, and a panicking `T::drop` under
+  `SlotReader`. Publication now happens in the destructor of a new
+  `HeadPublisher` guard, so it runs on the unwind path too.
+  Additionally, `WrittenSlot::commit` marked itself committed only
+  *after* publishing `tail` and waking the consumer; a panic in that
+  window let its destructor drop a value the consumer already owned.
+  The guard is now disarmed first.
+- **A forgotten SPSC/SPMC `SlotWriter` could publish an uninitialized
+  slot** — `reserve` advanced the producer's private write cursor and
+  relied on the guard's destructor to roll it back. `std::mem::forget`
+  runs no destructor, so safe code could reserve a slot, forget the
+  guard, and `push` a value into the *next* position; publishing `tail`
+  then exposed the skipped, never-initialized slot to the consumer as a
+  valid item. A safety argument may not depend on a destructor running.
+  The cursor now advances on publication (`push`, `commit`,
+  `commit_unchecked`) rather than on reservation, so an abandoned
+  reservation — dropped *or* forgotten — leaves the cursor on the
+  uninitialized slot and the next claim reuses it. Forgetting a
+  `WrittenSlot` now leaks the value in place, which is safe, instead of
+  publishing it. Capacity is no longer permanently consumed by a
+  forgotten reservation.
+
 ## [0.14.0] - 2026-08-14
 
 ### Fixed
