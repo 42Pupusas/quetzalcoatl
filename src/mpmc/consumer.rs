@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::slot_release::SlotRelease;
+use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::park_registry::ParkSlot;
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -20,8 +22,8 @@ pub struct Consumer<T, C: Config = DefaultConfig> {
     next_scan: Cell<usize>,
     /// Pops since the last `consumed` flush.
     local_consumed: Cell<usize>,
-    /// Stable park slot for this consumer (mod `PARK_SLOTS`).
-    park_slot: usize,
+    /// Park slot leased for this consumer's lifetime, returned on drop.
+    park_slot: ParkSlot,
 }
 
 impl<T, C: Config> Clone for Consumer<T, C> {
@@ -34,12 +36,7 @@ impl<T, C: Config> Clone for Consumer<T, C> {
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let stagger = (n * (self.queue.cap / 8).max(1)) & self.queue.mask;
-        // Distinct park slot per clone, mod PARK_SLOTS.
-        let park_idx = self
-            .queue
-            .consumer_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        self.queue.consumer_count.fetch_add(1, Ordering::Relaxed);
         // Bump the live-consumer count so producers can detect
         // "all consumers gone" via consumer_closed.
         self.queue
@@ -49,7 +46,7 @@ impl<T, C: Config> Clone for Consumer<T, C> {
             queue: Arc::clone(&self.queue),
             next_scan: Cell::new(stagger),
             local_consumed: Cell::new(0),
-            park_slot: park_idx & PARK_MASK,
+            park_slot: self.queue.consumer_slots.lease(),
         }
     }
 }
@@ -59,12 +56,13 @@ impl<T, C: Config> Clone for Consumer<T, C> {
 unsafe impl<T: Send, C: Config> Send for Consumer<T, C> {}
 
 impl<T, C: Config> Consumer<T, C> {
-    pub(super) const fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
+    pub(super) fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
+        let park_slot = queue.consumer_slots.lease();
         Self {
             queue,
             next_scan: Cell::new(0),
             local_consumed: Cell::new(0),
-            park_slot: 0,
+            park_slot,
         }
     }
 
@@ -324,7 +322,7 @@ impl<T, C: Config> Consumer<T, C> {
     #[must_use]
     pub fn pop_block(&self) -> Option<T> {
         let q = &*self.queue;
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if let Some(v) = self.pop() {
@@ -344,12 +342,11 @@ impl<T, C: Config> Consumer<T, C> {
                 continue;
             }
 
-            q.consumer_park.arm_handle(self.park_slot);
-            // SeqCst pairs with producer's `consumer_park.wake.load`
-            // after `ready.store(Release)`: either we see a
-            // published slot in the re-check below, or the
-            // producer sees our bit and unparks us.
-            q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // The SeqCst fetch_or inside arm pairs with the producer's
+            // `consumer_park.wake.load` after `ready.store(Release)`:
+            // either we see a published slot in the re-check below, or
+            // the producer sees our bit and unparks us.
+            q.consumer_park.arm(slot);
             // Fence so the recheck below is totally ordered with the
             // producer's `ready.store(Release)`. Without it the recheck
             // can be hoisted above our SeqCst fetch_or in the
@@ -358,7 +355,7 @@ impl<T, C: Config> Consumer<T, C> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
-                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.disarm(slot);
                 return Some(v);
             }
             // SeqCst on closed.load forces a total order with the last-
@@ -368,13 +365,13 @@ impl<T, C: Config> Consumer<T, C> {
             // to observe stale `closed=false`, causing an indefinite
             // park if no further publish follows.
             if q.closed.0.load(Ordering::SeqCst) {
-                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.disarm(slot);
                 return self.pop();
             }
 
-            // park_timeout backstop — see Producer::push_block.
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-            q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            // Bounded park backstop — see Producer::push_block.
+            slot.park_bounded(PARK_BACKSTOP);
+            q.consumer_park.disarm(slot);
         }
     }
 
@@ -426,7 +423,6 @@ impl<T, C: Config> Consumer<T, C> {
     /// loop restarts.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
-        let bit_mask = 1u64 << self.park_slot;
         let park_slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
@@ -453,19 +449,12 @@ impl<T, C: Config> Consumer<T, C> {
                 continue;
             }
 
-            self.queue.consumer_park.arm_handle(park_slot);
-            self.queue
-                .consumer_park
-                .wake
-                .fetch_or(bit_mask, Ordering::SeqCst);
+            self.queue.consumer_park.arm(park_slot);
             // See pop_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.has_item() {
-                self.queue
-                    .consumer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.consumer_park.disarm(park_slot);
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
@@ -475,22 +464,16 @@ impl<T, C: Config> Consumer<T, C> {
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
             if self.queue.closed.0.load(Ordering::SeqCst) {
-                self.queue
-                    .consumer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.consumer_park.disarm(park_slot);
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
                 return None;
             }
 
-            // park_timeout backstop — see Consumer::pop_block.
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-            self.queue
-                .consumer_park
-                .wake
-                .fetch_and(!bit_mask, Ordering::Relaxed);
+            // Bounded park backstop — see Consumer::pop_block.
+            park_slot.park_bounded(PARK_BACKSTOP);
+            self.queue.consumer_park.disarm(park_slot);
         }
     }
 
@@ -526,6 +509,8 @@ impl<T, C: Config> Drop for Consumer<T, C> {
         if lc > 0 {
             self.queue.consumed.fetch_add(lc, Ordering::Relaxed);
         }
+
+        self.queue.consumer_slots.release(self.park_slot);
 
         // Last-consumer drop: flag `consumer_closed` and wake any
         // producers parked in `push_block` so they can observe it

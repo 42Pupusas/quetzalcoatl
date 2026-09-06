@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::task::Waker;
 
 use super::park::PARK_SLOTS;
+use super::park_registry::ParkSlot;
+use super::waker_overflow::WakerOverflow;
 use super::AlignedBuf;
 
 /// A single registered [`Waker`], owned through an [`AtomicPtr`].
@@ -89,6 +91,10 @@ pub struct WakerSet {
     /// only one atomic load.
     pub pending: AtomicBool,
     pub slots: AlignedBuf<WakerSlot>,
+    /// Wakers for waiters holding no park slot. An async waiter has no
+    /// timeout to rescue itself, so it must be recorded somewhere even
+    /// when every slot is leased.
+    pub overflow: WakerOverflow,
 }
 
 impl WakerSet {
@@ -96,10 +102,11 @@ impl WakerSet {
         Self {
             pending: AtomicBool::new(false),
             slots: AlignedBuf::new_with(PARK_SLOTS, WakerSlot::new),
+            overflow: WakerOverflow::new(),
         }
     }
 
-    /// Registers `cx`'s waker in `slot`. Sets `pending = true`.
+    /// Registers `cx`'s waker for `slot`. Sets `pending = true`.
     ///
     /// Called by the future before returning `Poll::Pending`. The
     /// trailing `SeqCst` fence pairs with the fence in `wake_one`/
@@ -109,8 +116,11 @@ impl WakerSet {
     /// future parked with no further poll. Mirrors the blocking
     /// waiter's `fetch_or(SeqCst); fence(SeqCst)` in `park::WakeSet`.
     #[inline]
-    pub fn register(&self, slot: usize, cx: &std::task::Context<'_>) {
-        self.slots[slot & (PARK_SLOTS - 1)].store(cx.waker());
+    pub fn register(&self, slot: ParkSlot, cx: &std::task::Context<'_>) {
+        match slot.index() {
+            Some(index) => self.slots[index].store(cx.waker()),
+            None => self.overflow.register(cx.waker()),
+        }
         self.pending.store(true, Ordering::Release);
         std::sync::atomic::fence(Ordering::SeqCst);
     }
@@ -149,6 +159,7 @@ impl WakerSet {
         for slot in &*self.slots {
             slot.wake();
         }
+        self.overflow.wake_all();
         // Don't clear pending: a waiter may register between the load and
         // the end of this scan. Leave pending=true so the next call
         // retries. The waiter always re-checks the ring after registering,
@@ -172,6 +183,7 @@ impl WakerSet {
         for slot in &*self.slots {
             slot.wake();
         }
+        self.overflow.wake_all();
     }
 }
 

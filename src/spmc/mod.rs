@@ -53,6 +53,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::park_registry::ParkRegistry;
 use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -103,6 +104,9 @@ pub struct RingBuffer<T> {
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Consumer` clones. Bumped at clone time only.
     pub(crate) consumer_count: CachePadded<AtomicUsize>,
+    /// Leases park-slot indices to `Consumer` handles, reclaiming each
+    /// on drop so a slot is never shared by two live consumers.
+    pub(crate) consumer_slots: ParkRegistry,
     /// Single-producer park handle. Re-armed each time the producer
     /// parks, so a producer that moves between threads is woken on
     /// whichever thread is parked now; consumers claim it to issue the
@@ -159,6 +163,7 @@ impl<T> RingBuffer<T> {
             consumer_closed: CachePadded(AtomicBool::new(false)),
             consumer_count_live: CachePadded(AtomicUsize::new(1)),
             consumer_count: CachePadded(AtomicUsize::new(0)),
+            consumer_slots: ParkRegistry::new(),
             producer_parker: ThreadParker::new(),
             producer_parked: CachePadded(AtomicBool::new(false)),
             consumer_park: WakeSet::new(),
@@ -293,7 +298,7 @@ impl<T> RingBuffer<T> {
     /// p1.push("a".to_string()).unwrap();
     /// ```
     #[must_use]
-    pub const fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+    pub fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
         // No increment: the count is seeded at one for the consumer a
         // split hands out, exactly as `split` relies on. Counting this
         // one twice left the tally at one after the only consumer
@@ -302,7 +307,7 @@ impl<T> RingBuffer<T> {
         // existed.
         let shared: &Self = self;
         let producer = Producer::new_with(shared);
-        let consumer = Consumer::new_with(shared, 0);
+        let consumer = Consumer::new_with(shared, shared.consumer_slots.lease());
         (producer, consumer)
     }
 }

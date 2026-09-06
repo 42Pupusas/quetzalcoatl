@@ -6,11 +6,14 @@ use std::task::Poll;
 
 use super::batch_abandon::BatchAbandon;
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::park_registry::ParkSlot;
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
 const PRIMARY_SHORT_SPIN: u32 = 4;
+
+use super::PARK_BACKSTOP;
 
 /// Cloneable producer for an MPMC ring.
 ///
@@ -27,19 +30,19 @@ pub struct Producer<T, C: Config = DefaultConfig> {
     batch_unused: Cell<u32>,
     /// Original batch size (≤ `C::PRODUCER_BATCH`); diagnostic.
     batch_size: Cell<u32>,
-    /// Stable park slot for this producer (mod `PARK_SLOTS`).
-    park_slot: usize,
+    /// Park slot leased for this producer's lifetime, returned on drop.
+    park_slot: ParkSlot,
 }
 
 impl<T, C: Config> Clone for Producer<T, C> {
     fn clone(&self) -> Self {
-        let n = self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
             batch_start: Cell::new(0),
             batch_unused: Cell::new(0),
             batch_size: Cell::new(0),
-            park_slot: (n + 1) & PARK_MASK,
+            park_slot: self.queue.producer_slots.lease(),
         }
     }
 }
@@ -49,13 +52,14 @@ impl<T, C: Config> Clone for Producer<T, C> {
 unsafe impl<T: Send, C: Config> Send for Producer<T, C> {}
 
 impl<T, C: Config> Producer<T, C> {
-    pub(super) const fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
+    pub(super) fn new(queue: Arc<RingBuffer<T, C>>) -> Self {
+        let park_slot = queue.producer_slots.lease();
         Self {
             queue,
             batch_start: Cell::new(0),
             batch_unused: Cell::new(0),
             batch_size: Cell::new(0),
-            park_slot: 0,
+            park_slot,
         }
     }
 
@@ -217,7 +221,6 @@ impl<T, C: Config> Producer<T, C> {
     /// Same wait protocol as [`push_block`](Self::push_block). Useful
     /// when you want zero-copy writes plus blocking.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T, C>> {
-        let bit_mask = 1u64 << self.park_slot;
         let park_slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
@@ -235,36 +238,23 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
-            self.queue.producer_park.arm_handle(park_slot);
-            self.queue
-                .producer_park
-                .wake
-                .fetch_or(bit_mask, Ordering::SeqCst);
+            self.queue.producer_park.arm(park_slot);
             // See pop_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
             if self.queue.consumer_closed.0.load(Ordering::SeqCst) {
-                self.queue
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.producer_park.disarm(park_slot);
                 return None;
             }
             if self.reserve().is_some() {
-                self.queue
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.producer_park.disarm(park_slot);
                 return self.reserve();
             }
 
-            // park_timeout backstop — see push_block.
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-            self.queue
-                .producer_park
-                .wake
-                .fetch_and(!bit_mask, Ordering::Relaxed);
+            // Bounded park — see push_block.
+            park_slot.park_bounded(PARK_BACKSTOP);
+            self.queue.producer_park.disarm(park_slot);
         }
     }
 
@@ -279,7 +269,7 @@ impl<T, C: Config> Producer<T, C> {
     /// gated on a single `Relaxed` load.
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = &*self.queue;
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             match self.push(val) {
@@ -296,18 +286,17 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
-            q.producer_park.arm_handle(self.park_slot);
-            // SeqCst pairs with consumer's `producer_park.wake.load`
-            // after `done.store(Release)`: either we succeed in
-            // the re-check below, or the consumer sees our bit
-            // and unparks us.
-            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            // The SeqCst fetch_or inside arm pairs with the consumer's
+            // `producer_park.wake.load` after `done.store(Release)`:
+            // either we succeed in the re-check below, or the consumer
+            // sees our bit and unparks us.
+            q.producer_park.arm(slot);
             // Fence: see park_until_slot_free for the rationale.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             match self.push(val) {
                 Ok(()) => {
-                    q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                    q.producer_park.disarm(slot);
                     return Ok(());
                 }
                 Err(returned) => val = returned,
@@ -315,21 +304,19 @@ impl<T, C: Config> Producer<T, C> {
             // SeqCst: post-arm half of the close handshake, for the
             // same reason pop_block's closed.load is SeqCst.
             if q.consumer_closed.0.load(Ordering::SeqCst) {
-                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.producer_park.disarm(slot);
                 return Err(val);
             }
 
-            // park_timeout (not park) as a final-line backstop:
-            // round-robin in WakeSet eliminates the wake-bit
-            // starvation; the SeqCst pairing on `wake` closes the
-            // Dekker race. Together those should be sufficient, but
-            // an extremely rare residual race (cap=16 stress, ~3%
-            // of 5000-item runs) could still hang. The 1ms timeout
-            // caps that hang at 1ms — a parked producer always
-            // re-checks its done value within that window. Fast
-            // path (consumer unparks immediately) is unchanged.
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            // Bounded park as a final-line backstop: round-robin in
+            // WakeSet removes the wake-bit starvation and the SeqCst
+            // pairing on `wake` closes the Dekker race, but a rare
+            // residual hang was observed (cap=16 stress, ~3% of
+            // 5000-item runs). Exclusive slot leasing is the likelier
+            // cause and is now fixed, though not proven to be the only
+            // one, so the bound stays until it is.
+            slot.park_bounded(PARK_BACKSTOP);
+            q.producer_park.disarm(slot);
         }
     }
 
@@ -383,6 +370,7 @@ impl<T, C: Config> Drop for Producer<T, C> {
         // once the consumers are gone.
         BatchAbandon::new(&self.queue).release_all(self.batch_start.get(), self.batch_unused.get());
 
+        self.queue.producer_slots.release(self.park_slot);
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst pairs with consumer's `closed.load(SeqCst)` in
             // pop_block's recheck after fetch_or — see consumer.rs.

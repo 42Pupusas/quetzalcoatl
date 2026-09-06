@@ -8,6 +8,8 @@ use std::task::Poll;
 use super::batch_release::BatchRelease;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
+#[cfg(feature = "async")]
+use crate::common::park_registry::ParkSlot;
 use crate::common::SlotSnapshot;
 
 /// The consumer side of an MPSC ring buffer.
@@ -246,7 +248,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             if self.ring().closed.0.load(Ordering::Acquire) {
                 return Poll::Ready(self.pop());
             }
-            self.ring().consumer_waker.register(0, cx);
+            self.ring().consumer_waker.register(ParkSlot::SOLE, cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }

@@ -8,7 +8,8 @@ use super::consumer_floor::ConsumerFloor;
 use super::slot_reuse::SlotReuse;
 use super::slot_state::SlotState;
 use super::RingBuffer;
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::park_registry::ParkSlot;
 
 /// The producer side of a broadcast ring buffer.
 ///
@@ -18,25 +19,21 @@ use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
     pub(super) cached_min_head: std::cell::Cell<usize>,
-    /// Stable park slot for this producer handle (mod `PARK_SLOTS`).
-    /// Used by [`Producer::push_block`] / [`Producer::reserve_block`] to
-    /// register on the producer wake bitmap.
-    pub(super) park_slot: usize,
+    /// Park slot leased for this producer handle's lifetime and
+    /// returned on drop. Used by [`Producer::push_block`] /
+    /// [`Producer::reserve_block`] to register on the producer wake
+    /// bitmap.
+    pub(super) park_slot: ParkSlot,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         #[cfg(feature = "async")]
         self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
-        let park_idx = self
-            .queue
-            .producer_park_idx
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
         Self {
             queue: Arc::clone(&self.queue),
             cached_min_head: std::cell::Cell::new(0),
-            park_slot: park_idx & PARK_MASK,
+            park_slot: self.queue.producer_park_slots.lease(),
         }
     }
 }
@@ -51,9 +48,20 @@ fn any_consumer_active<T>(q: &RingBuffer<T>) -> bool {
         .any(|s| s.active.load(Ordering::Acquire))
 }
 
-#[cfg(feature = "async")]
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
+        self.queue.producer_park_slots.release(self.park_slot);
+        self.close_if_last();
+    }
+}
+
+impl<T> Producer<T> {
+    /// Signals the last-producer close to any waiting async consumer.
+    ///
+    /// Only the async build tracks a producer count, so the blocking
+    /// build has no close to signal here.
+    #[cfg(feature = "async")]
+    fn close_if_last(&self) {
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Last producer gone: flag closed and flush all parked
             // consumers so their pop_async can return None after
@@ -68,6 +76,10 @@ impl<T> Drop for Producer<T> {
             self.queue.consumer_waker.flush();
         }
     }
+
+    #[cfg(not(feature = "async"))]
+    #[allow(clippy::unused_self)]
+    const fn close_if_last(&self) {}
 }
 
 impl<T> Producer<T> {
@@ -220,7 +232,7 @@ impl<T> Producer<T> {
     /// on each retry, so `T` need not be `Clone`.
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = &*self.queue;
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         // Gate on `has_space()` (a real min_head scan) *before* calling
         // `push`. `push`/`claim_slot` does an unconditional `tail.fetch_add`
@@ -252,8 +264,7 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            q.producer_park.arm_handle(self.park_slot);
-            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            q.producer_park.arm(slot);
             // Pairs with WakeSet::wake_one's fence: the re-checks below
             // load consumer state with Acquire, which the SeqCst RMW
             // above does not place in the total order.
@@ -264,17 +275,17 @@ impl<T> Producer<T> {
             // would otherwise have nothing left to wake us. Either we make
             // progress here, or the consumer's wake_one/flush sees the bit.
             if !any_consumer_active(q) {
-                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.producer_park.disarm(slot);
                 return Err(val);
             }
             if self.has_space() {
-                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.producer_park.disarm(slot);
                 backoff = 0;
                 continue;
             }
 
-            std::thread::park();
-            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            q.producer_park.disarm(slot);
             backoff = 0;
         }
     }
@@ -285,7 +296,7 @@ impl<T> Producer<T> {
     ///
     /// Same wait protocol as [`push_block`](Self::push_block).
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if !any_consumer_active(&self.queue) {
@@ -299,34 +310,21 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            self.queue.producer_park.arm_handle(self.park_slot);
-            self.queue
-                .producer_park
-                .wake
-                .fetch_or(bit_mask, Ordering::SeqCst);
+            self.queue.producer_park.arm(slot);
             // See push_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if !any_consumer_active(&self.queue) {
-                self.queue
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.producer_park.disarm(slot);
                 return None;
             }
             if self.has_space() {
-                self.queue
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.queue.producer_park.disarm(slot);
                 return self.reserve();
             }
 
-            std::thread::park();
-            self.queue
-                .producer_park
-                .wake
-                .fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            self.queue.producer_park.disarm(slot);
         }
     }
 
@@ -352,11 +350,12 @@ impl<T> Producer<T> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    // Producers register on slot index = current tail
-                    // mod PARK_SLOTS; the consumer's wake fires the
-                    // matching slot.
-                    let slot = self.queue.tail.load(Ordering::Relaxed);
-                    self.queue.producer_waker.register(slot, cx);
+                    // Register on this producer's own leased slot. A
+                    // tail-derived index moved between polls, so one
+                    // producer scattered registrations across slots it
+                    // did not own -- displacing peers' wakers and
+                    // leaving stale entries behind.
+                    self.queue.producer_waker.register(self.park_slot, cx);
                     if !any_consumer_active(&self.queue) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }

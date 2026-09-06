@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::park_registry::ParkSlot;
 
 /// The consumer side of an SPMC ring buffer.
 ///
@@ -23,7 +24,7 @@ pub struct Consumer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     cached_tail: Cell<usize>,
     batch_next: Cell<usize>,
     batch_end: Cell<usize>,
-    park_slot: usize,
+    park_slot: ParkSlot,
 }
 
 const BATCH_SIZE: usize = 4;
@@ -31,11 +32,7 @@ const BATCH_SIZE: usize = 4;
 // Clone only for the Arc variant.
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
-        let park_idx = self
-            .queue
-            .consumer_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        self.queue.consumer_count.fetch_add(1, Ordering::Relaxed);
         self.queue
             .consumer_count_live
             .fetch_add(1, Ordering::Relaxed);
@@ -44,7 +41,7 @@ impl<T> Clone for Consumer<T> {
             cached_tail: Cell::new(0),
             batch_next: Cell::new(0),
             batch_end: Cell::new(0),
-            park_slot: park_idx & PARK_MASK,
+            park_slot: self.queue.consumer_slots.lease(),
         }
     }
 }
@@ -54,13 +51,14 @@ impl<T> Clone for Consumer<T> {
 unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Consumer<T, R> {}
 
 impl<T> Consumer<T> {
-    pub(super) const fn new(queue: Arc<RingBuffer<T>>) -> Self {
+    pub(super) fn new(queue: Arc<RingBuffer<T>>) -> Self {
+        let park_slot = queue.consumer_slots.lease();
         Self {
             queue,
             cached_tail: Cell::new(0),
             batch_next: Cell::new(0),
             batch_end: Cell::new(0),
-            park_slot: 0,
+            park_slot,
         }
     }
 }
@@ -81,17 +79,14 @@ impl<'a, T> Consumer<T, &'a RingBuffer<T>> {
     #[must_use]
     pub fn new_consumer(&self) -> Self {
         let queue: &'a RingBuffer<T> = self.queue;
-        let park_idx = queue
-            .consumer_count
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        queue.consumer_count.fetch_add(1, Ordering::Relaxed);
         queue.consumer_count_live.fetch_add(1, Ordering::Relaxed);
-        Self::new_with(queue, park_idx & PARK_MASK)
+        Self::new_with(queue, queue.consumer_slots.lease())
     }
 }
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
-    pub(super) const fn new_with(queue: R, park_slot: usize) -> Self {
+    pub(super) const fn new_with(queue: R, park_slot: ParkSlot) -> Self {
         Self {
             queue,
             cached_tail: Cell::new(0),
@@ -258,7 +253,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[must_use]
     pub fn pop_block(&self) -> Option<T> {
         let q = self.ring();
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if let Some(v) = self.pop() {
@@ -275,25 +270,24 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 continue;
             }
 
-            q.consumer_park.arm_handle(self.park_slot);
-            q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            q.consumer_park.arm(slot);
             // Pairs with WakeSet::wake_one's fence: the pop() re-check
             // below reads the slot sequence with Acquire, which the
             // SeqCst RMW above does not place in the total order.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
-                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.disarm(slot);
                 return Some(v);
             }
             // SeqCst: post-arm half of the close handshake.
             if q.closed.0.load(Ordering::SeqCst) {
-                q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.consumer_park.disarm(slot);
                 return self.pop();
             }
 
-            std::thread::park();
-            q.consumer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            q.consumer_park.disarm(slot);
         }
     }
 
@@ -362,7 +356,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// the loop restarts.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if self.has_item() {
@@ -385,19 +379,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 continue;
             }
 
-            self.ring().consumer_park.arm_handle(self.park_slot);
-            self.ring()
-                .consumer_park
-                .wake
-                .fetch_or(bit_mask, Ordering::SeqCst);
+            self.ring().consumer_park.arm(slot);
             // See pop_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.has_item() {
-                self.ring()
-                    .consumer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.ring().consumer_park.disarm(slot);
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
                 }
@@ -407,21 +394,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
             if self.ring().closed.0.load(Ordering::SeqCst) {
-                self.ring()
-                    .consumer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.ring().consumer_park.disarm(slot);
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
                 }
                 return None;
             }
 
-            std::thread::park();
-            self.ring()
-                .consumer_park
-                .wake
-                .fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            self.ring().consumer_park.disarm(slot);
         }
     }
 
@@ -462,12 +443,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             }
             q.done_slot(pos).store(pos + cap, Ordering::Release);
         }
+        q.consumer_slots.release(self.park_slot);
         if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst store + wake_producer's SeqCst load of
             // producer_parked are the two halves of the close
-            // handshake. Reading the parker OnceLock directly skips
-            // the load and lets the producer park after we decide not
-            // to wake it.
+            // handshake. Reading the parker handle directly skips the
+            // load and lets the producer park after we decide not to
+            // wake it.
             q.consumer_closed.0.store(true, Ordering::SeqCst);
             q.wake_producer();
             #[cfg(feature = "async")]

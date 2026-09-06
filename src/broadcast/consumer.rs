@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
+#[cfg(feature = "async")]
+use crate::common::park_registry::ParkSlot;
 use crate::common::SlotSnapshot;
 
 /// The consumer side of a broadcast ring buffer.
@@ -141,7 +143,7 @@ impl<T> Consumer<T> {
     where
         T: Clone,
     {
-        let slot = self.slot_index;
+        let slot = ParkSlot::from_exclusive_index(self.slot_index);
         std::future::poll_fn(move |cx| {
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use super::head_publisher::HeadPublisher;
 use super::RingBuffer;
 #[cfg(feature = "async")]
+use crate::common::park_registry::ParkSlot;
+#[cfg(feature = "async")]
 use std::task::Poll;
 
 /// The consumer side of an SPSC ring buffer.
@@ -184,7 +186,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 return Poll::Ready(self.pop());
             }
             // Register waker then re-check to close the lost-wake race.
-            self.ring().consumer_waker.register(0, cx);
+            self.ring().consumer_waker.register(ParkSlot::SOLE, cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }

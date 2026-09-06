@@ -7,6 +7,8 @@ use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registry::ParkSlot;
 
 /// The producer side of an SPMC ring buffer.
 ///
@@ -112,7 +114,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    self.ring().producer_waker.register(0, cx);
+                    self.ring().producer_waker.register(ParkSlot::SOLE, cx);
                     if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }

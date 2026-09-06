@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
+use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::park_registry::ParkSlot;
 use crate::common::TOMBSTONE;
 
 /// The producer side of an MPSC ring buffer.
@@ -22,23 +23,20 @@ use crate::common::TOMBSTONE;
 pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     pub(super) queue: R,
     pub(super) cached_head: std::cell::Cell<usize>,
-    /// Stable park slot for this producer (mod `PARK_SLOTS`). Used by
-    /// [`Producer::push_block`] to register on the wake bitmap.
-    pub(super) park_slot: usize,
+    /// Park slot leased for this producer's lifetime and returned on
+    /// drop. Used by [`Producer::push_block`] to register on the wake
+    /// bitmap.
+    pub(super) park_slot: ParkSlot,
 }
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
-        let park_idx = self
-            .queue
-            .producer_park_idx
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+        let park_slot = self.queue.producer_slots.lease();
         Self {
             queue: Arc::clone(&self.queue),
             cached_head: std::cell::Cell::new(0),
-            park_slot: park_idx & PARK_MASK,
+            park_slot,
         }
     }
 }
@@ -65,16 +63,13 @@ impl<'a, T> Producer<T, &'a RingBuffer<T>> {
     pub fn new_producer(&self) -> Self {
         let queue: &'a RingBuffer<T> = self.queue;
         queue.producer_count.fetch_add(1, Ordering::Relaxed);
-        let park_idx = queue
-            .producer_park_idx
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        Self::new_with(queue, park_idx & PARK_MASK)
+        let park_slot = queue.producer_slots.lease();
+        Self::new_with(queue, park_slot)
     }
 }
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
-    pub(super) const fn new_with(queue: R, park_slot: usize) -> Self {
+    pub(super) const fn new_with(queue: R, park_slot: ParkSlot) -> Self {
         Self {
             queue,
             cached_head: std::cell::Cell::new(0),
@@ -148,7 +143,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// on a single `Relaxed` load.
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = self.ring();
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if q.consumer_closed.0.load(Ordering::Acquire) {
@@ -163,8 +158,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            q.producer_park.arm_handle(self.park_slot);
-            q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
+            q.producer_park.arm(slot);
             // Pairs with the SeqCst fence in WakeSet::wake_one. The
             // re-check below reads `head`/`sequence` with Acquire from
             // inside push(); a SeqCst RMW above does not place those
@@ -175,19 +169,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             // SeqCst: post-arm half of the close handshake.
             if q.consumer_closed.0.load(Ordering::SeqCst) {
-                q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                q.producer_park.disarm(slot);
                 return Err(val);
             }
             match self.push(val) {
                 Ok(()) => {
-                    q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+                    q.producer_park.disarm(slot);
                     return Ok(());
                 }
                 Err(returned) => val = returned,
             }
 
-            std::thread::park();
-            q.producer_park.wake.fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            q.producer_park.disarm(slot);
             backoff = 0;
         }
     }
@@ -270,7 +264,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 
     fn claim_slot_block(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
-        let bit_mask = 1u64 << self.park_slot;
+        let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
             if self.ring().consumer_closed.0.load(Ordering::Acquire) {
@@ -284,33 +278,20 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            self.ring().producer_park.arm_handle(self.park_slot);
-            self.ring()
-                .producer_park
-                .wake
-                .fetch_or(bit_mask, Ordering::SeqCst);
+            self.ring().producer_park.arm(slot);
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
-                self.ring()
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.ring().producer_park.disarm(slot);
                 return None;
             }
             if let Some(claim) = self.claim_slot() {
-                self.ring()
-                    .producer_park
-                    .wake
-                    .fetch_and(!bit_mask, Ordering::Relaxed);
+                self.ring().producer_park.disarm(slot);
                 return Some(claim);
             }
 
-            std::thread::park();
-            self.ring()
-                .producer_park
-                .wake
-                .fetch_and(!bit_mask, Ordering::Relaxed);
+            slot.park();
+            self.ring().producer_park.disarm(slot);
             backoff = 0;
         }
     }
@@ -336,6 +317,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
+        self.ring().producer_slots.release(self.park_slot);
         if self.ring().producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst: pairs with the consumer's post-arm SeqCst load
             // and with wake_consumer's SeqCst load of consumer_parked.

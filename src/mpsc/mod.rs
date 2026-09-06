@@ -35,6 +35,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::park_registry::ParkRegistry;
 use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -72,9 +73,9 @@ pub struct RingBuffer<T> {
     /// space. The consumer wakes one parked producer after each pop
     /// (gated on the bitmap being non-zero).
     pub(crate) producer_park: WakeSet,
-    /// Monotonic counter for assigning stable park-slot indices to
-    /// `Producer` clones. Bumped at clone time only.
-    pub(crate) producer_park_idx: CachePadded<AtomicUsize>,
+    /// Leases park-slot indices to `Producer` handles, reclaiming each
+    /// on drop so a slot is never shared by two live producers.
+    pub(crate) producer_slots: ParkRegistry,
     /// Single-consumer park handle. Re-armed by the consumer each time
     /// it parks, so a consumer that moves between threads is woken on
     /// whichever thread is parked now; producers claim it to unpark.
@@ -125,7 +126,7 @@ impl<T> RingBuffer<T> {
             closed: CachePadded(AtomicBool::new(false)),
             consumer_closed: CachePadded(AtomicBool::new(false)),
             producer_park: WakeSet::new(),
-            producer_park_idx: CachePadded(AtomicUsize::new(0)),
+            producer_slots: ParkRegistry::new(),
             consumer_parker: ThreadParker::new(),
             consumer_parked: CachePadded(AtomicBool::new(false)),
             #[cfg(feature = "async")]
@@ -196,7 +197,8 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        let producer = Producer::new_with(arc.clone(), 0);
+        let park_slot = arc.producer_slots.lease();
+        let producer = Producer::new_with(arc.clone(), park_slot);
         let consumer = Consumer { queue: arc };
         (producer, consumer)
     }
@@ -229,9 +231,10 @@ impl<T> RingBuffer<T> {
     /// p1.push("a".to_string()).unwrap();
     /// ```
     #[must_use]
-    pub const fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+    pub fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
         let shared: &Self = self;
-        let producer = Producer::new_with(shared, 0);
+        let park_slot = shared.producer_slots.lease();
+        let producer = Producer::new_with(shared, park_slot);
         let consumer = Consumer { queue: shared };
         (producer, consumer)
     }
@@ -1363,6 +1366,62 @@ mod tests {
         assert_eq!(second.join().unwrap(), Some(2));
     }
 
+    /// More producers than `PARK_SLOTS`, so at least two share a park
+    /// slot and can be parked on it at the same time. Every producer
+    /// must eventually complete.
+    #[test]
+    fn push_block_completes_with_more_producers_than_park_slots() {
+        use crate::common::park::PARK_SLOTS;
+
+        const EXTRA: usize = 8;
+        let n_producers = PARK_SLOTS + EXTRA;
+        let (p, mut c) = RingBuffer::<usize>::new(Capacity::exact(2)).split();
+
+        let handles: Vec<_> = (0..n_producers)
+            .map(|i| {
+                let p = p.clone();
+                std::thread::spawn(move || p.push_block(i))
+            })
+            .collect();
+        drop(p);
+
+        let mut got = 0usize;
+        while got < n_producers {
+            if c.pop().is_some() {
+                got += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), Ok(()));
+        }
+    }
+
+    /// Creating and dropping producers past `PARK_SLOTS` times must not
+    /// alias a live blocking producer's slot. A monotonic counter wraps
+    /// on total handles ever made, not on how many are alive, so a
+    /// long-lived waiter eventually shares its bit with a newcomer.
+    #[test]
+    fn park_slots_do_not_alias_after_churning_producers() {
+        use crate::common::park::PARK_SLOTS;
+
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        p.push(1).unwrap();
+        p.push(2).unwrap();
+
+        for _ in 0..(PARK_SLOTS * 2) {
+            drop(p.clone());
+        }
+
+        let blocked = p.clone();
+        let h = std::thread::spawn(move || blocked.push_block(3));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(c.pop(), Some(1));
+        assert_eq!(h.join().unwrap(), Ok(()));
+        drop(p);
+    }
+
     #[test]
     fn pop_block_returns_none_on_close() {
         let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
@@ -1841,8 +1900,10 @@ mod tests {
         let ring = RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4));
 
         let waker = PanicWaker::waker();
-        ring.consumer_waker
-            .register(0, &Context::from_waker(&waker));
+        ring.consumer_waker.register(
+            crate::common::park_registry::ParkSlot::SOLE,
+            &Context::from_waker(&waker),
+        );
 
         let (mut producer, mut consumer) = ring.split();
 

@@ -1,9 +1,12 @@
 pub mod park;
 #[cfg(test)]
 pub mod park_probe;
+pub mod park_registry;
 pub mod thread_parker;
 #[cfg(feature = "async")]
 pub mod wake_async;
+#[cfg(feature = "async")]
+pub mod waker_overflow;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;

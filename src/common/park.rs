@@ -18,6 +18,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::park_registry::ParkSlot;
 use super::thread_parker::ThreadParker;
 use super::AlignedBuf;
 
@@ -221,20 +222,38 @@ impl WakeSet {
     ///
     /// Re-arming is what lets a waiter migrate between threads: the
     /// handle names the thread parked now, not the one that parked
-    /// first. Slot aliasing (>`PARK_SLOTS` waiters) means the last
-    /// armer wins; a wake on that bit may unpark a waiter that is not
-    /// the one that armed it, which is benign — it re-checks and
-    /// re-parks.
+    /// first. A [`ParkSlot::Shared`] holder has no slot to arm and
+    /// rescues itself on a timeout instead.
     #[inline]
-    pub fn arm_handle(&self, slot: usize) {
-        self.parkers[slot].arm();
+    pub fn arm_handle(&self, slot: ParkSlot) {
+        if let Some(index) = slot.index() {
+            self.parkers[index].arm();
+        }
     }
 
     /// Whether a handle is armed at `slot`.
     #[must_use]
     #[inline]
-    pub fn is_armed(&self, slot: usize) -> bool {
-        self.parkers[slot].is_armed()
+    pub fn is_armed(&self, slot: ParkSlot) -> bool {
+        slot.index()
+            .is_some_and(|index| self.parkers[index].is_armed())
+    }
+
+    /// Arms this waiter's handle and publishes its wake bit, so a peer
+    /// can find it. Slotless waiters publish nothing.
+    ///
+    /// The `SeqCst` `fetch_or` is the ordering half of the handshake:
+    /// it must precede the caller's final re-check of the ring.
+    #[inline]
+    pub fn arm(&self, slot: ParkSlot) {
+        self.arm_handle(slot);
+        self.wake.fetch_or(slot.mask(), Ordering::SeqCst);
+    }
+
+    /// Clears this waiter's wake bit.
+    #[inline]
+    pub fn disarm(&self, slot: ParkSlot) {
+        self.wake.fetch_and(!slot.mask(), Ordering::Relaxed);
     }
 }
 

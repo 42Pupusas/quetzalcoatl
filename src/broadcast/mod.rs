@@ -50,6 +50,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::park_registry::ParkRegistry;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
@@ -113,12 +114,12 @@ pub struct RingBuffer<T> {
     /// advance its head. Consumers `wake_one` after advancing a head.
     /// Independent of the async `producer_waker` below.
     pub(crate) producer_park: WakeSet,
-    /// Round-robin park-slot allocator for blocking producers. Each
-    /// `push_block`/`reserve_block` caller takes a stable slot
-    /// `idx & PARK_MASK` so concurrent blocking producers don't collide
-    /// on one bitmap bit (aliasing past 64 is benign — false wake,
-    /// re-check, re-park).
-    pub(crate) producer_park_idx: CachePadded<AtomicUsize>,
+    /// Leases park-slot indices to blocking producers, reclaiming each
+    /// on drop so no two live producers share one bitmap bit. Sharing a
+    /// bit loses wakeups outright: a wake clears the single shared bit
+    /// and unparks one holder, leaving the other parked with nothing
+    /// recording that it waits.
+    pub(crate) producer_park_slots: ParkRegistry,
     /// Live producer count (only tracked when `async` is enabled). When
     /// it reaches zero `closed` is set so `pop_async` can resolve to `None`.
     #[cfg(feature = "async")]
@@ -177,7 +178,7 @@ impl<T> RingBuffer<T> {
             tail: CachePadded(AtomicUsize::new(0)),
             min_head_cache: CachePadded(AtomicUsize::new(0)),
             producer_park: WakeSet::new(),
-            producer_park_idx: CachePadded(AtomicUsize::new(0)),
+            producer_park_slots: ParkRegistry::new(),
             consumer_slots: consumer_slots.into_boxed_slice(),
             #[cfg(feature = "async")]
             producer_count: CachePadded(AtomicUsize::new(1)),
@@ -255,10 +256,11 @@ impl<T> RingBuffer<T> {
         arc.consumer_slots[0].active.store(true, Ordering::Relaxed);
         arc.consumer_slots[0].head.store(0, Ordering::Relaxed);
 
+        let park_slot = arc.producer_park_slots.lease();
         let producer = Producer {
             queue: Arc::clone(&arc),
             cached_min_head: std::cell::Cell::new(0),
-            park_slot: 0,
+            park_slot,
         };
         let consumer = Consumer {
             queue: arc,
@@ -1458,8 +1460,10 @@ mod tests {
         let ring = RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4), 4);
 
         let waker = PanicWaker::waker();
-        ring.consumer_waker
-            .register(0, &Context::from_waker(&waker));
+        ring.consumer_waker.register(
+            crate::common::park_registry::ParkSlot::from_exclusive_index(0),
+            &Context::from_waker(&waker),
+        );
 
         let (mut producer, mut consumer) = ring.split();
 

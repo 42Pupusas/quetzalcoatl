@@ -63,6 +63,16 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::park_registry::ParkRegistry;
+
+/// Upper bound on a parked mpmc waiter's sleep.
+///
+/// A backstop, not the wake path: a residual missed wake was observed
+/// under saturated stress (cap=16, ~3% of 5000-item runs) and its cause
+/// was never isolated. Exclusive park-slot leasing removes the aliasing
+/// that is the likeliest explanation, but until that is demonstrated the
+/// bound stays so any survivor costs latency rather than a hang.
+pub(crate) const PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
@@ -125,9 +135,11 @@ impl Config for DefaultConfig {
 /// Inline-customization helper. Lets callers tune a ring without
 /// declaring a named config type:
 ///
-/// ```ignore
+/// ```
 /// use quetzalcoatl::mpmc::{Cfg, RingBuffer};
-/// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(cap).split();
+/// use quetzalcoatl::capacity::Capacity;
+///
+/// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
 /// ```
 ///
 /// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH>`.
@@ -184,6 +196,11 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Consumer` clones. Bumped at clone time only.
     pub(crate) consumer_count: CachePadded<AtomicUsize>,
+    /// Leases park-slot indices to `Producer` handles, reclaiming each
+    /// on drop so a slot is never shared by two live producers.
+    pub(crate) producer_slots: ParkRegistry,
+    /// Consumer counterpart of `producer_slots`.
+    pub(crate) consumer_slots: ParkRegistry,
     /// Async equivalent of `producer_park`: per-producer-slot wakers
     /// registered from `Poll::Pending` in `push_async`. Woken by any
     /// consumer after a successful pop / commit / batched drain.
@@ -273,6 +290,8 @@ impl<T, C: Config> RingBuffer<T, C> {
             cap,
             mask: capacity.mask,
             producer_park: WakeSet::new(),
+            producer_slots: ParkRegistry::new(),
+            consumer_slots: ParkRegistry::new(),
             consumer_park: WakeSet::new(),
             consumer_count: CachePadded(AtomicUsize::new(0)),
             #[cfg(feature = "async")]
