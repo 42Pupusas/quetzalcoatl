@@ -49,6 +49,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented contract was never the implemented one.
 
 ### Fixed
+- **A waiter that moved threads was never woken.** Park handles lived in
+  a `OnceLock<Thread>`, so the first thread to park on an endpoint owned
+  that entry for the endpoint's life. Every endpoint is `Send`, so a
+  handle that parks on one thread, moves, and parks on another was still
+  recorded as the first: the wake went to a thread that was not parked,
+  or had exited, and the thread actually sleeping was never signalled.
+  Work-stealing executors and thread pools move handles as a matter of
+  course. A `ThreadParker` now re-arms on every park, publishing the
+  handle through an `AtomicPtr` whose every access is a `swap`, so the
+  thread that takes the handle out is its sole owner and may drop it.
+  A regression test that pops from two threads in turn hung past 120
+  seconds before the fix.
+- **More than 64 waiters on one ring could lose a wakeup.** Park slots
+  were assigned by masking a monotonic counter, and the aliasing that
+  follows was documented as benign — a false wake, a re-check, a
+  re-park. It is not benign. Bit *i* of the wake bitmap is the only
+  record that slot *i* has a waiter, so a wake clears that one bit and
+  unparks one thread; a second waiter on the same slot is left parked
+  with nothing marking it as waiting, and nothing wakes it again. Because
+  the counter only ever increased, the same collision also arrived by
+  churn: a ring that created 64 or more endpoints over its life aliased a
+  long-lived waiter even with few alive at once. A `ParkRegistry` now
+  leases slots and reclaims them on drop, so an index is reused only
+  after its previous holder is gone. A waiter that finds every slot taken
+  gets a shared slot with no bitmap bit and re-checks the ring on a
+  timeout; async waiters, which cannot self-rescue because only a waker
+  can poll a future again, go on an overflow list that every wake drains.
+  Regression tests cover both the concurrent and the churn case.
+- **A broadcast producer registered its async waker at a moving index.**
+  The slot was derived from the ring tail, so it changed between polls of
+  the same future, scattering registrations across slots other producers
+  owned. The producer's leased slot is now used, as elsewhere.
+- The `mpmc::Cfg` example was marked `ignore` and had never compiled — it
+  referenced an undefined binding. It now runs with the rest of the
+  doctests.
 - **A broadcast consumer could loop forever on an abandoned
   reservation.** The tombstone was a single `usize::MAX` sentinel that
   named no position, but a broadcast consumer never clears a marker —
