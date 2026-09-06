@@ -11,8 +11,26 @@ categories = ["concurrency", "data-structures"]
 readme = "README.md"
 # Tight allowlist — keeps benches/ and examples/ out of the published
 # crate (they reference dev-dependencies and bloat the download).
+# `include` wins over `exclude` outright, so the loom models are kept
+# out by naming the directories rather than by excluding the file:
+# it is test-only scaffolding naming a crate the package never depends
+# on.
 include = [
-    "src/**/*.rs",
+    "src/*.rs",
+    "src/broadcast/**/*.rs",
+    "src/common/atomics.rs",
+    "src/common/mod.rs",
+    "src/common/park.rs",
+    "src/common/park_probe.rs",
+    "src/common/park_registration.rs",
+    "src/common/park_registry.rs",
+    "src/common/thread_parker.rs",
+    "src/common/wake_async.rs",
+    "src/common/waker_overflow.rs",
+    "src/mpmc/**/*.rs",
+    "src/mpsc/**/*.rs",
+    "src/spmc/**/*.rs",
+    "src/spsc/**/*.rs",
     "Cargo.toml",
     "README.md",
     "LICENSE",
