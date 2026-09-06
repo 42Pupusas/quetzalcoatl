@@ -77,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout; async waiters, which cannot self-rescue because only a waker
   can poll a future again, go on an overflow list that every wake drains.
   Regression tests cover both the concurrent and the churn case.
+- **Two async operations on one handle stranded one of them.** The async
+  methods take `&self`, so safe code can hold two `push_async` futures
+  from a single producer (or two `pop_async` futures from a single
+  consumer) and drive them from separate tasks with separate wakers. A
+  park slot belongs to the *endpoint*, not to the future, so both
+  registered in the same slot and the second store dropped the first
+  waker — leaving a parked future that nothing could ever poll again. A
+  displaced waker is now moved to the overflow list rather than dropped,
+  and `WakerSlot::store` returns it so the invariant cannot be missed at
+  a call site. A future re-registering its own waker, the common case,
+  still displaces nothing.
 - **A broadcast producer registered its async waker at a moving index.**
   The slot was derived from the ring tail, so it changed between polls of
   the same future, scattering registrations across slots other producers

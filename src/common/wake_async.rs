@@ -32,16 +32,28 @@ impl WakerSlot {
         }
     }
 
-    /// Stores (or replaces) the waker.
+    /// Stores (or replaces) the waker, returning any waker it displaced.
+    ///
+    /// A displaced waker belongs to a future that is still parked, so
+    /// the caller must keep it reachable; dropping it strands that
+    /// future. Returns `None` when the replaced entry was this same
+    /// waker, which is the common case of one future re-registering on
+    /// each poll.
     #[inline]
-    pub fn store(&self, waker: &Waker) {
+    #[must_use]
+    pub fn store(&self, waker: &Waker) -> Option<Waker> {
         let next = Box::into_raw(Box::new(waker.clone()));
         let prev = self.waker.swap(next, Ordering::AcqRel);
-        if !prev.is_null() {
-            // SAFETY: the swap removed `prev` from the slot, so this
-            // thread is its sole owner and no peer can observe it again.
-            drop(unsafe { Box::from_raw(prev) });
+        if prev.is_null() {
+            return None;
         }
+        // SAFETY: the swap removed `prev` from the slot, so this
+        // thread is its sole owner and no peer can observe it again.
+        let prev = unsafe { Box::from_raw(prev) };
+        if prev.will_wake(waker) {
+            return None;
+        }
+        Some(*prev)
     }
 
     /// Wakes the registered waker. Returns `true` only when this call
@@ -108,6 +120,12 @@ impl WakerSet {
 
     /// Registers `cx`'s waker for `slot`. Sets `pending = true`.
     ///
+    /// A slot is owned by an endpoint, not by a future, and the async
+    /// methods take `&self`: two futures from one handle share a slot,
+    /// and the second registration displaces the first. The displaced
+    /// future is still parked, so its waker moves to the overflow list
+    /// rather than being dropped.
+    ///
     /// Called by the future before returning `Poll::Pending`. The
     /// trailing `SeqCst` fence pairs with the fence in `wake_one`/
     /// `wake_n` so the waker's post-register re-check of the ring and a
@@ -118,7 +136,11 @@ impl WakerSet {
     #[inline]
     pub fn register(&self, slot: ParkSlot, cx: &std::task::Context<'_>) {
         match slot.index() {
-            Some(index) => self.slots[index].store(cx.waker()),
+            Some(index) => {
+                if let Some(displaced) = self.slots[index].store(cx.waker()) {
+                    self.overflow.register_owned(displaced);
+                }
+            }
             None => self.overflow.register(cx.waker()),
         }
         self.pending.store(true, Ordering::Release);
@@ -190,5 +212,82 @@ impl WakerSet {
 impl Default for WakerSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WakerSet, WakerSlot};
+    use crate::common::park_registry::ParkSlot;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+
+    struct CountingWaker {
+        count: AtomicUsize,
+    }
+
+    impl CountingWaker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: AtomicUsize::new(0),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn an_empty_slot_displaces_nothing() {
+        let slot = WakerSlot::new();
+        assert!(slot.store(&Waker::from(CountingWaker::new())).is_none());
+    }
+
+    #[test]
+    fn re_registering_one_waker_displaces_nothing() {
+        let slot = WakerSlot::new();
+        let waker = Waker::from(CountingWaker::new());
+        assert!(slot.store(&waker).is_none());
+        assert!(slot.store(&waker).is_none());
+    }
+
+    #[test]
+    fn a_second_waker_is_handed_back_rather_than_dropped() {
+        let slot = WakerSlot::new();
+        let first = CountingWaker::new();
+        let _ = slot.store(&Waker::from(Arc::clone(&first)));
+
+        let displaced = slot
+            .store(&Waker::from(CountingWaker::new()))
+            .expect("the first waker must be handed back");
+        displaced.wake();
+        assert_eq!(first.count(), 1);
+    }
+
+    /// Two futures sharing one endpoint's slot must both be woken: the
+    /// displaced registration belongs to a future that is still parked.
+    #[test]
+    fn a_displaced_registration_is_still_woken() {
+        let set = WakerSet::new();
+        let first = CountingWaker::new();
+        let second = CountingWaker::new();
+        let slot = ParkSlot::from_exclusive_index(0);
+
+        let first_waker = Waker::from(Arc::clone(&first));
+        let second_waker = Waker::from(Arc::clone(&second));
+        set.register(slot, &Context::from_waker(&first_waker));
+        set.register(slot, &Context::from_waker(&second_waker));
+
+        set.wake_all();
+        assert_eq!(first.count(), 1);
+        assert_eq!(second.count(), 1);
     }
 }

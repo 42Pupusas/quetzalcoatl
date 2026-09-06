@@ -47,6 +47,17 @@ impl WakerOverflow {
         waiting.push(waker.clone());
     }
 
+    /// Takes ownership of a waker displaced from a [`WakerSlot`].
+    ///
+    /// [`WakerSlot`]: super::wake_async::WakerSlot
+    pub fn register_owned(&self, waker: Waker) {
+        let mut waiting = self.lock();
+        if waiting.iter().any(|w| w.will_wake(&waker)) {
+            return;
+        }
+        waiting.push(waker);
+    }
+
     /// Wakes and clears every registered waker.
     ///
     /// Each waiter re-registers if it still cannot progress, which

@@ -2024,6 +2024,64 @@ mod tests {
         h.join().unwrap();
     }
 
+    /// Two `push_async` futures from *one* producer handle, driven by
+    /// separate tasks with separate wakers. `push_async` takes `&self`,
+    /// so this is reachable from safe code, and both futures park on
+    /// the handle's single slot: the second registration displaces and
+    /// drops the first waker, stranding that future.
+    #[test]
+    #[cfg(feature = "async")]
+    fn two_async_pushes_from_one_handle_both_complete() {
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move {
+                let producer = Rc::new(producer);
+                let first = {
+                    let p = Rc::clone(&producer);
+                    tokio::task::spawn_local(async move { p.push_async(10).await })
+                };
+                let second = {
+                    let p = Rc::clone(&producer);
+                    tokio::task::spawn_local(async move { p.push_async(11).await })
+                };
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+            }));
+            let _ = done_tx.send(());
+        });
+
+        // Let both futures exhaust their fast path and park before any
+        // space appears, so each must be woken to make progress.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = 0;
+        while got < 4 && Instant::now() < deadline {
+            if consumer.pop().is_some() {
+                got += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(got, 4, "a queued value never became visible");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a push_async future was stranded");
+        h.join().unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Borrowed split (non-'static T)
     // -----------------------------------------------------------------------
