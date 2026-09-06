@@ -131,7 +131,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 tail = q.tail.load(Ordering::Acquire);
                 self.cached_tail.set(tail);
                 if head >= tail {
-                    if q.closed.0.load(Ordering::Acquire) {
+                    if q.closed.is_closed() {
                         let tail2 = q.tail.load(Ordering::Acquire);
                         self.cached_tail.set(tail2);
                         let head2 = q.head.load(Ordering::Relaxed);
@@ -261,7 +261,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             if let Some(v) = self.pop() {
                 return Some(v);
             }
-            if q.closed.0.load(Ordering::Acquire) {
+            if q.closed.is_closed() {
                 if let Some(v) = self.pop() {
                     return Some(v);
                 }
@@ -283,7 +283,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 return Some(v);
             }
             // SeqCst: post-arm half of the close handshake.
-            if q.closed.0.load(Ordering::SeqCst) {
+            if q.closed.is_closed_for_parking() {
                 q.consumer_park.disarm(slot);
                 return self.pop();
             }
@@ -302,14 +302,14 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
+            if self.ring().closed.is_closed() {
                 return Poll::Ready(self.pop());
             }
             parked.arm(cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
+            if self.ring().closed.is_closed() {
                 return Poll::Ready(self.pop());
             }
             Poll::Pending
@@ -368,7 +368,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 backoff = 0;
                 continue;
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
+            if self.ring().closed.is_closed() {
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
                 }
@@ -395,7 +395,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             }
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
-            if self.ring().closed.0.load(Ordering::SeqCst) {
+            if self.ring().closed.is_closed_for_parking() {
                 self.ring().consumer_park.disarm(slot);
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
@@ -429,7 +429,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Returns `true` if the producer has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.ring().closed.0.load(Ordering::Acquire)
+        self.ring().closed.is_closed()
     }
 }
 
@@ -452,7 +452,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             // handshake. Reading the parker handle directly skips the
             // load and lets the producer park after we decide not to
             // wake it.
-            q.consumer_closed.0.store(true, Ordering::SeqCst);
+            q.consumer_closed.close();
             q.wake_producer();
             #[cfg(feature = "async")]
             q.producer_waker.flush();

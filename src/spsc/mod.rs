@@ -34,6 +34,7 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+use crate::common::close_state::CloseState;
 use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -60,10 +61,10 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Set when the [`Producer`] is dropped. [`Consumer::pop_block`]
     /// observes this and returns `None` once the queue drains.
-    pub(crate) producer_closed: CachePadded<AtomicBool>,
+    pub(crate) producer_closed: CloseState,
     /// Set when the [`Consumer`] is dropped. [`Producer::push_block`]
     /// observes this and returns `Err(val)` instead of hanging.
-    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    pub(crate) consumer_closed: CloseState,
     /// Single-producer park handle. Re-armed each time the producer
     /// parks, so a producer that moves between threads is woken on
     /// whichever thread is parked now; the consumer claims it to issue
@@ -130,8 +131,8 @@ impl<T> RingBuffer<T> {
             tail: CachePadded(AtomicUsize::new(0)),
             cap,
             mask: capacity.mask,
-            producer_closed: CachePadded(AtomicBool::new(false)),
-            consumer_closed: CachePadded(AtomicBool::new(false)),
+            producer_closed: CloseState::new(),
+            consumer_closed: CloseState::new(),
             producer_parker: ThreadParker::new(),
             producer_parked: CachePadded(AtomicBool::new(false)),
             consumer_parker: ThreadParker::new(),
@@ -225,7 +226,7 @@ impl<T> RingBuffer<T> {
     /// fail should drop the consumer, which is what
     /// [`push_block`](Producer::push_block) reports through `Err`.
     pub fn close(&self) {
-        self.producer_closed.0.store(true, Ordering::Release);
+        self.producer_closed.close();
         self.wake_consumer();
         #[cfg(feature = "async")]
         self.consumer_waker.flush();
@@ -1215,7 +1216,7 @@ mod tests {
         // Close without freeing a slot. Consumer::drop drains first, and
         // a parked producer that gets real space legitimately pushes into
         // it and returns Ok, which is not the path under test here.
-        c.queue.consumer_closed.0.store(true, Ordering::Release);
+        c.queue.consumer_closed.close();
         c.queue.wake_producer();
         assert_eq!(h.join().unwrap(), Err(99));
         drop(c);
@@ -1261,7 +1262,7 @@ mod tests {
         });
         // Close without freeing a slot, as in
         // push_block_returns_err_on_consumer_close.
-        c.queue.consumer_closed.0.store(true, Ordering::Release);
+        c.queue.consumer_closed.close();
         c.queue.wake_producer();
         assert!(!h.join().unwrap());
         drop(c);

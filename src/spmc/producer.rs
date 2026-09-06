@@ -111,7 +111,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let mut parked = ParkRegistration::new(&self.ring().producer_waker, ParkSlot::SOLE);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
@@ -119,7 +119,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Err(returned) => {
                     val = Some(returned);
                     parked.arm(cx);
-                    if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+                    if self.ring().consumer_closed.is_closed() {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {
@@ -159,7 +159,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
         let mut backoff = 0u32;
         loop {
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return None;
             }
             if self.has_space() {
@@ -177,7 +177,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
-            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
+            if self.ring().consumer_closed.is_closed_for_parking() {
                 self.ring()
                     .producer_parked
                     .0
@@ -226,8 +226,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.push(val)
     }
     fn consumer_gone(&self) -> bool {
-        // SeqCst: post-arm half of the close handshake.
-        self.ring().consumer_closed.0.load(Ordering::SeqCst)
+        self.ring().consumer_closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
         self.ring().producer_parker.arm();
@@ -243,8 +242,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
-        // SeqCst: pairs with each consumer's post-arm SeqCst load.
-        self.ring().closed.0.store(true, Ordering::SeqCst);
+        self.ring().closed.close();
         self.ring().consumer_park.flush();
         #[cfg(feature = "async")]
         self.ring().consumer_waker.flush();

@@ -49,6 +49,8 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+#[cfg(feature = "async")]
+use crate::common::close_state::CloseState;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
 #[cfg(feature = "async")]
@@ -127,7 +129,7 @@ pub struct RingBuffer<T> {
     /// Set by the last producer drop. Consumers' `pop_async` observe
     /// it and resolve to `None` once their backlog drains.
     #[cfg(feature = "async")]
-    pub(crate) closed: CachePadded<AtomicBool>,
+    pub(crate) closed: CloseState,
     /// Wakers registered by parked `push_async` futures. Slot index =
     /// pos & mask — producers waiting on slot `s` register there, and
     /// consumers wake the matching slot's waker after advancing head.
@@ -183,7 +185,7 @@ impl<T> RingBuffer<T> {
             #[cfg(feature = "async")]
             producer_count: CachePadded(AtomicUsize::new(1)),
             #[cfg(feature = "async")]
-            closed: CachePadded(AtomicBool::new(false)),
+            closed: CloseState::new(),
             #[cfg(feature = "async")]
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]

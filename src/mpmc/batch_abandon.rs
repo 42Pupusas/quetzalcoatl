@@ -53,7 +53,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
         while done.load(Ordering::Acquire) != pos {
             // SeqCst: the post-arm half of the close handshake, as in
             // the blocking paths.
-            if q.consumer_closed.0.load(Ordering::SeqCst) {
+            if q.consumer_closed.is_closed_for_parking() {
                 return;
             }
             // A consumer can be parked waiting for a slot this batch

@@ -36,6 +36,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
+use crate::common::close_state::CloseState;
 use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -64,10 +65,10 @@ pub struct RingBuffer<T> {
     pub(crate) producer_count: CachePadded<AtomicUsize>,
     /// Set by the last [`Producer`] drop. [`Consumer::pop_block`]
     /// observes this and returns `None` once the queue drains.
-    pub(crate) closed: CachePadded<AtomicBool>,
+    pub(crate) closed: CloseState,
     /// Set when the [`Consumer`] is dropped. [`Producer::push_block`]
     /// observes this and returns `Err(val)` instead of hanging.
-    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    pub(crate) consumer_closed: CloseState,
     /// Producer-side park state. Bit `i` of `producer_park.wake` is
     /// set ↔ a producer in slot `i` is parked waiting for free
     /// space. The consumer wakes one parked producer after each pop
@@ -123,8 +124,8 @@ impl<T> RingBuffer<T> {
             cap,
             mask: capacity.mask,
             producer_count: CachePadded(AtomicUsize::new(1)),
-            closed: CachePadded(AtomicBool::new(false)),
-            consumer_closed: CachePadded(AtomicBool::new(false)),
+            closed: CloseState::new(),
+            consumer_closed: CloseState::new(),
             producer_park: WakeSet::new(),
             producer_slots: ParkRegistry::new(),
             consumer_parker: ThreadParker::new(),
@@ -170,8 +171,7 @@ impl<T> RingBuffer<T> {
     /// drop the consumer, which is what
     /// [`push_block`](Producer::push_block) reports through `Err`.
     pub fn close(&self) {
-        // SeqCst: see Producer::drop.
-        self.closed.0.store(true, Ordering::SeqCst);
+        self.closed.close();
         self.wake_consumer();
         #[cfg(feature = "async")]
         self.consumer_waker.flush();

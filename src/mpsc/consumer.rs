@@ -251,14 +251,14 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if this.ring().closed.0.load(Ordering::Acquire) {
+            if this.ring().closed.is_closed() {
                 return Poll::Ready(this.pop());
             }
             parker.arm(&this.ring().consumer_waker, cx);
             if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if this.ring().closed.0.load(Ordering::Acquire) {
+            if this.ring().closed.is_closed() {
                 return Poll::Ready(this.pop());
             }
             Poll::Pending
@@ -274,7 +274,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.ring().closed.0.load(Ordering::Acquire)
+        self.ring().closed.is_closed()
     }
 
     /// Returns the number of items currently in the buffer.
@@ -304,7 +304,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
     }
     fn producer_gone(&self) -> bool {
         // SeqCst: post-arm half of the close handshake.
-        self.ring().closed.0.load(Ordering::SeqCst)
+        self.ring().closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
         self.ring().consumer_parker.arm();
@@ -333,7 +333,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
     }
     fn producer_gone(&self) -> bool {
         // SeqCst: post-arm half of the close handshake.
-        self.ring().closed.0.load(Ordering::SeqCst)
+        self.ring().closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
         self.ring().consumer_parker.arm();
@@ -352,7 +352,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
         // SeqCst: pairs with each producer's post-arm SeqCst load of
         // consumer_closed, ordering it against their SeqCst fetch_or on
         // the park bitmask.
-        self.ring().consumer_closed.0.store(true, Ordering::SeqCst);
+        self.ring().consumer_closed.close();
         self.ring().producer_park.flush();
         #[cfg(feature = "async")]
         self.ring().producer_waker.flush();

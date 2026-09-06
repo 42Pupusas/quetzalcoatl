@@ -1,4 +1,5 @@
 pub mod atomics;
+pub mod close_state;
 #[cfg(all(test, loom, feature = "async"))]
 mod loom_models;
 pub mod park;

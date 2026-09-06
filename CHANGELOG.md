@@ -49,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented contract was never the implemented one.
 
 ### Fixed
+- **`spsc::RingBuffer::close` published the close with `Release`,**
+  where every other close in the crate — including MPSC's otherwise
+  identical `close` — uses `SeqCst`. Closing and parking is a Dekker
+  handshake over two locations: the closer stores "closed" then loads
+  "is anyone parked?", while the waiter stores "I am parked" then
+  loads "closed?". `Release`/`Acquire` orders a store against a later
+  load of the *same* location and leaves that pair unordered, so both
+  sides could read stale values — the closer seeing nobody parked and
+  issuing no wake, the waiter seeing an open ring and parking with
+  nothing left to wake it. A consumer already parked in `pop_block`
+  when `close()` ran could sleep until the ring was dropped. The
+  flag now lives in `CloseState`, whose `close` is `SeqCst` for every
+  ring by construction.
 - **A cancelled async waiter left its waker registered forever.**
   `push_async`/`pop_async` registered the waker from inside `poll_fn`
   and nothing ever removed it. On a full or empty ring a cancel/retry

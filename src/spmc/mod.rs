@@ -54,6 +54,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
+use crate::common::close_state::CloseState;
 use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -94,11 +95,11 @@ pub struct RingBuffer<T> {
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Set by `Producer::Drop` so that consumers can distinguish
     /// "transiently empty" from "permanently drained" via `is_closed()`.
-    pub(crate) closed: CachePadded<AtomicBool>,
+    pub(crate) closed: CloseState,
     /// Set by the last `Consumer` drop. `Producer::push_block`
     /// observes this and returns `Err(val)` instead of hanging
     /// (no consumer left to drain).
-    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    pub(crate) consumer_closed: CloseState,
     /// Live consumer count; last-drop sets `consumer_closed`.
     pub(crate) consumer_count_live: CachePadded<AtomicUsize>,
     /// Monotonic counter for assigning stable park-slot indices to
@@ -159,8 +160,8 @@ impl<T> RingBuffer<T> {
             done,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
-            closed: CachePadded(AtomicBool::new(false)),
-            consumer_closed: CachePadded(AtomicBool::new(false)),
+            closed: CloseState::new(),
+            consumer_closed: CloseState::new(),
             consumer_count_live: CachePadded(AtomicUsize::new(1)),
             consumer_count: CachePadded(AtomicUsize::new(0)),
             consumer_slots: ParkRegistry::new(),

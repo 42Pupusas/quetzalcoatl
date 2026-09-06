@@ -226,7 +226,7 @@ impl<T, C: Config> Producer<T, C> {
         let park_slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+            if self.queue.consumer_closed.is_closed() {
                 return None;
             }
             // The discarded SlotWriter on `is_some()` restores the
@@ -245,7 +245,7 @@ impl<T, C: Config> Producer<T, C> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
-            if self.queue.consumer_closed.0.load(Ordering::SeqCst) {
+            if self.queue.consumer_closed.is_closed_for_parking() {
                 self.queue.producer_park.disarm(park_slot);
                 return None;
             }
@@ -278,7 +278,7 @@ impl<T, C: Config> Producer<T, C> {
                 Ok(()) => return Ok(()),
                 Err(returned) => val = returned,
             }
-            if q.consumer_closed.0.load(Ordering::Acquire) {
+            if q.consumer_closed.is_closed() {
                 return Err(val);
             }
             // Spin until cas_backoff fully escalates (~tens of μs
@@ -303,9 +303,7 @@ impl<T, C: Config> Producer<T, C> {
                 }
                 Err(returned) => val = returned,
             }
-            // SeqCst: post-arm half of the close handshake, for the
-            // same reason pop_block's closed.load is SeqCst.
-            if q.consumer_closed.0.load(Ordering::SeqCst) {
+            if q.consumer_closed.is_closed_for_parking() {
                 q.producer_park.disarm(slot);
                 return Err(val);
             }
@@ -340,7 +338,7 @@ impl<T, C: Config> Producer<T, C> {
         let mut parked = ParkRegistration::new(&self.queue.producer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
-            if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+            if self.queue.consumer_closed.is_closed() {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
@@ -348,7 +346,7 @@ impl<T, C: Config> Producer<T, C> {
                 Err(returned) => {
                     val = Some(returned);
                     parked.arm(cx);
-                    if self.queue.consumer_closed.0.load(Ordering::Acquire) {
+                    if self.queue.consumer_closed.is_closed() {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {
@@ -376,7 +374,7 @@ impl<T, C: Config> Drop for Producer<T, C> {
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst pairs with consumer's `closed.load(SeqCst)` in
             // pop_block's recheck after fetch_or — see consumer.rs.
-            self.queue.closed.0.store(true, Ordering::SeqCst);
+            self.queue.closed.close();
             // Wake every parked producer and consumer so they can
             // observe `closed` and exit. Cold path, last-drop only.
             self.queue.producer_park.flush();

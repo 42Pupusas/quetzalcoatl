@@ -154,7 +154,7 @@ impl<T> Consumer<T> {
             if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if this.queue.closed.0.load(Ordering::Acquire) {
+            if this.queue.closed.is_closed() {
                 return Poll::Ready(this.pop());
             }
             parker.arm(&this.queue.consumer_waker, cx);
@@ -168,7 +168,7 @@ impl<T> Consumer<T> {
             if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if this.queue.closed.0.load(Ordering::Acquire) {
+            if this.queue.closed.is_closed_for_parking() {
                 return Poll::Ready(this.pop());
             }
             Poll::Pending

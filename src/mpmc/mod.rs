@@ -63,6 +63,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::close_state::CloseState;
 use crate::common::park_registry::ParkRegistry;
 
 /// Upper bound on a parked mpmc waiter's sleep.
@@ -79,7 +80,7 @@ use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Tunable parameters baked into a [`RingBuffer`]'s type. Implement
@@ -178,11 +179,11 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// Set by the last `Consumer` drop. `Producer::push_block`
     /// observes this and returns `Err(val)` instead of hanging
     /// (no consumer left to drain).
-    pub(crate) consumer_closed: CachePadded<AtomicBool>,
+    pub(crate) consumer_closed: CloseState,
     /// Monotonic counter, bumped on each `Consumer::clone`. Used
     /// to stagger new consumers' starting scan offsets.
     pub(crate) clone_counter: CachePadded<AtomicUsize>,
-    pub(crate) closed: CachePadded<AtomicBool>,
+    pub(crate) closed: CloseState,
     /// Producer-side park state. Bit `i` of `producer_park.wake` is
     /// set ↔ a producer in slot `i` is parked waiting for a `done[s]`
     /// release. Consumers wake one parked producer after each release
@@ -285,8 +286,8 @@ impl<T, C: Config> RingBuffer<T, C> {
             producer_count: CachePadded(AtomicUsize::new(1)),
             consumer_count_live: CachePadded(AtomicUsize::new(1)),
             clone_counter: CachePadded(AtomicUsize::new(0)),
-            closed: CachePadded(AtomicBool::new(false)),
-            consumer_closed: CachePadded(AtomicBool::new(false)),
+            closed: CloseState::new(),
+            consumer_closed: CloseState::new(),
             cap,
             mask: capacity.mask,
             producer_park: WakeSet::new(),

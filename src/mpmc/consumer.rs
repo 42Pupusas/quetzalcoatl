@@ -331,7 +331,7 @@ impl<T, C: Config> Consumer<T, C> {
                 return Some(v);
             }
             // Empty AND closed AND really nothing left → done.
-            if q.closed.0.load(Ordering::Acquire) {
+            if q.closed.is_closed() {
                 if let Some(v) = self.pop() {
                     return Some(v);
                 }
@@ -360,13 +360,7 @@ impl<T, C: Config> Consumer<T, C> {
                 q.consumer_park.disarm(slot);
                 return Some(v);
             }
-            // SeqCst on closed.load forces a total order with the last-
-            // producer drop's `closed.store`: same Acquire-Release race
-            // as broadcast — same-address pairing is theoretically
-            // sufficient but x86 TSO under stress permits the recheck
-            // to observe stale `closed=false`, causing an indefinite
-            // park if no further publish follows.
-            if q.closed.0.load(Ordering::SeqCst) {
+            if q.closed.is_closed_for_parking() {
                 q.consumer_park.disarm(slot);
                 return self.pop();
             }
@@ -396,14 +390,14 @@ impl<T, C: Config> Consumer<T, C> {
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
+            if self.queue.closed.is_closed() {
                 return Poll::Ready(self.pop());
             }
             parked.arm(cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
+            if self.queue.closed.is_closed() {
                 return Poll::Ready(self.pop());
             }
             Poll::Pending
@@ -437,7 +431,7 @@ impl<T, C: Config> Consumer<T, C> {
                 backoff = 0;
                 continue;
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
+            if self.queue.closed.is_closed() {
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
@@ -465,7 +459,7 @@ impl<T, C: Config> Consumer<T, C> {
             }
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
-            if self.queue.closed.0.load(Ordering::SeqCst) {
+            if self.queue.closed.is_closed_for_parking() {
                 self.queue.consumer_park.disarm(park_slot);
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
@@ -492,7 +486,7 @@ impl<T, C: Config> Consumer<T, C> {
     /// has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.queue.closed.0.load(Ordering::Acquire)
+        self.queue.closed.is_closed()
     }
 
     /// Diagnostic snapshot: `(next_scan, claim, ready[..], done[..])`.
@@ -524,7 +518,7 @@ impl<T, C: Config> Drop for Consumer<T, C> {
             == 1
         {
             // SeqCst: pairs with each producer's post-arm SeqCst load.
-            self.queue.consumer_closed.0.store(true, Ordering::SeqCst);
+            self.queue.consumer_closed.close();
             self.queue.producer_park.flush();
             #[cfg(feature = "async")]
             self.queue.producer_waker.flush();

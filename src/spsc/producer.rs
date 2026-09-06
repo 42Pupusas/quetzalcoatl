@@ -187,7 +187,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             // Once the consumer drops it sets `consumer_closed = true`;
             // any free space we'd find afterward is permanent and
             // must not be filled.
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return None;
             }
             // Non-mutating gate: avoids constructing-then-dropping a
@@ -212,7 +212,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             // SeqCst: the post-arm re-check is the second half of the
             // close handshake with Consumer::drop.
-            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
+            if self.ring().consumer_closed.is_closed_for_parking() {
                 self.ring()
                     .producer_parked
                     .0
@@ -248,7 +248,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let mut parked = ParkRegistration::new(&self.ring().producer_waker, ParkSlot::SOLE);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
@@ -259,7 +259,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                     // if a pop happened between our failed push and this register,
                     // wake_producer_async was already called and we'd park forever.
                     parked.arm(cx);
-                    if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+                    if self.ring().consumer_closed.is_closed() {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {
@@ -300,7 +300,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.push(val)
     }
     fn consumer_gone(&self) -> bool {
-        self.ring().consumer_closed.0.load(Ordering::Acquire)
+        self.ring().consumer_closed.is_closed()
     }
     fn arm_park(&self) {
         // Publish this thread's handle, then publish "parked". SeqCst
@@ -325,7 +325,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
         // parker OnceLock without ever loading consumer_parked, so the
         // store and the consumer's re-check stay unordered and the
         // consumer can park after we decide not to wake it.
-        self.ring().producer_closed.0.store(true, Ordering::SeqCst);
+        self.ring().producer_closed.close();
         self.ring().wake_consumer();
         #[cfg(feature = "async")]
         self.ring().consumer_waker.flush();

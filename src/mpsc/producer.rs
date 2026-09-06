@@ -154,7 +154,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
-            if q.consumer_closed.0.load(Ordering::Acquire) {
+            if q.consumer_closed.is_closed() {
                 return Err(val);
             }
             match self.push(val) {
@@ -176,7 +176,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.
-            if q.consumer_closed.0.load(Ordering::SeqCst) {
+            if q.consumer_closed.is_closed_for_parking() {
                 q.producer_park.disarm(slot);
                 return Err(val);
             }
@@ -214,7 +214,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let mut parked = ParkRegistration::new(&self.ring().producer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
@@ -222,7 +222,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Err(returned) => {
                     val = Some(returned);
                     parked.arm(cx);
-                    if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+                    if self.ring().consumer_closed.is_closed() {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {
@@ -277,7 +277,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let slot = self.park_slot;
         let mut backoff = 0u32;
         loop {
-            if self.ring().consumer_closed.0.load(Ordering::Acquire) {
+            if self.ring().consumer_closed.is_closed() {
                 return None;
             }
             if let Some(claim) = self.claim_slot() {
@@ -291,7 +291,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             self.ring().producer_park.arm(slot);
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            if self.ring().consumer_closed.0.load(Ordering::SeqCst) {
+            if self.ring().consumer_closed.is_closed_for_parking() {
                 self.ring().producer_park.disarm(slot);
                 return None;
             }
@@ -331,7 +331,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
         if self.ring().producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst: pairs with the consumer's post-arm SeqCst load
             // and with wake_consumer's SeqCst load of consumer_parked.
-            self.ring().closed.0.store(true, Ordering::SeqCst);
+            self.ring().closed.close();
             self.ring().wake_consumer();
             #[cfg(feature = "async")]
             self.ring().consumer_waker.flush();

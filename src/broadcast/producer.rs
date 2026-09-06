@@ -69,12 +69,7 @@ impl<T> Producer<T> {
             // consumers so their pop_async can return None after
             // their backlog drains.
             //
-            // SeqCst pairs with the consumer's `closed.load(SeqCst)`
-            // after register: the consumer's recheck must observe this
-            // store, otherwise a consumer parked between "load closed
-            // false" and "register" would miss both the close signal
-            // and the flush, hanging forever.
-            self.queue.closed.0.store(true, Ordering::SeqCst);
+            self.queue.closed.close();
             self.queue.consumer_waker.flush();
         }
     }
