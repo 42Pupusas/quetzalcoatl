@@ -105,7 +105,8 @@ pub struct WakerSet {
     pub slots: AlignedBuf<WakerSlot>,
     /// Wakers for waiters holding no park slot. An async waiter has no
     /// timeout to rescue itself, so it must be recorded somewhere even
-    /// when every slot is leased.
+    /// when every slot is leased. Lock-free, and an empty one costs a
+    /// single `Relaxed` load on the wake path.
     pub overflow: WakerOverflow,
 }
 
@@ -278,12 +279,12 @@ mod tests {
         assert_eq!(first.count(), 1);
     }
 
-    /// A single future parking and being woken must never touch the
-    /// overflow mutex. `pending` is never cleared, so every later wake
-    /// on this ring reaches `wake_all` -- if that always locks, one
-    /// async waiter puts a mutex on every wake for the ring's lifetime.
+    /// A single future parking and being woken must never reach past
+    /// the overflow's empty fast path. `pending` is never cleared, so
+    /// every later wake on this ring calls into the overflow; only the
+    /// null-head check keeps that free.
     #[test]
-    fn a_slotted_waiter_never_touches_the_overflow_mutex() {
+    fn a_slotted_waiter_never_touches_the_overflow_stack() {
         let set = WakerSet::new();
         let waker = Waker::from(CountingWaker::new());
         let slot = ParkSlot::from_exclusive_index(0);
@@ -293,7 +294,7 @@ mod tests {
             set.wake_all();
         }
 
-        assert_eq!(set.overflow.lock_count(), 0);
+        assert_eq!(set.overflow.take_count(), 0);
     }
 
     /// Two futures sharing one endpoint's slot must both be woken: the

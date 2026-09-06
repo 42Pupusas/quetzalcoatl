@@ -77,14 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout; async waiters, which cannot self-rescue because only a waker
   can poll a future again, go on an overflow list that every wake drains.
   Regression tests cover both the concurrent and the churn case.
-- **The overflow mutex sat on every async wake.** `WakerSet` never
-  clears its `pending` flag, by design, so a ring that has parked one
-  async waiter routes every later wake through `WakerOverflow::wake_all`
-  — which locked unconditionally. One parked waiter was enough to put a
-  mutex acquisition on every wake for the rest of the ring's life,
-  contradicting the claim that the lock stays off these paths. An
-  `occupied` flag checked before the lock restores it: a run that stays
-  under `PARK_SLOTS` endpoints now never acquires the mutex at all.
+- **The waker overflow list no longer uses a lock.** It was introduced
+  as a `Mutex<Vec<Waker>>` — the only lock in the crate — on the
+  argument that it sat off the lock-free paths. It did not: `WakerSet`
+  never clears its `pending` flag, by design, so a ring that had parked
+  a single async waiter routed *every* later wake through
+  `WakerOverflow::wake_all` and took the mutex there. It is now a
+  Treiber stack: a `compare_exchange` to register, one `swap` to take
+  the whole chain, and a `Relaxed` null check that makes the common
+  empty case free. The crate contains no locks again.
 - **Two async operations on one handle stranded one of them.** The async
   methods take `&self`, so safe code can hold two `push_async` futures
   from a single producer (or two `pop_async` futures from a single
