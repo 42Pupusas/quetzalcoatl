@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::slot_release::SlotRelease;
 use super::RingBuffer;
 use crate::common::SlotSnapshot;
 
@@ -348,25 +349,17 @@ impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, 
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
     fn drop(&mut self) {
+        // The release is armed before the value is dropped so that a
+        // panicking `T::drop` still hands this slot back. Leaving the
+        // sequence published and `head` stale would make
+        // `RingBuffer::drop` drop the same value again.
+        //
+        // SAFETY: `seq_ptr` points into the RingBuffer kept alive by the
+        // consumer's reference.
+        let _release = SlotRelease::new(self.consumer.ring(), unsafe { &*self.seq_ptr }, self.head);
         // SAFETY: The value is initialized (seq check verified in pop_ref).
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
-
-        // SAFETY: seq_ptr points into the RingBuffer kept alive by
-        // consumer's reference.
-        let cap = self.consumer.ring().cap;
-        unsafe {
-            (*self.seq_ptr).store((self.head + cap) * 2, Ordering::Release);
-        }
-
-        self.consumer
-            .ring()
-            .head
-            .store(self.head + 1, Ordering::Release);
-
-        self.consumer.ring().producer_park.wake_one();
-        #[cfg(feature = "async")]
-        self.consumer.ring().wake_producer_async();
     }
 }

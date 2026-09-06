@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::slot_release::SlotRelease;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 
@@ -550,18 +551,15 @@ impl<T, C: Config> std::ops::Deref for SlotReader<'_, T, C> {
 impl<T, C: Config> Drop for SlotReader<'_, T, C> {
     fn drop(&mut self) {
         let q = &*self.consumer.queue;
+        // The release is armed before the value is dropped so that a
+        // panicking `T::drop` still hands this slot back. Leaving it
+        // "claimed but not released" would make `RingBuffer::drop` drop
+        // the same value again.
+        let _release = SlotRelease::new(q, self.pos, self.round_pos);
         // SAFETY: we hold the slot exclusively (state == 2 since
         // claim_slot's CAS); the value is initialized.
         unsafe {
             q.data_slot(self.pos).get().cast::<T>().drop_in_place();
         }
-        // SeqCst — see Consumer::pop. The store-buffer drain is
-        // necessary so the upcoming wake_one's wake.load doesn't miss
-        // a parked producer's bit.
-        q.done_slot(self.pos)
-            .store(self.round_pos + q.cap, Ordering::SeqCst);
-        q.producer_park.wake_one();
-        #[cfg(feature = "async")]
-        q.wake_producer_async();
     }
 }

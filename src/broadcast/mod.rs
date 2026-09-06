@@ -42,6 +42,7 @@ pub mod arc;
 mod consumer;
 mod consumer_floor;
 mod producer;
+mod slot_reuse;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
@@ -562,6 +563,57 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// A reservation is outstanding storage: the producer owns
+    /// position `pos` and will write it, but no consumer has read the
+    /// previous occupant of the aliasing slot. A consumer subscribing
+    /// *after* the reservation starts at `tail`, which is already past
+    /// `pos`, so the floor jumps ahead of a slot that is still being
+    /// written. Nothing may reclaim that slot until the reservation
+    /// resolves.
+    #[test]
+    fn late_consumer_does_not_free_an_outstanding_reservation() {
+        let (mut producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+        let mut peer = producer.clone();
+
+        let writer = producer.reserve().expect("first claim fits");
+
+        // Subscribes at tail == 1, ahead of the reservation at 0.
+        let late = consumer.clone();
+        drop(consumer);
+
+        assert!(
+            peer.reserve().is_some(),
+            "position 1 is free and must be claimable"
+        );
+
+        // Position 2 aliases position 0, which is still reserved.
+        assert!(
+            peer.reserve().is_none(),
+            "a slot with an outstanding reservation must not be reclaimed"
+        );
+
+        drop(writer);
+        drop(late);
+    }
+
+    /// The same hazard with no consumers left at all: the reservation
+    /// is still outstanding, so its slot stays off-limits.
+    #[test]
+    fn zero_consumers_does_not_free_an_outstanding_reservation() {
+        let (mut producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+        let mut peer = producer.clone();
+
+        let writer = producer.reserve().expect("first claim fits");
+        drop(consumer);
+
+        assert!(
+            peer.reserve().is_none(),
+            "no consumers must not permit reclaiming a reserved slot"
+        );
+
+        drop(writer);
     }
 
     #[test]
@@ -1206,12 +1258,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "async")]
+    #[cfg_attr(miri, ignore = "too slow for Miri: threads + tokio runtimes")]
     fn async_push_pop_cross_thread() {
         async_push_pop_cross_thread_run(1, 5_000, 8, 60);
     }
 
     #[test]
     #[cfg(feature = "async")]
+    #[ignore = "slow stress: 20k iters x 1k items x 2 consumers, ~40s alone"]
     fn async_push_pop_cross_thread_iters_unsaturated() {
         // Stress: many iterations of (push 1k items, drop producer) with
         // cap >> total so the producer never parks. Catches register/close
@@ -1278,6 +1332,61 @@ mod tests {
         }
         done.store(true, Ordering::Release);
         watchdog.join().unwrap();
+    }
+
+    /// A `Waker` is user code and may panic. `commit` publishes the
+    /// slot and only then wakes, so an unwind out of the wake path must
+    /// not run the guard's rollback — that would drop and tombstone a
+    /// value the consumers can already see.
+    #[test]
+    #[cfg(feature = "async")]
+    fn panicking_waker_during_commit_does_not_drop_published_value() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        struct PanicWaker;
+
+        impl PanicWaker {
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(std::ptr::null(), &Self::VTABLE),
+                |_| panic!("waker failure"),
+                |_| panic!("waker failure"),
+                |_| {},
+            );
+
+            fn waker() -> Waker {
+                // SAFETY: the vtable's functions are consistent with a
+                // stateless waker carrying a null data pointer.
+                unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &Self::VTABLE)) }
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ring = RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4), 4);
+
+        let waker = PanicWaker::waker();
+        ring.consumer_waker
+            .register(0, &Context::from_waker(&waker));
+
+        let (mut producer, mut consumer) = ring.split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let w = producer.reserve().unwrap();
+            w.write(crate::common::DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .commit();
+        }));
+        assert!(result.is_err(), "the waker panic must propagate");
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the committed value must survive the wake-path unwind"
+        );
+        assert!(
+            consumer.pop().is_some(),
+            "the committed value must still reach the consumer"
+        );
     }
 
     #[test]

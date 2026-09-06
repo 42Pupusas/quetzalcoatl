@@ -340,14 +340,19 @@ unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to consumers.
+    ///
+    /// Once `tail` is published a consumer owns the value, so the guard
+    /// is disarmed first: a panic in the wake path (a custom waker may
+    /// panic) must not let `Drop` drop a value a consumer can already
+    /// see.
     #[inline]
     pub fn commit(mut self) {
+        self.committed = true;
         self.write_pos.set(self.pos + 1);
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
-        self.committed = true;
     }
 }
 

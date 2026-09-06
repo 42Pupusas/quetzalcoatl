@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer alive or handle the `Err`.
 
 ### Fixed
+- **A broadcast slot with an outstanding reservation can no longer be
+  reclaimed by a peer producer.** `reserve` claims a position and only
+  `commit` or the guard's `Drop` resolves it, but reuse was gated solely
+  on the consumer floor — consumer progress. A consumer subscribing
+  *after* a reservation starts at `tail`, already past the reserved
+  position, so the floor legitimately sat ahead of a slot still being
+  written and a peer producer could claim the aliasing position. Two
+  producers then held the same storage. `claim_slot` now also checks
+  that the prior occupant of the target slot has resolved, so producer
+  ownership is tracked independently of consumer heads. The
+  no-consumers case was already safe; the regression test covers both.
 - **`cargo +nightly miri test` now passes clean.** The README instructs
   users to run exactly that command, but it aborted with four
   leak-checker errors. Two SPSC tests exercising the raw-pointer seam

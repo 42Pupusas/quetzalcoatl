@@ -436,10 +436,15 @@ unsafe impl<T: Send> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to the consumer.
+    ///
+    /// Once the sequence is published the consumer owns the value, so
+    /// the guard is disarmed first: a panic in the wake path (a custom
+    /// waker may panic) must not let `Drop` drop a value the consumer
+    /// can already see.
     #[inline]
     pub fn commit(mut self) {
-        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.committed = true;
+        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();

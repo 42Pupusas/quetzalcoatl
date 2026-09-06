@@ -1284,6 +1284,57 @@ mod tests {
         assert_eq!(c.drain(|_| {}), 0);
     }
 
+    /// A `T` whose destructor panics must still release its slot. The
+    /// `SlotReader` drops the value before storing `done`, so an unwind
+    /// in between leaves the slot marked unconsumed and
+    /// `RingBuffer::drop` drops the same value again.
+    #[test]
+    fn slot_reader_panicking_drop_does_not_double_drop() {
+        struct PanicOnDrop {
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: true,
+            })
+            .is_ok());
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: false,
+            })
+            .is_ok());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = consumer.pop_ref().unwrap();
+            drop(r);
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each item must be dropped exactly once"
+        );
+    }
+
     #[test]
     fn drain_collects_all_items() {
         let (p, c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
@@ -1376,6 +1427,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "async")]
+    #[cfg_attr(miri, ignore = "too slow for Miri: threads + tokio runtimes")]
     fn async_push_pop_cross_thread() {
         // One producer + N consumers, each on its own thread with a
         // current_thread runtime + LocalSet. Watchdog aborts within 5s

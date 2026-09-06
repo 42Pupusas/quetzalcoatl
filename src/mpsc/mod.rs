@@ -27,6 +27,7 @@
 
 mod consumer;
 mod producer;
+mod slot_release;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
@@ -928,6 +929,132 @@ mod tests {
         assert_eq!(items, vec![1, 3]);
     }
 
+    /// A panicking `drain` callback must not lose track of the items
+    /// already taken. The values are moved out of their slots one at a
+    /// time, but `head` is published only after the whole batch; if the
+    /// unwind skips that publication, `Consumer::drop` drains from the
+    /// stale cursor and drops the same values a second time.
+    #[test]
+    fn drain_callback_panic_does_not_double_drop() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) =
+            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+        for _ in 0..4 {
+            producer
+                .push(crate::common::DropCounter {
+                    counter: std::sync::Arc::clone(&counter),
+                })
+                .unwrap();
+        }
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_in = std::sync::Arc::clone(&seen);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain(|item| {
+                drop(item);
+                assert!(
+                    seen_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1,
+                    "callback failure"
+                );
+            });
+        }));
+        assert!(result.is_err(), "the panic must propagate to the caller");
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "each item must be dropped exactly once"
+        );
+    }
+
+    /// Same hazard reached through `drain_up_to`.
+    #[test]
+    fn drain_up_to_callback_panic_does_not_double_drop() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) =
+            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+        for _ in 0..4 {
+            producer
+                .push(crate::common::DropCounter {
+                    counter: std::sync::Arc::clone(&counter),
+                })
+                .unwrap();
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain_up_to(3, |item| {
+                drop(item);
+                panic!("callback failure");
+            });
+        }));
+        assert!(result.is_err());
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "each item must be dropped exactly once"
+        );
+    }
+
+    /// A `T` whose destructor panics must still release its slot. The
+    /// `SlotReader` drops the value before publishing the sequence and
+    /// `head`, so an unwind in between leaves a destroyed value marked
+    /// readable.
+    #[test]
+    fn slot_reader_panicking_drop_does_not_double_drop() {
+        struct PanicOnDrop {
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: true,
+            })
+            .is_ok());
+        assert!(producer
+            .push(PanicOnDrop {
+                counter: std::sync::Arc::clone(&counter),
+                panics: false,
+            })
+            .is_ok());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = consumer.pop_ref().unwrap();
+            drop(r);
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        drop(consumer);
+        drop(producer);
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each item must be dropped exactly once"
+        );
+    }
+
     #[test]
     #[ignore = "too slow for Miri"]
     fn concurrent_drain() {
@@ -1571,6 +1698,66 @@ mod tests {
         ch.join().unwrap();
         done.store(true, Ordering::Release);
         watchdog.join().unwrap();
+    }
+
+    /// A `Waker` is user code and may panic. `commit` publishes the
+    /// slot and only then wakes, so an unwind out of the wake path must
+    /// not run the guard's rollback — that would drop a value the
+    /// consumer already owns.
+    #[test]
+    #[cfg(feature = "async")]
+    fn panicking_waker_during_commit_does_not_drop_published_value() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        struct PanicWaker;
+
+        impl PanicWaker {
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(std::ptr::null(), &Self::VTABLE),
+                |_| panic!("waker failure"),
+                |_| panic!("waker failure"),
+                |_| {},
+            );
+
+            fn waker() -> Waker {
+                // SAFETY: the vtable's functions are consistent with a
+                // stateless waker carrying a null data pointer.
+                unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &Self::VTABLE)) }
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ring = RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4));
+
+        let waker = PanicWaker::waker();
+        ring.consumer_waker
+            .register(0, &Context::from_waker(&waker));
+
+        let (mut producer, mut consumer) = ring.split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let w = producer.reserve().unwrap();
+            w.write(crate::common::DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .commit();
+        }));
+        assert!(result.is_err(), "the waker panic must propagate");
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the committed value must survive the wake-path unwind"
+        );
+        assert!(
+            consumer.pop().is_some(),
+            "the committed value must still reach the consumer"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the value is dropped exactly once, by its consumer"
+        );
     }
 
     #[test]

@@ -1289,6 +1289,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "async")]
+    #[cfg_attr(miri, ignore = "too slow for Miri: threads + tokio runtimes")]
     fn async_push_pop_cross_thread() {
         // Producer and consumer on separate threads. The watchdog thread
         // aborts the process if either side hangs longer than 5s, so the

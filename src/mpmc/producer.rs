@@ -530,15 +530,20 @@ unsafe impl<T: Send, C: Config> Send for WrittenSlot<'_, T, C> {}
 
 impl<T, C: Config> WrittenSlot<'_, T, C> {
     /// Commits the write, making the slot visible to consumers.
+    ///
+    /// Once `ready` is published a consumer owns the value, so the guard
+    /// is disarmed first: a panic in the wake path (a custom waker may
+    /// panic) must not let `Drop` drop a value a consumer can already
+    /// see, nor hand the position back to the batch.
     #[inline]
     pub fn commit(mut self) {
+        self.committed = true;
         let q = &*self.producer.queue;
         // SeqCst — see Producer::push.
         q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
         q.consumer_park.wake_one();
         #[cfg(feature = "async")]
         q.wake_consumer_async();
-        self.committed = true;
     }
 }
 

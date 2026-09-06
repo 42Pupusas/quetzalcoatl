@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::consumer_floor::ConsumerFloor;
+use super::slot_reuse::SlotReuse;
 use super::RingBuffer;
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 use crate::common::TOMBSTONE;
@@ -82,9 +83,17 @@ impl<T> Producer<T> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let mut backoff = 0u32;
+        let reuse = SlotReuse::new(self.queue.cap);
         let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
         let pos = loop {
             if !self.permits_with_refresh(current_tail) {
+                return None;
+            }
+            // The consumer floor speaks for consumer progress only. A
+            // peer's outstanding reservation on the aliasing slot is
+            // producer-owned storage that no consumer head can release.
+            if !reuse.prior_occupant_resolved(current_tail, &self.queue.slot(current_tail).sequence)
+            {
                 return None;
             }
             match self.queue.tail.compare_exchange_weak(
@@ -492,13 +501,18 @@ unsafe impl<T: Send + Sync> Send for WrittenSlot<'_, T> {}
 
 impl<T> WrittenSlot<'_, T> {
     /// Commits the write, making the slot visible to all consumers.
+    ///
+    /// Once the sequence is published the consumers can read the value,
+    /// so the guard is disarmed first: a panic in the wake path (a
+    /// custom waker may panic) must not let `Drop` drop a value the
+    /// consumers can already see.
     #[inline]
     pub fn commit(mut self) {
+        self.committed = true;
         self.slot_sequence
             .store(self.pos * 2 + 1, Ordering::Release);
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
-        self.committed = true;
     }
 }
 
