@@ -49,6 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented contract was never the implemented one.
 
 ### Fixed
+- **A cancelled async waiter left its waker registered forever.**
+  `push_async`/`pop_async` registered the waker from inside `poll_fn`
+  and nothing ever removed it. On a full or empty ring a cancel/retry
+  loop (a timeout, `select!`, a dropped task) left one live `Waker`
+  behind per iteration: each new future's registration displaced the
+  dead one into the overflow list, which no wake drained because the
+  peer was gone. A thousand cancelled pushes on an idle ring left a
+  thousand live wakers. The registration is now owned by the future —
+  `ParkRegistration` for endpoints shared by several futures,
+  `ParkedFuture` for the exclusive `&mut` consumers — and is withdrawn
+  on drop, whether that drop is cancellation or completion. The
+  displaced-waker rule is preserved: a peer's waker found in the slot
+  at withdraw time moves to the overflow list, never dropped.
 - **A waiter that moved threads was never woken.** Park handles lived in
   a `OnceLock<Thread>`, so the first thread to park on an endpoint owned
   that entry for the endpoint's life. Every endpoint is `Send`, so a

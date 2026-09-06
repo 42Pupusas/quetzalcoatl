@@ -6,7 +6,13 @@ use std::task::Poll;
 
 use super::RingBuffer;
 #[cfg(feature = "async")]
+#[cfg(feature = "async")]
+#[cfg(feature = "async")]
+use crate::common::park_registration::{ParkSite, ParkedFuture};
+#[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
+#[cfg(feature = "async")]
+use crate::common::wake_async::WakerSet;
 use crate::common::SlotSnapshot;
 
 /// The consumer side of a broadcast ring buffer.
@@ -144,14 +150,14 @@ impl<T> Consumer<T> {
         T: Clone,
     {
         let slot = ParkSlot::from_exclusive_index(self.slot_index);
-        std::future::poll_fn(move |cx| {
-            if let Some(v) = self.pop() {
+        ParkedFuture::new(self, slot, |this, parker, cx| {
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
-            self.queue.consumer_waker.register(slot, cx);
+            parker.arm(&this.queue.consumer_waker, cx);
             // SeqCst fence after register: pairs with the producer drop's
             // SeqCst store of `closed`, ensuring our re-check observes any
             // close that happened after our pre-register load. Without
@@ -159,11 +165,11 @@ impl<T> Consumer<T> {
             // close is invisible across our register, the flush has
             // already passed our slot, and we park forever.
             std::sync::atomic::fence(Ordering::SeqCst);
-            if let Some(v) = self.pop() {
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.queue.closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.queue.closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
             Poll::Pending
         })
@@ -232,6 +238,13 @@ impl<T> Consumer<T> {
 
 /// A zero-copy read reference to an item in the broadcast ring buffer.
 ///
+#[cfg(feature = "async")]
+impl<T> ParkSite for Consumer<T> {
+    fn park_set(&mut self) -> &WakerSet {
+        &self.queue.consumer_waker
+    }
+}
+
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without cloning.
 ///

@@ -1,6 +1,8 @@
 pub mod park;
 #[cfg(test)]
 pub mod park_probe;
+#[cfg(feature = "async")]
+pub mod park_registration;
 pub mod park_registry;
 pub mod thread_parker;
 #[cfg(feature = "async")]

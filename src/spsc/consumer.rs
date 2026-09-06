@@ -6,7 +6,11 @@ use std::sync::Arc;
 use super::head_publisher::HeadPublisher;
 use super::RingBuffer;
 #[cfg(feature = "async")]
+use crate::common::park_registration::{ParkSite, ParkedFuture};
+#[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
+#[cfg(feature = "async")]
+use crate::common::wake_async::WakerSet;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
@@ -178,20 +182,20 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// consume any item.
     #[cfg(feature = "async")]
     pub fn pop_async(&mut self) -> impl std::future::Future<Output = Option<T>> + '_ {
-        std::future::poll_fn(move |cx| {
-            if let Some(v) = self.pop() {
+        ParkedFuture::new(self, ParkSlot::SOLE, |this, parker, cx| {
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.ring().producer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
             // Register waker then re-check to close the lost-wake race.
-            self.ring().consumer_waker.register(ParkSlot::SOLE, cx);
-            if let Some(v) = self.pop() {
+            parker.arm(&this.ring().consumer_waker, cx);
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().producer_closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.ring().producer_closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
             Poll::Pending
         })
@@ -353,6 +357,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without copying.
 ///
+#[cfg(feature = "async")]
+impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
+    fn park_set(&mut self) -> &WakerSet {
+        &self.queue.consumer_waker
+    }
+}
+
 /// When dropped, drops the `T` value and advances the head pointer.
 pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     data_ptr: *const MaybeUninit<T>,

@@ -9,7 +9,13 @@ use super::batch_release::BatchRelease;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
 #[cfg(feature = "async")]
+#[cfg(feature = "async")]
+#[cfg(feature = "async")]
+use crate::common::park_registration::{ParkSite, ParkedFuture};
+#[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
+#[cfg(feature = "async")]
+use crate::common::wake_async::WakerSet;
 use crate::common::SlotSnapshot;
 
 /// The consumer side of an MPSC ring buffer.
@@ -241,19 +247,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     #[cfg(feature = "async")]
     pub fn pop_async(&mut self) -> impl std::future::Future<Output = Option<T>> + '_ {
-        std::future::poll_fn(move |cx| {
-            if let Some(v) = self.pop() {
+        ParkedFuture::new(self, ParkSlot::SOLE, |this, parker, cx| {
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.ring().closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
-            self.ring().consumer_waker.register(ParkSlot::SOLE, cx);
-            if let Some(v) = self.pop() {
+            parker.arm(&this.ring().consumer_waker, cx);
+            if let Some(v) = this.pop() {
                 return Poll::Ready(Some(v));
             }
-            if self.ring().closed.0.load(Ordering::Acquire) {
-                return Poll::Ready(self.pop());
+            if this.ring().closed.0.load(Ordering::Acquire) {
+                return Poll::Ready(this.pop());
             }
             Poll::Pending
         })
@@ -356,6 +362,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
 
 /// A zero-copy read reference to an item in the ring buffer.
 ///
+#[cfg(feature = "async")]
+impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
+    fn park_set(&mut self) -> &WakerSet {
+        &self.queue.consumer_waker
+    }
+}
+
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without copying.
 ///

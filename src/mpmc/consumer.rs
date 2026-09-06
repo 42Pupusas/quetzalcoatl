@@ -8,6 +8,8 @@ use super::slot_release::SlotRelease;
 use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
 
 /// Cloneable consumer for an MPMC ring.
@@ -389,7 +391,7 @@ impl<T, C: Config> Consumer<T, C> {
     #[cfg(feature = "async")]
     #[allow(clippy::future_not_send)]
     pub fn pop_async(&self) -> impl std::future::Future<Output = Option<T>> + '_ {
-        let slot = self.park_slot;
+        let mut parked = ParkRegistration::new(&self.queue.consumer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
@@ -397,7 +399,7 @@ impl<T, C: Config> Consumer<T, C> {
             if self.queue.closed.0.load(Ordering::Acquire) {
                 return Poll::Ready(self.pop());
             }
-            self.queue.consumer_waker.register(slot, cx);
+            parked.arm(cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }

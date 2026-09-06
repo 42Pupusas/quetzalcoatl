@@ -9,6 +9,8 @@ use super::slot_reuse::SlotReuse;
 use super::slot_state::SlotState;
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
 
 /// The producer side of a broadcast ring buffer.
@@ -338,6 +340,11 @@ impl<T> Producer<T> {
     #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
     pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
         let mut val = Some(val);
+        // Register on this producer's own leased slot. A tail-derived
+        // index moved between polls, so one producer scattered
+        // registrations across slots it did not own -- displacing
+        // peers' wakers and leaving stale entries behind.
+        let mut parked = ParkRegistration::new(&self.queue.producer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
             // No active consumers means a push would just sit until
@@ -350,12 +357,7 @@ impl<T> Producer<T> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    // Register on this producer's own leased slot. A
-                    // tail-derived index moved between polls, so one
-                    // producer scattered registrations across slots it
-                    // did not own -- displacing peers' wakers and
-                    // leaving stale entries behind.
-                    self.queue.producer_waker.register(self.park_slot, cx);
+                    parked.arm(cx);
                     if !any_consumer_active(&self.queue) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }

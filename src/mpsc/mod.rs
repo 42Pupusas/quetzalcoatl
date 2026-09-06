@@ -2024,6 +2024,56 @@ mod tests {
         h.join().unwrap();
     }
 
+    /// A `push_async` that is cancelled must not leave its
+    /// registration behind. This is the timeout-loop pattern reduced
+    /// to its essentials: park the future once, then drop it, with no
+    /// consumer to drain what the park registered.
+    ///
+    /// The producer here is slotless, which is the case that
+    /// accumulates without bound — a leased slot holds one waker and
+    /// overwrites it, while the overflow keeps every registration
+    /// until something drains it.
+    #[test]
+    #[cfg(feature = "async")]
+    fn cancelled_pushes_do_not_accumulate_registrations() {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Noop;
+        // `Waker::noop()` would not do here: every noop waker is
+        // `will_wake`-identical to every other, which would collapse the
+        // distinct tasks this test needs.
+        #[allow(clippy::manual_noop_waker)]
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let ring = RingBuffer::<u64>::new(Capacity::exact(2));
+        let (producer, _consumer) = ring.split();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+
+        for _ in 0..1_000 {
+            // A fresh waker each round: distinct tasks poll distinct
+            // futures, so a shared slot displaces rather than matching
+            // `will_wake`.
+            let waker = Waker::from(Arc::new(Noop));
+            let mut cx = Context::from_waker(&waker);
+            let mut future = Box::pin(producer.push_async(99));
+            assert!(
+                matches!(future.as_mut().poll(&mut cx), Poll::Pending),
+                "the ring must stay full"
+            );
+        }
+
+        let depth = producer.overflow_depth();
+        assert!(
+            depth <= 1,
+            "1000 cancelled pushes left {depth} registrations behind"
+        );
+    }
+
     /// Two `push_async` futures from *one* producer handle, driven by
     /// separate tasks with separate wakers. `push_async` takes `&self`,
     /// so this is reachable from safe code, and both futures park on

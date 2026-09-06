@@ -8,6 +8,8 @@ use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
 
 /// The consumer side of an SPMC ring buffer.
@@ -295,7 +297,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[cfg(feature = "async")]
     #[allow(clippy::future_not_send)]
     pub fn pop_async(&self) -> impl std::future::Future<Output = Option<T>> + '_ {
-        let slot = self.park_slot;
+        let mut parked = ParkRegistration::new(&self.ring().consumer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
@@ -303,7 +305,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             if self.ring().closed.0.load(Ordering::Acquire) {
                 return Poll::Ready(self.pop());
             }
-            self.ring().consumer_waker.register(slot, cx);
+            parked.arm(cx);
             if let Some(v) = self.pop() {
                 return Poll::Ready(Some(v));
             }

@@ -7,6 +7,8 @@ use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
 use crate::common::TOMBSTONE;
 
@@ -80,6 +82,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn ring(&self) -> &RingBuffer<T> {
         &self.queue
+    }
+
+    /// How many wakers the producer-side overflow currently holds.
+    #[cfg(all(test, feature = "async"))]
+    pub(crate) fn overflow_depth(&self) -> usize {
+        self.ring().producer_waker.overflow.depth()
     }
 
     #[inline]
@@ -191,7 +199,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// if the consumer has been dropped.
     ///
     /// The future is cancel-safe: dropping it before completion leaves
-    /// the ring unchanged (the value is moved back out on cancellation).
+    /// the ring unchanged (the value is moved back out on
+    /// cancellation) and withdraws its park registration, so a
+    /// cancel/retry loop does not accumulate dead wakers.
     ///
     /// Each producer clone has its own park slot so multiple async
     /// producers can wait concurrently without contending on a single
@@ -201,7 +211,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
     pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
         let mut val = Some(val);
-        let slot = self.park_slot;
+        let mut parked = ParkRegistration::new(&self.ring().producer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
             if self.ring().consumer_closed.0.load(Ordering::Acquire) {
@@ -211,7 +221,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    self.ring().producer_waker.register(slot, cx);
+                    parked.arm(cx);
                     if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }

@@ -56,6 +56,33 @@ impl WakerSlot {
         Some(*prev)
     }
 
+    /// Takes the stored waker out when it is not `waker`, returning it.
+    ///
+    /// Used by a cancelled waiter to withdraw its own registration. The
+    /// slot is emptied either way; the return value is a peer's waker
+    /// that displaced this one and is still parked, which the caller
+    /// must keep reachable.
+    ///
+    /// The comparison is [`Waker::will_wake`], so it identifies the
+    /// *task*, not the guard. Two guards on one slot with the same
+    /// waker cannot be told apart — but they would wake the same task,
+    /// so clearing either is equivalent.
+    #[inline]
+    #[must_use]
+    pub fn clear_if(&self, waker: &Waker) -> Option<Waker> {
+        let claimed = self.waker.swap(ptr::null_mut(), Ordering::AcqRel);
+        if claimed.is_null() {
+            return None;
+        }
+        // SAFETY: the swap removed `claimed` from the slot, so this
+        // thread is its sole owner and no peer can observe it again.
+        let claimed = unsafe { Box::from_raw(claimed) };
+        if claimed.will_wake(waker) {
+            return None;
+        }
+        Some(*claimed)
+    }
+
     /// Wakes the registered waker. Returns `true` only when this call
     /// claimed the waker and fired it.
     #[inline]
@@ -263,7 +290,16 @@ mod tests {
         let slot = WakerSlot::new();
         let waker = Waker::from(CountingWaker::new());
         assert!(slot.store(&waker).is_none());
+        // Under Miri this is `Some`: `will_wake` compares data and vtable
+        // pointers, and std relies on LLVM const-deduplication to give
+        // `Waker::from(Arc)` and its `clone` the same vtable. Without
+        // codegen the vtables are distinct allocations. `Some` only
+        // routes the clone into the overflow list -- the wake still
+        // happens, so the peer-safety contract holds either way.
+        #[cfg(not(miri))]
         assert!(slot.store(&waker).is_none());
+        #[cfg(miri)]
+        drop(slot.store(&waker));
     }
 
     #[test]
@@ -295,6 +331,24 @@ mod tests {
         }
 
         assert_eq!(set.overflow.take_count(), 0);
+    }
+
+    /// A cancelled future leaves its registration behind. Each
+    /// cancellation from a slotless waiter pushes another entry that
+    /// nothing removes until the next wake, so the stack grows with
+    /// the number of cancellations rather than the number of waiters.
+    #[test]
+    fn cancelled_registrations_accumulate_on_the_overflow() {
+        let set = WakerSet::new();
+        let waker = Waker::from(CountingWaker::new());
+
+        for _ in 0..1_000 {
+            set.register(ParkSlot::Shared, &Context::from_waker(&waker));
+        }
+
+        assert_eq!(set.overflow.depth(), 1_000);
+        set.wake_all();
+        assert_eq!(set.overflow.depth(), 0);
     }
 
     /// Two futures sharing one endpoint's slot must both be woken: the

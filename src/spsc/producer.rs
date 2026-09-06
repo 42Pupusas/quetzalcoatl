@@ -7,6 +7,9 @@ use std::sync::Arc;
 use super::RingBuffer;
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
 #[cfg(feature = "async")]
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
+#[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
 #[cfg(feature = "async")]
 use std::task::Poll;
@@ -242,6 +245,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
     pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
         let mut val = Some(val);
+        let mut parked = ParkRegistration::new(&self.ring().producer_waker, ParkSlot::SOLE);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
             if self.ring().consumer_closed.0.load(Ordering::Acquire) {
@@ -254,7 +258,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                     // Register waker, then re-check to close the lost-wake race:
                     // if a pop happened between our failed push and this register,
                     // wake_producer_async was already called and we'd park forever.
-                    self.ring().producer_waker.register(ParkSlot::SOLE, cx);
+                    parked.arm(cx);
                     if self.ring().consumer_closed.0.load(Ordering::Acquire) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }

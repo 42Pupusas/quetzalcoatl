@@ -7,6 +7,8 @@ use std::task::Poll;
 use super::batch_abandon::BatchAbandon;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::BACKOFF_PARK_THRESHOLD;
+#[cfg(feature = "async")]
+use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
 
 /// Tight-spin iterations on the primary slot's `done` before
@@ -335,7 +337,7 @@ impl<T, C: Config> Producer<T, C> {
     #[allow(clippy::missing_panics_doc, clippy::future_not_send)]
     pub fn push_async(&self, val: T) -> impl std::future::Future<Output = Result<(), T>> + '_ {
         let mut val = Some(val);
-        let slot = self.park_slot;
+        let mut parked = ParkRegistration::new(&self.queue.producer_waker, self.park_slot);
         std::future::poll_fn(move |cx| {
             let v = val.take().expect("polled after completion");
             if self.queue.consumer_closed.0.load(Ordering::Acquire) {
@@ -345,7 +347,7 @@ impl<T, C: Config> Producer<T, C> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(returned) => {
                     val = Some(returned);
-                    self.queue.producer_waker.register(slot, cx);
+                    parked.arm(cx);
                     if self.queue.consumer_closed.0.load(Ordering::Acquire) {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
