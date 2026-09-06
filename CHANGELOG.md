@@ -41,8 +41,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and write the same slot — a data race, confirmed under Miri. Code that
   relied on pushing into a subscriber-less broadcast must now keep a
   consumer alive or handle the `Err`.
+- **`RingBuffer::close` (SPSC, MPSC) documents what it actually does.**
+  It claimed subsequent pushes are silently dropped; they succeed, and
+  no push path ever consulted the flag. The method signals the consumer
+  side. Callers who need pushes to fail should drop the consumer, which
+  `push_block` reports through `Err`. Behaviour is unchanged — the
+  documented contract was never the implemented one.
 
 ### Fixed
+- **A broadcast consumer could loop forever on an abandoned
+  reservation.** The tombstone was a single `usize::MAX` sentinel that
+  named no position, but a broadcast consumer never clears a marker —
+  every other consumer still has to see the same slot. Every later
+  position aliasing that slot therefore also read as abandoned: at
+  `cap == 1`, a consumer advanced past the same marker indefinitely
+  instead of reporting an empty ring. The sequence word now encodes
+  vacant / published(pos) / abandoned(pos), so a marker matches only the
+  position it names. Abandoning a reservation also wakes consumers and
+  producers: it releases the position for both, and a consumer parked on
+  it was waiting for a publication that would never arrive.
+- **A tombstone-only MPSC drain stranded ring capacity.** `drain` and
+  `drain_up_to` advanced a local cursor across abandoned positions but
+  published `head` only when a value came out, so a batch that found
+  only tombstones cleared the slot metadata while leaving `head` on the
+  tombstone. The space was never handed back and producers saw a ring
+  that stayed full. Released positions are now counted separately from
+  delivered values, and publication happens in a guard's destructor,
+  which covers the unwind path as well. `pop` and `pop_ref` also wake a
+  producer when they skip a tombstone, which they previously did not.
+- **Blocking zero-copy reads could return `None` on an open channel.**
+  `pop_ref_block` tested an observation and then returned whatever the
+  claim produced, but an observation is not ownership: in MPSC the
+  position could hold an abandoned reservation, and in SPMC/MPMC a peer
+  consumer could take it first. Either turned into `None` from a
+  blocking read while producers were live and publishing. The
+  single-consumer gate now resolves tombstones itself so the claim after
+  it cannot fail, and the multi-consumer paths treat a lost claim as
+  contention and retry.
+- **Dropping an MPMC producer could hang forever.** Handing back an
+  unused batch position requires its previous round to be released, and
+  only a consumer does that. The wait was unconditional, so with the
+  consumers gone the destructor never returned — during cancellation or
+  unwinding, exactly when the peers are disappearing. The wait now stops
+  when the consumers close, leaving the slot in its previous round's
+  state for `RingBuffer::drop` to reclaim.
+- **An SPMC ring split with `split_borrowed` never closed.** The live
+  consumer count was seeded at one and the split incremented it again
+  while handing out a single consumer, so dropping that consumer left
+  the tally at one: `consumer_closed` was never set and a producer
+  blocked in `push_block` waited for a consumer that no longer existed.
+- **An SPSC value pushed after the consumer left was leaked.** The
+  consumer drains on drop, but the producer outlives it, and the ring
+  had no cleanup of its own — the storage was freed with the value still
+  in it. `RingBuffer::drop` now reclaims whatever remains between the
+  cursors.
 - **A broadcast slot with an outstanding reservation can no longer be
   reclaimed by a peer producer.** `reserve` claims a position and only
   `commit` or the guard's `Drop` resolves it, but reuse was gated solely
