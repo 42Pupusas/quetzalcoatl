@@ -246,6 +246,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishing it. Capacity is no longer permanently consumed by a
   forgotten reservation.
 
+### Added
+- **Exhaustive-schedule models for the async wake machinery**, run
+  under `RUSTFLAGS="--cfg loom" cargo test --lib --features async --
+  release -- common::loom_models`. Where the release stress suite
+  samples one platform's scheduler at scale and Miri checks one
+  schedule for UB, `loom` enumerates every interleaving the C11
+  memory model permits and asserts the wake-path invariants under all
+  of them: a withdrawal never drops a peer's waker the wake is about
+  to claim, a wake and a withdrawal claim a waker at most once, racing
+  registrations and wakes deliver exactly one wake per waiter, and
+  concurrent `ParkRegistry` leases never alias a slot. Four leaf
+  primitives are covered — `WakerSet`/`WakerSlot`, `WakerOverflow`,
+  `ParkRegistry`, and the `ExclusiveRegistration` withdraw path. The
+  park/blocking machinery (which calls `std::thread::park`, unmocked
+  by loom) and the ring slot machinery (far too large to enumerate)
+  stay outside the model's reach; the stress suite covers those.
+  Atomic types route through the new `common::atomics` aliases, which
+  switch on the `cfg(loom)` flag cargo derives from the new
+  `[target.'cfg(loom)'.dependencies]` entry — no cargo feature, no
+  loom code compiled or fetched in default builds. The three leaf
+  constructors keep `const` under std (loom's atomics are not
+  const-constructible) and `WakerSlot`/`WakerOverflow`'s drop paths
+  take their stored pointer with a `swap`, which is equivalent under
+  `&mut self` and shared across both worlds.
+
 ## [0.14.0] - 2026-08-14
 
 ### Fixed

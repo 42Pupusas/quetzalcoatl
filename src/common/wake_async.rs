@@ -1,6 +1,8 @@
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::Waker;
+
+use super::atomics::{fence, AtomicBool, AtomicPtr};
 
 use super::park::PARK_SLOTS;
 use super::park_registry::ParkSlot;
@@ -26,7 +28,19 @@ pub struct WakerSlot {
 }
 
 impl WakerSlot {
+    // Loom's `AtomicPtr::new` is not const, so the loom twin of this
+    // constructor takes the weaker form. Std callers keep const use.
+    #[cfg(not(loom))]
+    #[must_use]
     pub const fn new() -> Self {
+        Self {
+            waker: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    #[cfg(loom)]
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             waker: AtomicPtr::new(ptr::null_mut()),
         }
@@ -110,10 +124,14 @@ impl Default for WakerSlot {
 
 impl Drop for WakerSlot {
     fn drop(&mut self) {
-        let stored = *self.waker.get_mut();
+        // `&mut self` proves no peer holds a reference, so a plain swap
+        // takes the pointer with the same uniqueness the old `get_mut`
+        // path had (and is the shared form: loom's `AtomicPtr` exposes
+        // no `get_mut`).
+        let stored = self.waker.swap(ptr::null_mut(), Ordering::Relaxed);
         if !stored.is_null() {
-            // SAFETY: `&mut self` proves no peer holds a reference, and
-            // the pointer was last published by `store`.
+            // SAFETY: the swap removed `stored` from the slot, so this
+            // thread is its sole owner and no peer can observe it again.
             drop(unsafe { Box::from_raw(stored) });
         }
     }
@@ -178,7 +196,7 @@ impl WakerSet {
             None => self.overflow.register(cx.waker()),
         }
         self.pending.store(true, Ordering::Release);
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
     }
 
     /// Wakes every registered waker. No-op if `pending` is false.
@@ -211,7 +229,7 @@ impl WakerSet {
         // issued a Release store on the ring (`ready`/`done`) then
         // called us; without this fence a peer that just registered and
         // re-checked could be missed. See `park::WakeSet::wake_one`.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         for slot in &*self.slots {
             slot.wake();
         }
@@ -235,7 +253,7 @@ impl WakerSet {
 
     /// Wakes every registered waker. Used at close time.
     pub fn flush(&self) {
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         for slot in &*self.slots {
             slot.wake();
         }

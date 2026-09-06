@@ -42,8 +42,10 @@
 //! the stack, so entries do not accumulate across wakes.
 
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::task::Waker;
+
+use super::atomics::AtomicPtr;
+use std::sync::atomic::Ordering;
 
 /// One registration, owned by the stack until a drainer takes it.
 struct Node {
@@ -59,16 +61,29 @@ struct Node {
 pub struct WakerOverflow {
     head: AtomicPtr<Node>,
     #[cfg(test)]
-    takes: std::sync::atomic::AtomicUsize,
+    takes: super::atomics::AtomicUsize,
 }
 
 impl WakerOverflow {
+    // Loom's `AtomicPtr::new` is not const, so the loom twin of this
+    // constructor takes the weaker form. Std callers keep const use.
+    #[cfg(not(loom))]
     #[must_use]
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
             #[cfg(test)]
-            takes: std::sync::atomic::AtomicUsize::new(0),
+            takes: super::atomics::AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(loom)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(ptr::null_mut()),
+            #[cfg(test)]
+            takes: super::atomics::AtomicUsize::new(0),
         }
     }
 
@@ -138,6 +153,20 @@ impl WakerOverflow {
         self.takes.load(Ordering::Relaxed)
     }
 
+    /// How many registrations are currently on the stack.
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        let mut node = self.head.load(Ordering::Acquire);
+        let mut depth = 0;
+        while !node.is_null() {
+            depth += 1;
+            // SAFETY: test-only, and callers hold `&self` with no
+            // concurrent drainer, so no node here can be freed.
+            node = unsafe { (*node).next };
+        }
+        depth
+    }
+
     #[cfg(test)]
     fn note_take(&self) {
         self.takes.fetch_add(1, Ordering::Relaxed);
@@ -156,10 +185,14 @@ impl Default for WakerOverflow {
 
 impl Drop for WakerOverflow {
     fn drop(&mut self) {
-        let mut node = *self.head.get_mut();
+        // `&mut self` proves no peer holds a reference, so a plain swap
+        // takes the pointer with the same uniqueness the old `get_mut`
+        // path had (and is the shared form: loom's `AtomicPtr` exposes
+        // no `get_mut`).
+        let mut node = self.head.swap(ptr::null_mut(), Ordering::Relaxed);
         while !node.is_null() {
-            // SAFETY: `&mut self` proves no peer holds a reference, and
-            // every node was published by `push`.
+            // SAFETY: the swap detached the whole chain, so this thread
+            // is its sole owner and no peer can reach these nodes.
             let owned = unsafe { Box::from_raw(node) };
             node = owned.next;
         }

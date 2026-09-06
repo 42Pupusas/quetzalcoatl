@@ -1,3 +1,6 @@
+pub mod atomics;
+#[cfg(all(test, loom, feature = "async"))]
+mod loom_models;
 pub mod park;
 #[cfg(test)]
 pub mod park_probe;

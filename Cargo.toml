@@ -31,8 +31,16 @@ include = [
 async = []
 dhat-heap = ["dep:dhat"]
 
+[lints.rust]
+# `loom` is a compiler cfg cargo sets from the [target.'cfg(loom)']
+# dependency below, not a feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 dhat = { version = "0.3", optional = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 divan = "0.1"

@@ -19,7 +19,8 @@
 //! [`ParkSlot::Shared`], which self-rescues on a timeout rather than
 //! relying on a wake that has nowhere to land.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::atomics::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use super::park::PARK_SLOTS;
 
@@ -131,8 +132,19 @@ pub struct ParkRegistry {
 const _: () = assert!(super::park::PARK_SLOTS == u64::BITS as usize);
 
 impl ParkRegistry {
+    // Loom's `AtomicU64::new` is not const, so the loom twin of this
+    // constructor takes the weaker form. Std callers keep const use.
+    #[cfg(not(loom))]
     #[must_use]
     pub const fn new() -> Self {
+        Self {
+            held: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(loom)]
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             held: AtomicU64::new(0),
         }
