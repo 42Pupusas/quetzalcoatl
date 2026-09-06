@@ -53,6 +53,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
@@ -60,8 +61,7 @@ use crate::common::{AlignedBuf, CachePadded};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
+use std::sync::Arc;
 
 /// A lock-free SPMC ring buffer.
 ///
@@ -103,10 +103,11 @@ pub struct RingBuffer<T> {
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Consumer` clones. Bumped at clone time only.
     pub(crate) consumer_count: CachePadded<AtomicUsize>,
-    /// Single-producer park handle. Idempotently set the first time
-    /// the producer parks; consumers read it via `OnceLock::get` to
-    /// issue the unpark.
-    pub(crate) producer_parker: OnceLock<Thread>,
+    /// Single-producer park handle. Re-armed each time the producer
+    /// parks, so a producer that moves between threads is woken on
+    /// whichever thread is parked now; consumers claim it to issue the
+    /// unpark.
+    pub(crate) producer_parker: ThreadParker,
     /// `true` ↔ producer is currently parked. Consumers gate their
     /// unpark on this `Relaxed` load to keep the no-park hot path free.
     pub(crate) producer_parked: CachePadded<AtomicBool>,
@@ -158,7 +159,7 @@ impl<T> RingBuffer<T> {
             consumer_closed: CachePadded(AtomicBool::new(false)),
             consumer_count_live: CachePadded(AtomicUsize::new(1)),
             consumer_count: CachePadded(AtomicUsize::new(0)),
-            producer_parker: OnceLock::new(),
+            producer_parker: ThreadParker::new(),
             producer_parked: CachePadded(AtomicBool::new(false)),
             consumer_park: WakeSet::new(),
             #[cfg(feature = "async")]
@@ -183,9 +184,7 @@ impl<T> RingBuffer<T> {
             return;
         }
         self.producer_parked.0.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.producer_parker.get() {
-            handle.unpark();
-        }
+        self.producer_parker.wake();
     }
 
     /// Wakes the async producer task, if any. Self-gates on `pending`.

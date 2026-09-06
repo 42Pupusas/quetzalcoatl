@@ -299,7 +299,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
         self.ring().closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
-        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parker.arm();
         self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {
@@ -328,7 +328,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         self.ring().closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
-        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parker.arm();
         self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {

@@ -344,7 +344,7 @@ impl<T, C: Config> Consumer<T, C> {
                 continue;
             }
 
-            q.consumer_park.ensure_handle_installed(self.park_slot);
+            q.consumer_park.arm_handle(self.park_slot);
             // SeqCst pairs with producer's `consumer_park.wake.load`
             // after `ready.store(Release)`: either we see a
             // published slot in the re-check below, or the
@@ -453,7 +453,7 @@ impl<T, C: Config> Consumer<T, C> {
                 continue;
             }
 
-            self.queue.consumer_park.ensure_handle_installed(park_slot);
+            self.queue.consumer_park.arm_handle(park_slot);
             self.queue
                 .consumer_park
                 .wake

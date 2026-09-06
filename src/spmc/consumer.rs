@@ -275,7 +275,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 continue;
             }
 
-            q.consumer_park.ensure_handle_installed(self.park_slot);
+            q.consumer_park.arm_handle(self.park_slot);
             q.consumer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
             // Pairs with WakeSet::wake_one's fence: the pop() re-check
             // below reads the slot sequence with Acquire, which the
@@ -385,9 +385,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 continue;
             }
 
-            self.ring()
-                .consumer_park
-                .ensure_handle_installed(self.park_slot);
+            self.ring().consumer_park.arm_handle(self.park_slot);
             self.ring()
                 .consumer_park
                 .wake

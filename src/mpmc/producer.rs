@@ -235,7 +235,7 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
-            self.queue.producer_park.ensure_handle_installed(park_slot);
+            self.queue.producer_park.arm_handle(park_slot);
             self.queue
                 .producer_park
                 .wake
@@ -296,7 +296,7 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
-            q.producer_park.ensure_handle_installed(self.park_slot);
+            q.producer_park.arm_handle(self.park_slot);
             // SeqCst pairs with consumer's `producer_park.wake.load`
             // after `done.store(Release)`: either we succeed in
             // the re-check below, or the consumer sees our bit

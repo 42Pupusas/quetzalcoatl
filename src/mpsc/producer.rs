@@ -163,7 +163,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            q.producer_park.ensure_handle_installed(self.park_slot);
+            q.producer_park.arm_handle(self.park_slot);
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
             // Pairs with the SeqCst fence in WakeSet::wake_one. The
             // re-check below reads `head`/`sequence` with Acquire from
@@ -284,9 +284,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            self.ring()
-                .producer_park
-                .ensure_handle_installed(self.park_slot);
+            self.ring().producer_park.arm_handle(self.park_slot);
             self.ring()
                 .producer_park
                 .wake

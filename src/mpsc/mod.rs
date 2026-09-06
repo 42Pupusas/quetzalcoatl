@@ -35,6 +35,7 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
+use crate::common::thread_parker::ThreadParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
@@ -42,8 +43,7 @@ use crate::common::{AlignedBuf, CachePadded, SeqSlot};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
+use std::sync::Arc;
 
 /// A lock-free MPSC ring buffer.
 ///
@@ -75,10 +75,10 @@ pub struct RingBuffer<T> {
     /// Monotonic counter for assigning stable park-slot indices to
     /// `Producer` clones. Bumped at clone time only.
     pub(crate) producer_park_idx: CachePadded<AtomicUsize>,
-    /// Single-consumer park handle. Idempotently set by the consumer
-    /// the first time it parks; producers `OnceLock::get` it to
-    /// unpark.
-    pub(crate) consumer_parker: OnceLock<Thread>,
+    /// Single-consumer park handle. Re-armed by the consumer each time
+    /// it parks, so a consumer that moves between threads is woken on
+    /// whichever thread is parked now; producers claim it to unpark.
+    pub(crate) consumer_parker: ThreadParker,
     /// `true` ↔ the consumer is currently parked on `consumer_parker`.
     /// Producers gate their unpark on this `Relaxed` load to keep the
     /// no-park hot path free.
@@ -126,7 +126,7 @@ impl<T> RingBuffer<T> {
             consumer_closed: CachePadded(AtomicBool::new(false)),
             producer_park: WakeSet::new(),
             producer_park_idx: CachePadded(AtomicUsize::new(0)),
-            consumer_parker: OnceLock::new(),
+            consumer_parker: ThreadParker::new(),
             consumer_parked: CachePadded(AtomicBool::new(false)),
             #[cfg(feature = "async")]
             producer_waker: WakerSet::new(),
@@ -255,9 +255,7 @@ impl<T> RingBuffer<T> {
             return;
         }
         self.consumer_parked.0.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.consumer_parker.get() {
-            handle.unpark();
-        }
+        self.consumer_parker.wake();
     }
 
     /// Wakes the async consumer task, if any. Self-gates on `pending`.
@@ -1336,6 +1334,33 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         p.push(7).unwrap();
         assert_eq!(h.join().unwrap(), Some(7));
+    }
+
+    /// The consumer parks on thread B after having parked on thread A.
+    /// `Consumer` is `Send`, so this is reachable from safe code; the
+    /// wake must reach whichever thread is parked *now*.
+    #[test]
+    fn pop_block_wakes_a_consumer_that_moved_threads() {
+        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        let first = std::thread::spawn(move || {
+            let mut c = c;
+            assert_eq!(c.pop_block(), Some(1));
+            c
+        });
+        // Long enough that the first consumer exhausts its spin budget
+        // and genuinely parks, installing its handle.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(1).unwrap();
+        let c = first.join().unwrap();
+
+        let second = std::thread::spawn(move || {
+            let mut c = c;
+            c.pop_block()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        p.push(2).unwrap();
+        assert_eq!(second.join().unwrap(), Some(2));
     }
 
     #[test]

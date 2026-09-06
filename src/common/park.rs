@@ -17,9 +17,8 @@
 //! waiter never observes "closed but still parked."
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-use std::thread::Thread;
 
+use super::thread_parker::ThreadParker;
 use super::AlignedBuf;
 
 /// Park-slot count.
@@ -53,10 +52,11 @@ pub struct WakeSet {
     /// `i` is parked. Peers read this `Relaxed` after each release
     /// and wake one parked waiter if non-zero.
     pub wake: AtomicU64,
-    /// `Thread` handle table. Idempotently set by the first waiter
-    /// that parks at each slot; readers (peers issuing wakes)
-    /// obtain a `&Thread` via `OnceLock::get`.
-    pub parkers: AlignedBuf<OnceLock<Thread>>,
+    /// Park handle table. Re-armed by each waiter that parks at a
+    /// slot, so a waiter that migrates between threads is woken on
+    /// whichever thread is parked now; peers issuing wakes claim the
+    /// handle out of the slot.
+    pub parkers: AlignedBuf<ThreadParker>,
     /// Round-robin cursor: index *just after* the last slot we woke.
     /// `wake_one` rotates the bitmap by `cursor` before picking the
     /// trailing-zero bit, so a stuck low-bit waiter that re-parks
@@ -75,7 +75,7 @@ impl WakeSet {
     pub fn new() -> Self {
         Self {
             wake: AtomicU64::new(0),
-            parkers: AlignedBuf::new_with(PARK_SLOTS, OnceLock::new),
+            parkers: AlignedBuf::new_with(PARK_SLOTS, ThreadParker::new),
             cursor: AtomicU64::new(0),
         }
     }
@@ -158,9 +158,7 @@ impl WakeSet {
             // Advance cursor past this slot for the next caller.
             self.cursor
                 .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
-            if let Some(handle) = self.parkers[bit as usize].get() {
-                handle.unpark();
-            }
+            self.parkers[bit as usize].wake();
             return;
         }
     }
@@ -202,9 +200,7 @@ impl WakeSet {
                 continue;
             }
             cursor = u64::from(bit).wrapping_add(1);
-            if let Some(handle) = self.parkers[bit as usize].get() {
-                handle.unpark();
-            }
+            self.parkers[bit as usize].wake();
         }
         self.cursor.store(cursor, Ordering::Relaxed);
     }
@@ -215,21 +211,30 @@ impl WakeSet {
         let mut bits = self.wake.swap(0, Ordering::AcqRel);
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
-            if let Some(handle) = self.parkers[b].get() {
-                handle.unpark();
-            }
+            self.parkers[b].wake();
             bits &= bits - 1;
         }
     }
 
-    /// Idempotently installs the current thread's `Thread` handle at
-    /// `slot`. Subsequent calls observe the slot already set and
-    /// no-op. Slot aliasing (>`PARK_SLOTS` waiters) means the first
-    /// installer wins; later wakes on that bit may unpark the wrong
-    /// waiter (benign — it just re-checks and re-parks).
+    /// Publishes the calling thread's handle at `slot`, replacing any
+    /// handle left by an earlier park.
+    ///
+    /// Re-arming is what lets a waiter migrate between threads: the
+    /// handle names the thread parked now, not the one that parked
+    /// first. Slot aliasing (>`PARK_SLOTS` waiters) means the last
+    /// armer wins; a wake on that bit may unpark a waiter that is not
+    /// the one that armed it, which is benign — it re-checks and
+    /// re-parks.
     #[inline]
-    pub fn ensure_handle_installed(&self, slot: usize) {
-        let _ = self.parkers[slot].set(std::thread::current());
+    pub fn arm_handle(&self, slot: usize) {
+        self.parkers[slot].arm();
+    }
+
+    /// Whether a handle is armed at `slot`.
+    #[must_use]
+    #[inline]
+    pub fn is_armed(&self, slot: usize) -> bool {
+        self.parkers[slot].is_armed()
     }
 }
 

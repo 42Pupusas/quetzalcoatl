@@ -252,7 +252,7 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            q.producer_park.ensure_handle_installed(self.park_slot);
+            q.producer_park.arm_handle(self.park_slot);
             q.producer_park.wake.fetch_or(bit_mask, Ordering::SeqCst);
             // Pairs with WakeSet::wake_one's fence: the re-checks below
             // load consumer state with Acquire, which the SeqCst RMW
@@ -299,9 +299,7 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            self.queue
-                .producer_park
-                .ensure_handle_installed(self.park_slot);
+            self.queue.producer_park.arm_handle(self.park_slot);
             self.queue
                 .producer_park
                 .wake

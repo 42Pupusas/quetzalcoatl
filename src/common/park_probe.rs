@@ -11,11 +11,14 @@
 //!
 //! # Choosing the observable
 //!
-//! The observable must be monotonic. `producer_parked` is **not**: the
-//! waiter sets it, re-checks, and may clear it and return without ever
-//! parking, so a probe can miss the edge and spin forever. The parker
-//! `OnceLock` handles are monotonic — installed before the re-checks and
-//! never cleared — so they are the correct thing to wait on.
+//! The observable must latch for long enough that a polling probe
+//! cannot miss it. `producer_parked` is set before the waiter's final
+//! re-checks and stays set while it is parked, so a probe polling it
+//! observes a waiter that has committed to parking.
+//!
+//! An armed park handle is *not* a safe substitute: a wake claims the
+//! handle out of its slot, so the observable disappears the moment the
+//! peer acts on it. Probe the `parked` flag or the wake bitmap instead.
 //!
 //! The budget counts attempts, not time, and is deliberately small: a
 //! blown budget must fail the test quickly rather than burn CPU.

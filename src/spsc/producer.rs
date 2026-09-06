@@ -195,7 +195,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            let _ = self.ring().producer_parker.set(std::thread::current());
+            self.ring().producer_parker.arm();
             // SeqCst pairs with the consumer's `producer_parked.load`
             // after `head.store(Release)`.
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
@@ -297,11 +297,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.ring().consumer_closed.0.load(Ordering::Acquire)
     }
     fn arm_park(&self) {
-        // Idempotently install our parker handle, then publish "parked".
-        // SeqCst pairs with the consumer's `producer_parked.load` after
+        // Publish this thread's handle, then publish "parked". SeqCst
+        // pairs with the consumer's `producer_parked.load` after
         // `head.store(Release)`: either our re-check sees freed space, or
         // the consumer sees our flag and unparks us.
-        let _ = self.ring().producer_parker.set(std::thread::current());
+        self.ring().producer_parker.arm();
         self.ring().producer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {

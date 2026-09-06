@@ -1,6 +1,7 @@
 pub mod park;
 #[cfg(test)]
 pub mod park_probe;
+pub mod thread_parker;
 #[cfg(feature = "async")]
 pub mod wake_async;
 
@@ -47,7 +48,7 @@ pub fn spawn_progress_watchdog(
 
 /// Shared blocking-push loop for the single-producer topologies (spsc,
 /// spmc). Both park the producer thread with the identical mechanism
-/// (`producer_parker: OnceLock<Thread>` + `producer_parked` flag), so
+/// (`producer_parker: ThreadParker` + `producer_parked` flag), so
 /// their `push_block` bodies were byte-for-byte the same. The loop lives
 /// here once; each implementor supplies the four primitives that differ
 /// only in which ring fields they touch.

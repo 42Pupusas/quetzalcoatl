@@ -295,7 +295,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
         // SeqCst pairs with the producer's `consumer_parked.load` after
         // `tail.store(Release)`: either our re-check sees the published
         // slot, or the producer sees our flag and unparks us.
-        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parker.arm();
         self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {
@@ -324,7 +324,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         self.ring().producer_closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
-        let _ = self.ring().consumer_parker.set(std::thread::current());
+        self.ring().consumer_parker.arm();
         self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {

@@ -424,7 +424,7 @@ impl<T, C: Config> Drop for RingBuffer<T, C> {
                 }
             }
         }
-        // OnceLock<Thread> entries in `producer_parkers` clean themselves up.
+        // ThreadParker entries in the park tables free their handles.
     }
 }
 

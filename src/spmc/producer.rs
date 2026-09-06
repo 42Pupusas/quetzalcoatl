@@ -164,7 +164,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            let _ = self.ring().producer_parker.set(std::thread::current());
+            self.ring().producer_parker.arm();
             self.ring().producer_parked.0.store(true, Ordering::SeqCst);
             // The has_space() re-check below loads `head` with Acquire,
             // which the SeqCst store above does not order.
@@ -224,7 +224,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.ring().consumer_closed.0.load(Ordering::SeqCst)
     }
     fn arm_park(&self) {
-        let _ = self.ring().producer_parker.set(std::thread::current());
+        self.ring().producer_parker.arm();
         self.ring().producer_parked.0.store(true, Ordering::SeqCst);
     }
     fn disarm_park(&self) {
