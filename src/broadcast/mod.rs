@@ -43,6 +43,7 @@ mod consumer;
 mod consumer_floor;
 mod producer;
 mod slot_reuse;
+mod slot_state;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
@@ -54,6 +55,7 @@ use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
+use slot_state::SlotState;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -62,23 +64,21 @@ use std::sync::Arc;
 
 pub(super) struct BroadcastSlot<T> {
     pub data: UnsafeCell<MaybeUninit<T>>,
-    /// Sequence number: 0 = empty, `pos * 2 + 1` = published at position `pos`.
-    /// Uses the same 2x encoding as MPSC/SPMC for consistency.
+    /// See [`SlotState`] for the encoding. Unlike the MPSC/SPMC rings,
+    /// broadcast markers must name their position: a consumer never
+    /// clears one (the other consumers still have to see it), so a
+    /// positionless marker would be re-read on every later lap.
     pub sequence: AtomicUsize,
 }
 
 impl<T> BroadcastSlot<T> {
-    /// Classifies this slot for logical position `pos` - see
-    /// `crate::common::SlotSnapshot::classify` for the shared logic (the
-    /// "free" sentinel here is always `0` rather than `pos * 2`, but
-    /// classification only distinguishes Ready/Tombstoned from
-    /// everything else, so the difference is immaterial).
+    /// Classifies this slot for logical position `pos`.
     #[inline]
     pub(super) fn classify(
         &self,
         pos: usize,
     ) -> crate::common::SlotSnapshot<*const MaybeUninit<T>> {
-        crate::common::SlotSnapshot::classify(&self.sequence, &self.data, pos)
+        SlotState::classify(&self.sequence, &self.data, pos)
     }
 }
 
@@ -162,7 +162,7 @@ impl<T> RingBuffer<T> {
         let cap = capacity.cap;
         let buf = AlignedBuf::new_with(cap, || BroadcastSlot {
             data: UnsafeCell::new(MaybeUninit::uninit()),
-            sequence: AtomicUsize::new(0),
+            sequence: AtomicUsize::new(SlotState::VACANT),
         });
         let consumer_slots: Vec<ConsumerSlot> = (0..max_consumers)
             .map(|_| ConsumerSlot {
@@ -202,19 +202,38 @@ impl<T> RingBuffer<T> {
         self.producer_park.wake_one();
     }
 
-    /// Wakes one async producer task, if any. Self-gates on `pending`.
+    /// Wakes every async producer task waiting for space.
+    ///
+    /// Call sites are unconditional; this pair and
+    /// [`notify_consumers`](Self::notify_consumers) are the only place
+    /// the async feature enters the notification path.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_producer_async(&self) {
+    pub(crate) fn notify_producers(&self) {
         self.producer_waker.wake_all();
     }
 
-    /// Wakes one async consumer task, if any. Self-gates on `pending`.
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_producers(&self) {}
+
+    /// Wakes every async consumer task waiting for a publication.
+    ///
+    /// Called on every capacity- or position-releasing transition, an
+    /// abandoned reservation included: a consumer blocked at that
+    /// position advances past the marker, so the transition is real
+    /// progress even though it delivers no value.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_consumer_async(&self) {
+    pub(crate) fn notify_consumers(&self) {
         self.consumer_waker.wake_all();
     }
+
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_consumers(&self) {}
 
     /// Returns a reference to the slot at logical position `pos`.
     ///
@@ -318,9 +337,10 @@ impl<T> Drop for RingBuffer<T> {
         // position `pos` was last written by push number `pos`, so the
         // most recent `min(tail, cap)` slots may hold live data.
         //
-        // We use the per-slot sequence number to decide: seq > 0 means
-        // the producer wrote data and hasn't cleared it. seq == 0 means
-        // either never written or already cleared by a subsequent claim_slot.
+        // We use the per-slot sequence number to decide: only a
+        // published marker owns a value. Vacant means never written or
+        // cleared by a later claim; abandoned means the reservation
+        // resolved without one.
         //
         // The start of the range is `tail - min(tail, cap)` to avoid
         // scanning the entire buffer, and the wrapping_sub handles the
@@ -330,11 +350,11 @@ impl<T> Drop for RingBuffer<T> {
         for pos in start..tail {
             let slot = &mut self.buf[pos & self.mask];
             let seq = *slot.sequence.get_mut();
-            if seq > 0 && seq != crate::common::TOMBSTONE {
-                // SAFETY: sequence > 0 and not tombstoned means data was
-                // initialized by a producer and not cleared by a subsequent
-                // claim_slot. Exclusive access in drop (&mut self) guarantees
-                // no concurrency.
+            if SlotState::decode(seq).holds_value() {
+                // SAFETY: a published marker means data was initialized
+                // by a producer and not cleared by a subsequent
+                // claim_slot. Exclusive access in drop (&mut self)
+                // guarantees no concurrency.
                 unsafe {
                     slot.data.get().cast::<T>().drop_in_place();
                 }
@@ -614,6 +634,80 @@ mod tests {
         );
 
         drop(writer);
+    }
+
+    /// An abandoned reservation must be skipped exactly once. The
+    /// marker names its position, so a consumer that has already walked
+    /// past it reads the slot as empty rather than as another
+    /// abandonment — with `cap == 1` every later position aliases that
+    /// one slot, so a positionless marker made `pop` advance forever
+    /// instead of reporting empty.
+    #[test]
+    fn capacity_one_abandoned_reservation_is_skipped_once() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(1), 4).split();
+
+        drop(producer.reserve().expect("the empty ring has a slot"));
+
+        assert_eq!(consumer.pop(), None, "the ring holds no value");
+        assert_eq!(consumer.pop(), None, "and still holds none");
+
+        producer.push(7).unwrap();
+        assert_eq!(consumer.pop(), Some(7));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    /// The same at `cap == 2`, alternating abandoned and published
+    /// positions so the consumer must skip markers interleaved with
+    /// real values rather than at the head of the ring.
+    #[test]
+    fn capacity_two_alternating_abandon_and_publish() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+
+        for round in 0..8u32 {
+            drop(producer.reserve().expect("a slot is free"));
+            producer.push(round).expect("the other slot is free");
+            assert_eq!(consumer.pop(), Some(round));
+            assert_eq!(consumer.pop(), None, "round {round} left a stale marker");
+        }
+    }
+
+    /// A consumer whose head sits at an abandoned position must not
+    /// treat every later position as abandoned too.
+    #[test]
+    fn a_stale_abandoned_marker_does_not_swallow_later_positions() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4), 4).split();
+
+        drop(producer.reserve().expect("the empty ring has a slot"));
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    /// Abandoning a written-but-uncommitted reservation drops the value
+    /// and releases the position, exactly like abandoning an unwritten
+    /// one.
+    #[test]
+    fn abandoning_a_written_slot_releases_its_position() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (mut producer, mut consumer) =
+            RingBuffer::<DropCounter>::new(Capacity::exact(1), 4).split();
+
+        {
+            let w = producer.reserve().expect("the empty ring has a slot");
+            w.write(DropCounter {
+                counter: counter.clone(),
+            });
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "value dropped in place");
+
+        assert_eq!(consumer.pop().map(|_| ()), None);
+        producer
+            .push(DropCounter { counter })
+            .expect("the abandoned position was released");
+        assert!(consumer.pop().is_some());
     }
 
     #[test]

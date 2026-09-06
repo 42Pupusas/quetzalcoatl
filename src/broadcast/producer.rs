@@ -6,9 +6,9 @@ use std::task::Poll;
 
 use super::consumer_floor::ConsumerFloor;
 use super::slot_reuse::SlotReuse;
+use super::slot_state::SlotState;
 use super::RingBuffer;
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
-use crate::common::TOMBSTONE;
 
 /// The producer side of a broadcast ring buffer.
 ///
@@ -114,16 +114,16 @@ impl<T> Producer<T> {
 
         // Drop old value if this slot was previously written.
         if std::mem::needs_drop::<T>() {
-            let old_seq = slot.sequence.swap(0, Ordering::Acquire);
-            if old_seq > 0 && old_seq != TOMBSTONE {
-                // SAFETY: old_seq > 0 means data was initialized
+            let old = slot.sequence.swap(SlotState::VACANT, Ordering::Acquire);
+            if SlotState::decode(old).holds_value() {
+                // SAFETY: a published marker means data was initialized
                 // by a prior push. We own the slot via our CAS claim.
                 unsafe {
                     slot.data.get().cast::<T>().drop_in_place();
                 }
             }
         } else {
-            slot.sequence.store(0, Ordering::Relaxed);
+            slot.sequence.store(SlotState::VACANT, Ordering::Relaxed);
         }
 
         Some((slot.data.get(), &slot.sequence, pos))
@@ -143,9 +143,8 @@ impl<T> Producer<T> {
             Some((data_ptr, slot_seq, pos)) => {
                 // SAFETY: We exclusively own this slot via our CAS claim.
                 unsafe { (*data_ptr).write(val) };
-                slot_seq.store(pos * 2 + 1, Ordering::Release);
-                #[cfg(feature = "async")]
-                self.queue.wake_consumer_async();
+                slot_seq.store(SlotState::published_word(pos), Ordering::Release);
+                self.queue.notify_consumers();
                 Ok(())
             }
             None => Err(val),
@@ -426,7 +425,6 @@ pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
-    #[allow(dead_code)] // only read when feature = "async" is enabled
     queue: &'a RingBuffer<T>,
 }
 
@@ -469,16 +467,24 @@ impl<'a, T> SlotWriter<'a, T> {
     #[inline]
     pub unsafe fn commit_unchecked(self) {
         self.slot_sequence
-            .store(self.pos * 2 + 1, Ordering::Release);
-        #[cfg(feature = "async")]
-        self.queue.wake_consumer_async();
+            .store(SlotState::published_word(self.pos), Ordering::Release);
+        self.queue.notify_consumers();
         std::mem::forget(self);
     }
 }
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        self.slot_sequence.store(TOMBSTONE, Ordering::Release);
+        // Abandoning releases the position: a consumer sitting at it can
+        // now advance past the marker, and a producer waiting on the
+        // aliasing slot can now reclaim it. Both are progress and both
+        // need the wake — without it a consumer parked on this position
+        // waits for a publication that will never come.
+        self.slot_sequence
+            .store(SlotState::abandoned_word(self.pos), Ordering::Release);
+        self.queue.notify_consumers();
+        self.queue.wake_producer();
+        self.queue.notify_producers();
     }
 }
 
@@ -490,7 +496,6 @@ pub struct WrittenSlot<'a, T> {
     slot_data: *mut MaybeUninit<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
-    #[allow(dead_code)] // only read when feature = "async" is enabled
     queue: &'a RingBuffer<T>,
     committed: bool,
 }
@@ -510,9 +515,8 @@ impl<T> WrittenSlot<'_, T> {
     pub fn commit(mut self) {
         self.committed = true;
         self.slot_sequence
-            .store(self.pos * 2 + 1, Ordering::Release);
-        #[cfg(feature = "async")]
-        self.queue.wake_consumer_async();
+            .store(SlotState::published_word(self.pos), Ordering::Release);
+        self.queue.notify_consumers();
     }
 }
 
@@ -523,9 +527,14 @@ impl<T> Drop for WrittenSlot<'_, T> {
             unsafe {
                 self.slot_data.cast::<T>().drop_in_place();
             }
-            self.slot_sequence.store(TOMBSTONE, Ordering::Release);
-            #[cfg(feature = "async")]
-            self.queue.wake_consumer_async();
+            // See SlotWriter::drop: abandonment is a progress event for
+            // consumers at this position and for producers waiting on
+            // the aliasing slot.
+            self.slot_sequence
+                .store(SlotState::abandoned_word(self.pos), Ordering::Release);
+            self.queue.notify_consumers();
+            self.queue.wake_producer();
+            self.queue.notify_producers();
         }
     }
 }

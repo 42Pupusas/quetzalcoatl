@@ -66,6 +66,22 @@ impl<T> Drop for Consumer<T> {
 }
 
 impl<T> Consumer<T> {
+    /// Publishes this consumer's head past `head` and notifies the
+    /// producers.
+    ///
+    /// Every path that moves the head runs through here — delivering a
+    /// value, skipping an abandoned position, or dropping a reader.
+    /// Each raises this consumer's contribution to the floor, so each is
+    /// a capacity-releasing event a blocked producer must learn about.
+    #[inline]
+    fn advance_head(&self, head: usize) {
+        self.queue.consumer_slots[self.slot_index]
+            .head
+            .store(head + 1, Ordering::Release);
+        self.queue.wake_producer();
+        self.queue.notify_producers();
+    }
+
     /// Pops the next item, returning a clone.
     ///
     /// Returns `None` if the buffer is empty or the next slot hasn't
@@ -89,10 +105,11 @@ impl<T> Consumer<T> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    // Abandoned slot — skip it by advancing this consumer's head.
-                    self.queue.consumer_slots[self.slot_index]
-                        .head
-                        .store(head + 1, Ordering::Release);
+                    // Abandoned slot — skip it by advancing this
+                    // consumer's head. That frees the position for the
+                    // producers, so it is published and notified like
+                    // any other head advance.
+                    self.advance_head(head);
                     continue;
                 }
                 SlotSnapshot::NotReady => return None,
@@ -105,14 +122,7 @@ impl<T> Consumer<T> {
             // advanced (min_head blocks the producer).
             let val = unsafe { (*data_ptr).assume_init_ref().clone() };
 
-            // Advance this consumer's head
-            self.queue.consumer_slots[self.slot_index]
-                .head
-                .store(head + 1, Ordering::Release);
-
-            self.queue.wake_producer();
-            #[cfg(feature = "async")]
-            self.queue.wake_producer_async();
+            self.advance_head(head);
 
             return Some(val);
         }
@@ -179,10 +189,8 @@ impl<T> Consumer<T> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    // Abandoned slot — skip it.
-                    self.queue.consumer_slots[self.slot_index]
-                        .head
-                        .store(head + 1, Ordering::Release);
+                    // Abandoned slot — skip it, releasing the position.
+                    self.advance_head(head);
                     continue;
                 }
                 SlotSnapshot::NotReady => return None,
@@ -248,11 +256,6 @@ impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
         // Do NOT drop the T value — other consumers may still need it.
         // Just advance this consumer's head.
-        self.consumer.queue.consumer_slots[self.consumer.slot_index]
-            .head
-            .store(self.head + 1, Ordering::Release);
-        self.consumer.queue.wake_producer();
-        #[cfg(feature = "async")]
-        self.consumer.queue.wake_producer_async();
+        self.consumer.advance_head(self.head);
     }
 }
