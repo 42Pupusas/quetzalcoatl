@@ -126,6 +126,12 @@ impl WakerSet {
     /// future is still parked, so its waker moves to the overflow list
     /// rather than being dropped.
     ///
+    /// The blocking twin ([`super::thread_parker::ThreadParker`]) needs
+    /// no such care. Endpoints are `Send` but not `Sync`, so one handle
+    /// is only ever inside one blocking call at a time, and re-arming
+    /// can only displace a handle the same thread has finished with.
+    /// Futures break that: a single thread can hold several at once.
+    ///
     /// Called by the future before returning `Poll::Pending`. The
     /// trailing `SeqCst` fence pairs with the fence in `wake_one`/
     /// `wake_n` so the waker's post-register re-check of the ring and a

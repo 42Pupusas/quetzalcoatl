@@ -1538,6 +1538,54 @@ mod tests {
         h.join().unwrap();
     }
 
+    /// The consumer-side twin of the mpsc producer case: two
+    /// `pop_async` futures from *one* consumer handle, driven by
+    /// separate tasks. Both park on the handle's single slot, so the
+    /// second registration must not discard the first.
+    #[test]
+    #[cfg(feature = "async")]
+    fn two_async_pops_from_one_handle_both_complete() {
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            let got = rt.block_on(local.run_until(async move {
+                let consumer = Rc::new(consumer);
+                let first = {
+                    let c = Rc::clone(&consumer);
+                    tokio::task::spawn_local(async move { c.pop_async().await })
+                };
+                let second = {
+                    let c = Rc::clone(&consumer);
+                    tokio::task::spawn_local(async move { c.pop_async().await })
+                };
+                (first.await.unwrap(), second.await.unwrap())
+            }));
+            let _ = done_tx.send(got);
+        });
+
+        // Both futures park on an empty ring before anything is pushed.
+        std::thread::sleep(Duration::from_millis(100));
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+
+        let (first, second) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pop_async future was stranded");
+        let mut got = [first.unwrap(), second.unwrap()];
+        got.sort_unstable();
+        assert_eq!(got, [1, 2]);
+        h.join().unwrap();
+        drop(producer);
+    }
+
     // -----------------------------------------------------------------------
     // Borrowed split (non-'static T)
     // -----------------------------------------------------------------------
