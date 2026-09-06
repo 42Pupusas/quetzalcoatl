@@ -50,7 +50,6 @@ impl<T, C: Config> Drop for SlotRelease<'_, T, C> {
             .done_slot(self.pos)
             .store(self.round_pos + self.queue.cap, Ordering::SeqCst);
         self.queue.producer_park.wake_one();
-        #[cfg(feature = "async")]
-        self.queue.wake_producer_async();
+        self.queue.notify_producers();
     }
 }

@@ -92,6 +92,30 @@ pub struct RingBuffer<T> {
 unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
+impl<T> Drop for RingBuffer<T> {
+    fn drop(&mut self) {
+        // The consumer drains on drop, so normally nothing is left. But
+        // the producer outlives it: a push that lands after the consumer
+        // is gone has no one to take the value, and without this the
+        // storage was freed with the value still in it — a leak for any
+        // `T` that owns resources.
+        //
+        // Handles are all gone (we hold `&mut self`), so the cursors can
+        // be read non-atomically, and everything between them is an
+        // initialized value nobody consumed.
+        let head = *self.head.0.get_mut();
+        let tail = *self.tail.0.get_mut();
+        for pos in head..tail {
+            // SAFETY: the producer published `pos < tail` and the
+            // consumer never advanced `head` past it, so the slot holds
+            // an initialized value. `&mut self` rules out concurrency.
+            unsafe {
+                self.buf[pos & self.mask].get().cast::<T>().drop_in_place();
+            }
+        }
+    }
+}
+
 impl<T> RingBuffer<T> {
     /// Creates a new SPSC ring buffer with the given capacity.
     #[must_use]
@@ -193,8 +217,16 @@ impl<T> RingBuffer<T> {
         self.len() == self.cap
     }
 
-    /// Externally closes the ring, causing any blocked `pop_block` to
-    /// return `None`. Subsequent pushes are silently dropped.
+    /// Externally closes the ring, causing a blocked
+    /// [`pop_block`](Consumer::pop_block) to return `None` once the ring
+    /// has drained.
+    ///
+    /// This signals the consumer; it does not close the producer.
+    /// Pushes after it still succeed, and a value pushed after the
+    /// consumer has stopped reading stays in the ring until the ring
+    /// itself is dropped, which reclaims it. Callers who need pushes to
+    /// fail should drop the consumer, which is what
+    /// [`push_block`](Producer::push_block) reports through `Err`.
     pub fn close(&self) {
         self.producer_closed.0.store(true, Ordering::Release);
         self.wake_consumer();
@@ -535,6 +567,33 @@ mod tests {
         // Dropping consumer should drain and drop all 4 items
         drop(consumer);
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// A push that lands after the consumer is gone still owns its
+    /// value, and the ring is the only thing left to reclaim it. The
+    /// storage used to be freed with the value still inside.
+    #[test]
+    fn ring_drops_a_value_pushed_after_the_consumer_left() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+            drop(consumer);
+            producer
+                .push(DropCounter {
+                    counter: counter.clone(),
+                })
+                .expect("the ring has space regardless of the consumer");
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the value is still in the ring"
+            );
+        }
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "freeing the ring must drop what it still holds"
+        );
     }
 
     /// Items popped normally should be dropped exactly once.

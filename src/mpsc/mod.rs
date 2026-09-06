@@ -159,8 +159,15 @@ impl<T> RingBuffer<T> {
         self.len() == self.cap
     }
 
-    /// Externally closes the ring, causing any blocked `pop_block` to
-    /// return `None`. Subsequent pushes are silently dropped.
+    /// Externally closes the ring, causing a blocked
+    /// [`pop_block`](Consumer::pop_block) to return `None` once the ring
+    /// has drained.
+    ///
+    /// This signals the consumer; it does not close the producers.
+    /// Pushes after it still succeed, and any value left unread is
+    /// dropped when the ring is. Callers who need pushes to fail should
+    /// drop the consumer, which is what
+    /// [`push_block`](Producer::push_block) reports through `Err`.
     pub fn close(&self) {
         // SeqCst: see Producer::drop.
         self.closed.0.store(true, Ordering::SeqCst);

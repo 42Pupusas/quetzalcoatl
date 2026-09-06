@@ -53,6 +53,7 @@
 //! ones at the same total thread count because there's scheduling
 //! slack.
 
+mod batch_abandon;
 mod consumer;
 mod producer;
 mod slot_release;
@@ -282,34 +283,44 @@ impl<T, C: Config> RingBuffer<T, C> {
         }
     }
 
-    /// Wakes one async producer task, if any. Self-gates on `pending`.
+    /// Wakes the async producer tasks waiting for space.
+    ///
+    /// Call sites are unconditional; this family is where the async
+    /// feature enters the notification path.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_producer_async(&self) {
+    pub(crate) fn notify_producers(&self) {
         self.producer_waker.wake_all();
     }
 
-    /// Wakes up to `n` async producer tasks, if any. Self-gates.
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_producers(&self) {}
+
+    /// Wakes up to `n` async producer tasks.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_producer_async_n(&self, n: usize) {
+    pub(crate) fn notify_producers_n(&self, n: usize) {
         self.producer_waker.wake_n(n);
     }
 
-    /// Wakes one async consumer task, if any. Self-gates on `pending`.
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_producers_n(&self, _n: usize) {}
+
+    /// Wakes the async consumer tasks waiting for a publication.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_consumer_async(&self) {
+    pub(crate) fn notify_consumers(&self) {
         self.consumer_waker.wake_all();
     }
 
-    /// Wakes up to `n` async consumer tasks, if any. Self-gates.
-    #[cfg(feature = "async")]
-    #[allow(dead_code)]
+    #[cfg(not(feature = "async"))]
     #[inline]
-    pub(crate) fn wake_consumer_async_n(&self, n: usize) {
-        self.consumer_waker.wake_n(n);
-    }
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_consumers(&self) {}
 
     #[inline]
     pub(crate) fn data_slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
@@ -1012,6 +1023,52 @@ mod tests {
         drop(p);
         assert!(c.is_closed());
         assert_eq!(c.pop(), None);
+    }
+
+    /// Dropping a producer must not wait on a consumer that no longer
+    /// exists.
+    ///
+    /// A batch position whose previous round is still unreleased can
+    /// only be handed back once `done` catches up, and only a consumer
+    /// advances `done`. Waiting for that unconditionally made the drop
+    /// depend on a peer still running: with the consumers gone the
+    /// producer's destructor never returned. The wait now stops when
+    /// the consumers close.
+    #[test]
+    fn producer_drop_completes_after_consumers_are_gone() {
+        // A full lap so the batch's positions alias slots whose
+        // previous round the (departed) consumer never released.
+        let (p, c) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        drop(c);
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&dropped);
+        let h = std::thread::spawn(move || {
+            drop(p);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        h.join().expect("the producer drop must not wait forever");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The same with an outstanding reservation: the abandoned batch
+    /// position is exactly the state whose release needs a consumer.
+    #[test]
+    fn producer_drop_with_reservation_completes_after_consumers_are_gone() {
+        let (mut p, c) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        for i in 0..4 {
+            p.push(i).unwrap();
+        }
+        let writer = p.reserve();
+        drop(c);
+        drop(writer);
+
+        let h = std::thread::spawn(move || drop(p));
+        h.join().expect("the producer drop must not wait forever");
     }
 
     #[test]

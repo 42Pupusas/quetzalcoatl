@@ -294,8 +294,13 @@ impl<T> RingBuffer<T> {
     /// p1.push("a".to_string()).unwrap();
     /// ```
     #[must_use]
-    pub fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
-        self.consumer_count_live.fetch_add(1, Ordering::Relaxed);
+    pub const fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
+        // No increment: the count is seeded at one for the consumer a
+        // split hands out, exactly as `split` relies on. Counting this
+        // one twice left the tally at one after the only consumer
+        // dropped, so `consumer_closed` was never set and a producer
+        // blocked in `push_block` waited for a consumer that no longer
+        // existed.
         let shared: &Self = self;
         let producer = Producer::new_with(shared);
         let consumer = Consumer::new_with(shared, 0);
@@ -1556,6 +1561,45 @@ mod tests {
 
         assert_eq!(consumer.pop().unwrap(), &[10, 20]);
         assert_eq!(consumer.pop().unwrap(), &[30, 40]);
+    }
+
+    /// A borrowed split hands out one consumer, so dropping it must
+    /// reach zero and close the ring. The count was seeded at one and
+    /// incremented again by the split, leaving a phantom consumer that
+    /// kept a blocked producer waiting forever.
+    #[test]
+    fn borrowed_split_last_consumer_drop_closes_the_ring() {
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(2));
+        let (producer, consumer) = ring.split_borrowed();
+
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        assert!(producer.is_full());
+        drop(consumer);
+
+        assert_eq!(
+            producer.push_block(3),
+            Err(3),
+            "a full ring with no consumers must not block the producer"
+        );
+    }
+
+    /// The same once extra handles have been minted: closure follows
+    /// the last of them, not the first.
+    #[test]
+    fn borrowed_consumers_close_the_ring_on_the_last_drop() {
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(2));
+        let (producer, c1) = ring.split_borrowed();
+        let c2 = c1.new_consumer();
+
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        drop(c1);
+        assert!(!c2.is_closed(), "one consumer still holds the ring open");
+
+        assert_eq!(c2.pop(), Some(1));
+        drop(c2);
+        assert_eq!(producer.push_block(3), Err(3));
     }
 
     #[test]

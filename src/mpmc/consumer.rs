@@ -187,8 +187,7 @@ impl<T, C: Config> Consumer<T, C> {
         q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
         // Wake one parked producer if any.
         q.producer_park.wake_one();
-        #[cfg(feature = "async")]
-        q.wake_producer_async();
+        q.notify_producers();
         Some(val)
     }
 
@@ -259,8 +258,7 @@ impl<T, C: Config> Consumer<T, C> {
             // releases up to `count` of them — each `wake_one` would
             // strand the rest until the next pop/drain.
             self.queue.producer_park.wake_n(count);
-            #[cfg(feature = "async")]
-            self.queue.wake_producer_async_n(count);
+            self.queue.notify_producers_n(count);
         }
         count
     }
@@ -283,8 +281,7 @@ impl<T, C: Config> Consumer<T, C> {
         }
         if count > 0 {
             self.queue.producer_park.wake_n(count);
-            #[cfg(feature = "async")]
-            self.queue.wake_producer_async_n(count);
+            self.queue.notify_producers_n(count);
         }
         count
     }

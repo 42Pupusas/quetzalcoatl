@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::batch_abandon::BatchAbandon;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::park::{BACKOFF_PARK_THRESHOLD, PARK_MASK};
 
@@ -179,8 +180,7 @@ impl<T, C: Config> Producer<T, C> {
 
         // Wake one consumer parked in pop_block, if any.
         q.consumer_park.wake_one();
-        #[cfg(feature = "async")]
-        q.wake_consumer_async();
+        q.notify_consumers();
         Ok(())
     }
 
@@ -377,37 +377,11 @@ impl<T, C: Config> Producer<T, C> {
 
 impl<T, C: Config> Drop for Producer<T, C> {
     fn drop(&mut self) {
-        // Tombstone any reserved-but-unpublished batch positions:
-        // mark them as already-claimed-and-released so the
-        // next-round producer can proceed. Without this, dropped
-        // producers strand slots and stall the ring.
-        let q = &*self.queue;
-        let cap = q.cap;
-        let start = self.batch_start.get();
-        let mut unused = self.batch_unused.get();
-        while unused != 0 {
-            let bit = unused.trailing_zeros() as usize;
-            let pos = start + bit;
-            // Wait for previous round's consumer to release before
-            // tombstoning, else we'd stomp on prior-round state. Wake
-            // any parked consumers each iteration: a consumer can be
-            // parked on `consumer_park` waiting for a state==1 slot we
-            // already published in this batch, and without an explicit
-            // wake here the consumer never advances past the slot whose
-            // `done` we're spinning on — classic deadlock during the
-            // producer's last drop.
-            let done = q.done_slot(pos);
-            let mut backoff = 0u32;
-            while done.load(Ordering::Acquire) != pos {
-                q.consumer_park.wake_one();
-                #[cfg(feature = "async")]
-                q.wake_consumer_async();
-                crate::common::cas_backoff(&mut backoff);
-            }
-            q.ready_slot(pos).store(pos + 2, Ordering::Release);
-            q.done_slot(pos).store(pos + cap, Ordering::Release);
-            unused &= unused - 1;
-        }
+        // Hand back any reserved-but-unpublished batch positions.
+        // Without this, dropped producers strand slots and stall the
+        // ring; see BatchAbandon for why the wait it performs stops
+        // once the consumers are gone.
+        BatchAbandon::new(&self.queue).release_all(self.batch_start.get(), self.batch_unused.get());
 
         if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst pairs with consumer's `closed.load(SeqCst)` in
@@ -492,8 +466,7 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
         // SeqCst — see Producer::push.
         q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
         q.consumer_park.wake_one();
-        #[cfg(feature = "async")]
-        q.wake_consumer_async();
+        q.notify_consumers();
         // Skip SlotWriter::drop (which would restore the bit).
         std::mem::forget(self);
     }
@@ -542,8 +515,7 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
         // SeqCst — see Producer::push.
         q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
         q.consumer_park.wake_one();
-        #[cfg(feature = "async")]
-        q.wake_consumer_async();
+        q.notify_consumers();
     }
 }
 
