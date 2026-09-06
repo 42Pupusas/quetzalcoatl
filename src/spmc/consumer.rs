@@ -324,31 +324,60 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
-        let (data_ptr, slot_done, head) = self.claim_slot()?;
-        let done_ptr: *const AtomicUsize = slot_done;
+        let claimed = self.claim_detached()?;
+        Some(self.reader_for(claimed))
+    }
 
-        Some(SlotReader {
+    /// Claims a position, describing it without borrowing `self`.
+    ///
+    /// The blocking path has to tell a lost claim from an empty ring,
+    /// and cannot do that through a returned reader: the reader borrows
+    /// `self` for the rest of the function, so a `None` cannot be
+    /// retried. Holding the claim as raw pointers keeps the loan out of
+    /// the way until [`reader_for`](Self::reader_for) binds it.
+    #[inline]
+    fn claim_detached(&self) -> Option<ClaimedSlot<T>> {
+        let (data_ptr, slot_done, head) = self.claim_slot()?;
+        Some(ClaimedSlot {
             data_ptr,
-            done_ptr,
+            done_ptr: std::ptr::from_ref(slot_done),
             head,
-            cap: self.ring().cap,
-            consumer: self,
         })
     }
 
+    /// Wraps an already-claimed position in its reader.
+    #[inline]
+    fn reader_for(&mut self, claimed: ClaimedSlot<T>) -> SlotReader<'_, T, R> {
+        let cap = self.ring().cap;
+        claimed.into_reader(self, cap)
+    }
+
     /// Returns a zero-copy read reference, blocking when empty.
+    ///
+    /// A claim is what proves ownership; `has_item` only reports that
+    /// the shared head was behind the tail. With several consumers
+    /// competing, a peer can take that position between the two, and
+    /// returning the resulting `None` would end a blocking read on an
+    /// open, non-empty ring. A lost claim is contention, not emptiness:
+    /// the loop restarts.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
         let bit_mask = 1u64 << self.park_slot;
         let mut backoff = 0u32;
         loop {
             if self.has_item() {
-                return self.pop_ref();
+                if let Some(claimed) = self.claim_detached() {
+                    return Some(self.reader_for(claimed));
+                }
+                backoff = 0;
+                continue;
             }
             if self.ring().closed.0.load(Ordering::Acquire) {
-                if self.has_item() {
-                    return self.pop_ref();
+                if let Some(claimed) = self.claim_detached() {
+                    return Some(self.reader_for(claimed));
                 }
+                // Closed and nothing claimable: a peer took whatever
+                // `has_item` saw and no producer will publish again.
                 return None;
             }
             if backoff < BACKOFF_PARK_THRESHOLD {
@@ -371,7 +400,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                     .consumer_park
                     .wake
                     .fetch_and(!bit_mask, Ordering::Relaxed);
-                return self.pop_ref();
+                if let Some(claimed) = self.claim_detached() {
+                    return Some(self.reader_for(claimed));
+                }
+                backoff = 0;
+                continue;
             }
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
@@ -380,8 +413,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                     .consumer_park
                     .wake
                     .fetch_and(!bit_mask, Ordering::Relaxed);
-                if self.has_item() {
-                    return self.pop_ref();
+                if let Some(claimed) = self.claim_detached() {
+                    return Some(self.reader_for(claimed));
                 }
                 return None;
             }
@@ -441,6 +474,36 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             q.wake_producer();
             #[cfg(feature = "async")]
             q.producer_waker.flush();
+        }
+    }
+}
+
+/// A claimed position, held without borrowing the consumer.
+///
+/// The pointers name storage inside the ring, which the consumer's
+/// handle keeps alive; the claim itself is proven by `claim_slot`'s
+/// batch reservation.
+struct ClaimedSlot<T> {
+    data_ptr: *const MaybeUninit<T>,
+    done_ptr: *const AtomicUsize,
+    head: usize,
+}
+
+impl<T> ClaimedSlot<T> {
+    /// Hands the claim to the consumer that made it, as the reader that
+    /// will release it on drop.
+    #[inline]
+    const fn into_reader<R: Deref<Target = RingBuffer<T>>>(
+        self,
+        consumer: &mut Consumer<T, R>,
+        cap: usize,
+    ) -> SlotReader<'_, T, R> {
+        SlotReader {
+            data_ptr: self.data_ptr,
+            done_ptr: self.done_ptr,
+            head: self.head,
+            cap,
+            consumer,
         }
     }
 }

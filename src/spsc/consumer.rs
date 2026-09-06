@@ -229,13 +229,18 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         })
     }
 
-    /// Non-mutating peek: returns true if a `pop_ref` (or `pop`)
-    /// would currently succeed. Used by `pop_ref_block` as the
-    /// pre-park gate — calling `pop_ref` itself for the gate would
-    /// construct a `SlotReader` that, when dropped, advances head
-    /// and consumes the item we wanted to return.
+    /// Returns true if a `pop_ref` (or `pop`) would currently succeed.
+    /// Used by `pop_ref_block` as the pre-park gate — calling `pop_ref`
+    /// itself for the gate would construct a `SlotReader` that, when
+    /// dropped, advances head and consumes the item we wanted to
+    /// return.
+    ///
+    /// Nothing has to be released first: an SPSC reservation holds the
+    /// producer's private cursor and never publishes an abandoned
+    /// position for the consumer to walk over, so `tail > head` always
+    /// means a value. The claim after this gate cannot fail.
     #[inline]
-    fn has_item(&self) -> bool {
+    fn ready_for_claim(&self) -> bool {
         let head = self.ring().head.load(Ordering::Relaxed);
         self.available(head)
     }
@@ -308,8 +313,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         = SlotReader<'a, T, R>
     where
         Self: 'a;
-    fn has_item(&self) -> bool {
-        self.has_item()
+    fn ready_for_claim(&mut self) -> bool {
+        Self::ready_for_claim(self)
     }
     fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
         self.pop_ref()

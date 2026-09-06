@@ -25,6 +25,7 @@
 //! assert_eq!(v, [1, 2]);
 //! ```
 
+mod batch_release;
 mod consumer;
 mod producer;
 mod slot_release;
@@ -259,20 +260,34 @@ impl<T> RingBuffer<T> {
         self.consumer_waker.wake_all();
     }
 
-    /// Wakes one async producer task, if any. Self-gates on `pending`.
+    /// Wakes the async producer tasks waiting for space.
+    ///
+    /// Call sites are unconditional; this and
+    /// [`notify_producers_n`](Self::notify_producers_n) are where the
+    /// async feature enters the producer notification path.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_producer_async(&self) {
+    pub(crate) fn notify_producers(&self) {
         self.producer_waker.wake_all();
     }
 
-    /// Wakes up to `n` async producer tasks, if any. Self-gates on
-    /// `pending`. Mirrors `producer_park.wake_n` for batched drains.
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_producers(&self) {}
+
+    /// Wakes up to `n` async producer tasks. Mirrors
+    /// `producer_park.wake_n` for batched releases.
     #[cfg(feature = "async")]
     #[inline]
-    pub(crate) fn wake_producer_async_n(&self, n: usize) {
+    pub(crate) fn notify_producers_n(&self, n: usize) {
         self.producer_waker.wake_n(n);
     }
+
+    #[cfg(not(feature = "async"))]
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn notify_producers_n(&self, _n: usize) {}
 }
 
 impl<T> Drop for RingBuffer<T> {
@@ -927,6 +942,70 @@ mod tests {
         let count = consumer.drain(|v| items.push(v));
         assert_eq!(count, 2);
         assert_eq!(items, vec![1, 3]);
+    }
+
+    /// A batch that finds only tombstones still releases their
+    /// positions. Publishing `head` only when a value came out cleared
+    /// the slot metadata while leaving the cursor on the tombstone, so
+    /// the capacity was never handed back and the ring stayed full
+    /// forever.
+    #[test]
+    fn tombstone_only_drain_releases_capacity() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+
+        for _ in 0..2 {
+            drop(producer.reserve().expect("a slot is free"));
+        }
+        assert!(producer.is_full(), "both positions are claimed");
+
+        assert_eq!(consumer.drain(drop), 0, "tombstones deliver no values");
+        assert!(consumer.is_empty(), "but their positions must be released");
+
+        producer.push(1).expect("the released capacity is reusable");
+        producer.push(2).expect("and so is the second position");
+        let mut items = Vec::new();
+        assert_eq!(consumer.drain(|v| items.push(v)), 2);
+        assert_eq!(items, vec![1, 2]);
+    }
+
+    /// The same for `drain_up_to`, whose limit counts delivered values
+    /// and so never bounds the tombstone skipping.
+    #[test]
+    fn tombstone_only_drain_up_to_releases_capacity() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+
+        for _ in 0..2 {
+            drop(producer.reserve().expect("a slot is free"));
+        }
+
+        assert_eq!(consumer.drain_up_to(8, drop), 0);
+        assert!(consumer.is_empty(), "positions released");
+        producer.push(7).expect("capacity came back");
+        assert_eq!(consumer.pop(), Some(7));
+    }
+
+    /// A blocking zero-copy read must not report an empty ring because
+    /// the position at its head happened to hold an abandoned
+    /// reservation. The producer is live and publishes right after, so
+    /// the contract says block and deliver that value.
+    #[test]
+    fn pop_ref_block_skips_a_tombstone_and_waits_for_the_value() {
+        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        drop(producer.reserve().expect("the empty ring has a slot"));
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            producer.push(99).unwrap();
+            producer
+        });
+
+        let reader = consumer
+            .pop_ref_block()
+            .expect("the producer is live, so this must block rather than end");
+        assert_eq!(*reader, 99);
+        drop(reader);
+        drop(writer.join().unwrap());
     }
 
     /// A panicking `drain` callback must not lose track of the items

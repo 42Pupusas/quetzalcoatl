@@ -171,16 +171,37 @@ pub trait SingleParkerConsumer<T> {
 /// The gate is `has_item` (non-mutating) — never `try_pop_ref` — because
 /// a discarded reader would advance the head on drop and consume the
 /// item we meant to return.
+///
+/// An observation is not a claim, so the gate has to be strong enough
+/// that the claim after it cannot fail. A gate that merely reported
+/// "the slot at head is not empty" was not: an abandoned reservation
+/// answers yes, and the `try_pop_ref` that follows releases it and
+/// reports an empty ring — `None` from a blocking read on an open
+/// channel with live producers. [`ready_for_claim`] therefore resolves
+/// tombstones itself and reports only a genuine value.
+///
+/// These are the single-consumer topologies, so nothing else advances
+/// the head: a value observed by the gate is still there for the claim.
+///
+/// [`ready_for_claim`]: Self::ready_for_claim
 pub trait SingleParkerConsumerRef {
     /// The borrowing read guard (e.g. `SlotReader<'a, ..>`).
     type Reader<'a>
     where
         Self: 'a;
 
-    /// Non-mutating "is an item ready?" gate.
-    fn has_item(&self) -> bool;
+    /// Whether a value is ready to claim.
+    ///
+    /// Releases any abandoned positions it walks over — they free ring
+    /// capacity, so skipping them is progress worth publishing — but
+    /// never consumes a value, which is what keeps it usable as a
+    /// pre-park gate.
+    ///
+    /// Implementors must guarantee that a `true` here makes the
+    /// following [`try_pop_ref`](Self::try_pop_ref) return `Some`.
+    fn ready_for_claim(&mut self) -> bool;
     /// Claim the ready item by reference. Only called right after
-    /// `has_item()` returned true.
+    /// `ready_for_claim()` returned true.
     fn try_pop_ref(&mut self) -> Option<Self::Reader<'_>>;
     /// True once the producer side is gone.
     fn producer_gone(&self) -> bool;
@@ -194,11 +215,11 @@ pub trait SingleParkerConsumerRef {
     fn pop_ref_block(&mut self) -> Option<Self::Reader<'_>> {
         let mut backoff = 0u32;
         loop {
-            if self.has_item() {
+            if self.ready_for_claim() {
                 return self.try_pop_ref();
             }
             if self.producer_gone() {
-                if self.has_item() {
+                if self.ready_for_claim() {
                     return self.try_pop_ref();
                 }
                 return None;
@@ -210,13 +231,13 @@ pub trait SingleParkerConsumerRef {
             self.arm_park();
             // See pop_block: pairs with the producer's wake-path fence.
             std::sync::atomic::fence(Ordering::SeqCst);
-            if self.has_item() {
+            if self.ready_for_claim() {
                 self.disarm_park();
                 return self.try_pop_ref();
             }
             if self.producer_gone() {
                 self.disarm_park();
-                if self.has_item() {
+                if self.ready_for_claim() {
                     return self.try_pop_ref();
                 }
                 return None;

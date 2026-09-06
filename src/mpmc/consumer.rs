@@ -207,12 +207,24 @@ impl<T, C: Config> Consumer<T, C> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, C>> {
-        let (pos, round_pos) = self.claim_slot()?;
-        Some(SlotReader {
+        let claimed = self.claim_slot()?;
+        Some(self.reader_for(claimed))
+    }
+
+    /// Wraps an already-claimed `(pos, round_pos)` in its reader.
+    ///
+    /// Separating this from the claim lets the blocking path distinguish
+    /// a lost claim from an empty ring, which returning `Option<Reader>`
+    /// from one call cannot: the reader borrows `self`, so the caller
+    /// cannot retry after a `None`.
+    #[inline]
+    const fn reader_for(&mut self, claimed: (usize, usize)) -> SlotReader<'_, T, C> {
+        let (pos, round_pos) = claimed;
+        SlotReader {
             consumer: self,
             pos,
             round_pos,
-        })
+        }
     }
 
     /// Drains all currently-claimable items, calling `f` for each.
@@ -409,6 +421,12 @@ impl<T, C: Config> Consumer<T, C> {
     ///
     /// Same wait protocol as [`pop_block`](Self::pop_block). Useful
     /// when you want zero-copy reads plus blocking.
+    /// A claim is what proves ownership; `has_item` only reports that
+    /// some slot looked published. With several consumers competing,
+    /// a peer can claim that slot between the two, and returning the
+    /// resulting `None` would end a blocking read on an open, non-empty
+    /// ring. A lost claim is therefore contention, not emptiness: the
+    /// loop restarts.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
         let bit_mask = 1u64 << self.park_slot;
@@ -418,12 +436,19 @@ impl<T, C: Config> Consumer<T, C> {
             // Non-mutating gate: avoid CAS-claiming a slot that the
             // discarded SlotReader would then have to release.
             if self.has_item() {
-                return self.pop_ref();
+                if let Some(claimed) = self.claim_slot() {
+                    return Some(self.reader_for(claimed));
+                }
+                backoff = 0;
+                continue;
             }
             if self.queue.closed.0.load(Ordering::Acquire) {
-                if self.has_item() {
-                    return self.pop_ref();
+                if let Some(claimed) = self.claim_slot() {
+                    return Some(self.reader_for(claimed));
                 }
+                // Closed and nothing claimable: a peer took whatever
+                // `has_item` may have seen, and no producer will publish
+                // again, so the ring is drained for this consumer.
                 return None;
             }
             if backoff < BACKOFF_PARK_THRESHOLD {
@@ -444,7 +469,11 @@ impl<T, C: Config> Consumer<T, C> {
                     .consumer_park
                     .wake
                     .fetch_and(!bit_mask, Ordering::Relaxed);
-                return self.pop_ref();
+                if let Some(claimed) = self.claim_slot() {
+                    return Some(self.reader_for(claimed));
+                }
+                backoff = 0;
+                continue;
             }
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
@@ -453,8 +482,8 @@ impl<T, C: Config> Consumer<T, C> {
                     .consumer_park
                     .wake
                     .fetch_and(!bit_mask, Ordering::Relaxed);
-                if self.has_item() {
-                    return self.pop_ref();
+                if let Some(claimed) = self.claim_slot() {
+                    return Some(self.reader_for(claimed));
                 }
                 return None;
             }

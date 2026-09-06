@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::batch_release::BatchRelease;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
 use crate::common::SlotSnapshot;
@@ -32,13 +33,43 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         &self.queue
     }
 
+    /// Whether a value sits at the head, releasing any abandoned
+    /// positions in the way.
+    ///
+    /// A tombstone is not an item. Reporting it as one made
+    /// `pop_ref_block` claim, find nothing, and return `None` from a
+    /// blocking read while producers were still live. Skipping it here
+    /// also hands its slot back — a release published through the
+    /// shared ring rather than through this handle.
     #[inline]
-    fn has_item(&self) -> bool {
-        let head = self.ring().head.load(Ordering::Relaxed);
-        !matches!(
-            self.ring().slot(head).classify(head),
-            SlotSnapshot::NotReady
-        )
+    fn ready_for_claim(&self) -> bool {
+        loop {
+            let head = self.ring().head.load(Ordering::Relaxed);
+            match self.ring().slot(head).classify(head) {
+                SlotSnapshot::Ready(_) => return true,
+                SlotSnapshot::Tombstoned => self.release_tombstone(head),
+                SlotSnapshot::NotReady => return false,
+            }
+        }
+    }
+
+    /// Releases the tombstoned slot at `head` and advances past it.
+    ///
+    /// Skipping a tombstone frees a slot exactly as consuming a value
+    /// does, so it publishes `head` and wakes a producer. Leaving the
+    /// wake out stranded the capacity until an unrelated pop happened to
+    /// come along.
+    #[inline]
+    fn release_tombstone(&self, head: usize) {
+        let ring = self.ring();
+        ring.slot(head)
+            .sequence
+            .store((head + ring.cap) * 2, Ordering::Release);
+        // SeqCst: as in `pop`, the store buffer must drain before the
+        // wake path loads the park bitmap.
+        ring.head.store(head + 1, Ordering::SeqCst);
+        ring.producer_park.wake_one_published();
+        ring.notify_producers();
     }
 
     #[inline]
@@ -51,9 +82,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    slot.sequence
-                        .store((head + self.ring().cap) * 2, Ordering::Release);
-                    self.ring().head.store(head + 1, Ordering::Release);
+                    self.release_tombstone(head);
                     continue;
                 }
                 SlotSnapshot::NotReady => return None,
@@ -76,8 +105,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             self.ring().head.store(head + 1, Ordering::SeqCst);
 
             self.ring().producer_park.wake_one_published();
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async();
+            self.ring().notify_producers();
 
             return Some(val);
         }
@@ -93,9 +121,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    slot.sequence
-                        .store((head + self.ring().cap) * 2, Ordering::Release);
-                    self.ring().head.store(head + 1, Ordering::Release);
+                    self.release_tombstone(head);
                     continue;
                 }
                 SlotSnapshot::NotReady => return None,
@@ -113,18 +139,28 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         }
     }
 
+    /// Drains all currently available items, calling `f` for each.
+    /// Returns the number of values delivered.
+    ///
+    /// Tombstoned positions are skipped and counted as released even
+    /// though they deliver nothing, so a batch that finds only
+    /// tombstones still publishes `head` and hands the space back.
+    ///
+    /// If `f` panics, the positions already taken stay consumed: the
+    /// cursor is published while unwinding.
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
-        let mut head = self.ring().head.load(Ordering::Relaxed);
-        let mut count = 0usize;
+        let ring = self.ring();
+        let mut batch = BatchRelease::new(ring, ring.head.load(Ordering::Relaxed));
 
         loop {
-            let slot = self.ring().slot(head);
+            let head = batch.position();
+            let slot = ring.slot(head);
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
                     slot.sequence
-                        .store((head + self.ring().cap) * 2, Ordering::Release);
-                    head += 1;
+                        .store((head + ring.cap) * 2, Ordering::Release);
+                    batch.skip();
                     continue;
                 }
                 SlotSnapshot::NotReady => break,
@@ -135,35 +171,34 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
-                .store((head + self.ring().cap) * 2, Ordering::Release);
+                .store((head + ring.cap) * 2, Ordering::Release);
 
-            head += 1;
-            count += 1;
+            batch.take();
             f(val);
         }
 
-        if count > 0 {
-            self.ring().head.store(head, Ordering::Release);
-            self.ring().producer_park.wake_n(count);
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async_n(count);
-        }
-
-        count
+        batch.delivered()
     }
 
+    /// Drains up to `limit` items, calling `f` for each. Returns the
+    /// number of values delivered.
+    ///
+    /// The limit counts delivered values; skipped tombstones are not
+    /// charged against it. Panic and release behaviour match
+    /// [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
-        let mut head = self.ring().head.load(Ordering::Relaxed);
-        let mut count = 0usize;
+        let ring = self.ring();
+        let mut batch = BatchRelease::new(ring, ring.head.load(Ordering::Relaxed));
 
-        while count < limit {
-            let slot = self.ring().slot(head);
+        while batch.delivered() < limit {
+            let head = batch.position();
+            let slot = ring.slot(head);
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
                     slot.sequence
-                        .store((head + self.ring().cap) * 2, Ordering::Release);
-                    head += 1;
+                        .store((head + ring.cap) * 2, Ordering::Release);
+                    batch.skip();
                     continue;
                 }
                 SlotSnapshot::NotReady => break,
@@ -174,21 +209,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
-                .store((head + self.ring().cap) * 2, Ordering::Release);
+                .store((head + ring.cap) * 2, Ordering::Release);
 
-            head += 1;
-            count += 1;
+            batch.take();
             f(val);
         }
 
-        if count > 0 {
-            self.ring().head.store(head, Ordering::Release);
-            self.ring().producer_park.wake_n(count);
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async_n(count);
-        }
-
-        count
+        batch.delivered()
     }
 
     pub fn drain_block(&mut self, mut f: impl FnMut(T)) -> usize {
@@ -290,8 +317,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         = SlotReader<'a, T, R>
     where
         Self: 'a;
-    fn has_item(&self) -> bool {
-        self.has_item()
+    fn ready_for_claim(&mut self) -> bool {
+        Self::ready_for_claim(self)
     }
     fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
         self.pop_ref()

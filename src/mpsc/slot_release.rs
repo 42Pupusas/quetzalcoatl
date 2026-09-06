@@ -47,7 +47,6 @@ impl<T> Drop for SlotRelease<'_, T> {
         // inside `wake_one_published`.
         self.ring.head.store(self.head + 1, Ordering::SeqCst);
         self.ring.producer_park.wake_one_published();
-        #[cfg(feature = "async")]
-        self.ring.wake_producer_async();
+        self.ring.notify_producers();
     }
 }
