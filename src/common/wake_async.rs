@@ -278,6 +278,24 @@ mod tests {
         assert_eq!(first.count(), 1);
     }
 
+    /// A single future parking and being woken must never touch the
+    /// overflow mutex. `pending` is never cleared, so every later wake
+    /// on this ring reaches `wake_all` -- if that always locks, one
+    /// async waiter puts a mutex on every wake for the ring's lifetime.
+    #[test]
+    fn a_slotted_waiter_never_touches_the_overflow_mutex() {
+        let set = WakerSet::new();
+        let waker = Waker::from(CountingWaker::new());
+        let slot = ParkSlot::from_exclusive_index(0);
+
+        for _ in 0..64 {
+            set.register(slot, &Context::from_waker(&waker));
+            set.wake_all();
+        }
+
+        assert_eq!(set.overflow.lock_count(), 0);
+    }
+
     /// Two futures sharing one endpoint's slot must both be woken: the
     /// displaced registration belongs to a future that is still parked.
     #[test]
