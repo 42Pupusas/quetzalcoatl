@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`UncommittedSlot` owns the written-but-unpublished value.** Between
+  `write` and `commit` a producer holds an initialized value no
+  consumer can reach. All five rings tracked that with a `committed:
+  bool` beside a raw pointer and an `if !self.committed { …
+  drop_in_place() }` in `Drop`.
+
+  The flag and the pointer are now one type. `WrittenSlot::commit`
+  disarms it before publishing, and `Drop` asks
+  `drop_if_uncommitted()`, whose return value says whether the ring
+  still owes its own release — a tombstone in mpsc, an abandonment
+  marker in broadcast, a returned batch bit in mpmc, and nothing in
+  spsc/spmc, whose `Drop` impls are gone entirely.
+
+  The ordering rule that makes a panicking waker safe (disarm first,
+  publish second) was stated in five doc comments and enforced by
+  none. It is now a property of the type each ring holds.
+
 - **`Capacity` now owns ring indexing.** It already held `cap` and its
   `mask`, and enforced the power-of-two invariant that makes
   `pos & mask` a valid index. Every ring then unpacked it into two

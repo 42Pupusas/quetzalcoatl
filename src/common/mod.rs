@@ -28,6 +28,7 @@ pub mod seq_slot;
 pub mod single_parker;
 pub mod sole_parker;
 pub mod thread_parker;
+pub mod uncommitted_slot;
 #[cfg(feature = "async")]
 pub mod wake_async;
 #[cfg(feature = "async")]
@@ -38,4 +39,5 @@ pub use cache_padded::CachePadded;
 #[cfg(test)]
 pub use drop_counter::{BorrowedDropCounter, DropCounter};
 pub use seq_slot::{SeqSlot, SlotSnapshot, TOMBSTONE};
+pub use uncommitted_slot::UncommittedSlot;
 pub use single_parker::{SingleParkerConsumer, SingleParkerConsumerRef, SingleParkerProducer};

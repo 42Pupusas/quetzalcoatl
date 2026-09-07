@@ -25,6 +25,7 @@ include = [
     "src/common/park_registration.rs",
     "src/common/park_registry.rs",
     "src/common/thread_parker.rs",
+    "src/common/uncommitted_slot.rs",
     "src/common/wake_async.rs",
     "src/common/waker_overflow.rs",
     "src/mpmc/**/*.rs",

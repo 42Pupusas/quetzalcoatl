@@ -7,6 +7,7 @@ use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
+use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
@@ -268,12 +269,13 @@ impl<'a, T> SlotWriter<'a, T> {
         // SAFETY: Exclusive access (single producer), valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
-            slot_data: this.slot_data,
+            // SAFETY: just initialized above; the slot is unpublished,
+            // and the Producer's borrow keeps the buffer alive.
+            value: unsafe { UncommittedSlot::armed(this.slot_data) },
             tail: this.tail,
             write_pos: this.write_pos,
             pos: this.pos,
             queue: this.queue,
-            committed: false,
         }
     }
 
@@ -313,12 +315,11 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// next claim. That leaks, which is safe, and never exposes
 /// uninitialized or aliased data to a consumer.
 pub struct WrittenSlot<'a, T> {
-    slot_data: *mut MaybeUninit<T>,
+    value: UncommittedSlot<T>,
     tail: &'a AtomicUsize,
     write_pos: &'a std::cell::Cell<usize>,
     pos: usize,
     queue: &'a RingBuffer<T>,
-    committed: bool,
 }
 
 // SAFETY: Same as SlotWriter -- exclusive access to a slot in a RingBuffer
@@ -334,7 +335,7 @@ impl<T> WrittenSlot<'_, T> {
     /// see.
     #[inline]
     pub fn commit(mut self) {
-        self.committed = true;
+        self.value.commit();
         self.write_pos.set(self.pos + 1);
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
@@ -343,15 +344,5 @@ impl<T> WrittenSlot<'_, T> {
     }
 }
 
-impl<T> Drop for WrittenSlot<'_, T> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // SAFETY: write() initialized this slot, and it was never
-            // published, so no consumer can have observed it.
-            unsafe {
-                self.slot_data.cast::<T>().drop_in_place();
-            }
-            // `write_pos` was never advanced — nothing to roll back.
-        }
-    }
-}
+// `write_pos` is only advanced by commit, so an uncommitted drop owes
+// no release beyond the value itself, which `UncommittedSlot` handles.

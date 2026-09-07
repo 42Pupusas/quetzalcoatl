@@ -7,6 +7,7 @@ use std::task::Poll;
 use super::batch_abandon::BatchAbandon;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::backoff::Backoff;
+use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -431,10 +432,13 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
         // Skip SlotWriter::drop — WrittenSlot now owns the rollback.
         let this = std::mem::ManuallyDrop::new(self);
         WrittenSlot {
+            // SAFETY: just initialized above; we hold the bit for `pos`
+            // exclusively and never published, so no consumer can see
+            // it. The producer borrow keeps the buffer alive.
+            value: unsafe { UncommittedSlot::armed(data_ptr) },
             producer: this.producer,
             pos: this.pos,
             bit: this.bit,
-            committed: false,
         }
     }
 
@@ -477,10 +481,10 @@ impl<T, C: Config> Drop for SlotWriter<'_, T, C> {
 /// in place and the reservation is rolled back (the bit is restored
 /// to `batch_unused`).
 pub struct WrittenSlot<'a, T, C: Config = DefaultConfig> {
+    value: UncommittedSlot<T>,
     producer: &'a Producer<T, C>,
     pos: usize,
     bit: u32,
-    committed: bool,
 }
 
 // SAFETY: same as SlotWriter — exclusive access via the producer
@@ -496,7 +500,7 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
     /// see, nor hand the position back to the batch.
     #[inline]
     pub fn commit(mut self) {
-        self.committed = true;
+        self.value.commit();
         let q = &*self.producer.queue;
         // SeqCst — see Producer::push.
         q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
@@ -507,18 +511,7 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
 
 impl<T, C: Config> Drop for WrittenSlot<'_, T, C> {
     fn drop(&mut self) {
-        if !self.committed {
-            // SAFETY: write() initialized this slot; we still hold
-            // the bit for `pos` exclusively (no consumer has seen
-            // ready[pos] = pos+1 because we never published).
-            unsafe {
-                self.producer
-                    .queue
-                    .data_slot(self.pos)
-                    .get()
-                    .cast::<T>()
-                    .drop_in_place();
-            }
+        if self.value.drop_if_uncommitted() {
             // Restore the bit so the position can be reused.
             let unused = self.producer.batch_unused.get();
             self.producer.batch_unused.set(unused | (1u32 << self.bit));

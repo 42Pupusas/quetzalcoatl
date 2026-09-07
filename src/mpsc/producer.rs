@@ -10,7 +10,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
-use crate::common::TOMBSTONE;
+use crate::common::{UncommittedSlot, TOMBSTONE};
 
 /// The producer side of an MPSC ring buffer.
 ///
@@ -373,11 +373,12 @@ impl<'a, T> SlotWriter<'a, T> {
         // SAFETY: The claim gives exclusive access and a valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
-            slot_data: this.slot_data,
+            // SAFETY: just initialized above; the claim is exclusive and
+            // the Producer's Arc keeps the buffer alive.
+            value: unsafe { UncommittedSlot::armed(this.slot_data) },
             slot_seq: this.slot_seq,
             pos: this.pos,
             queue: this.queue,
-            committed: false,
         }
     }
 
@@ -411,11 +412,10 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// Call [`commit`](Self::commit) to publish. Dropped without
 /// committing → value is dropped and slot is tombstoned.
 pub struct WrittenSlot<'a, T> {
-    slot_data: *mut MaybeUninit<T>,
+    value: UncommittedSlot<T>,
     slot_seq: &'a AtomicUsize,
     pos: usize,
     queue: &'a RingBuffer<T>,
-    committed: bool,
 }
 
 // SAFETY: Same as SlotWriter -- exclusive access to a slot in a RingBuffer
@@ -431,7 +431,7 @@ impl<T> WrittenSlot<'_, T> {
     /// can already see.
     #[inline]
     pub fn commit(mut self) {
-        self.committed = true;
+        self.value.commit();
         self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
@@ -441,11 +441,7 @@ impl<T> WrittenSlot<'_, T> {
 
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
-        if !self.committed {
-            // SAFETY: write() initialized this slot data.
-            unsafe {
-                self.slot_data.cast::<T>().drop_in_place();
-            }
+        if self.value.drop_if_uncommitted() {
             self.slot_seq.store(TOMBSTONE, Ordering::Release);
             self.queue.wake_consumer();
             #[cfg(feature = "async")]

@@ -9,6 +9,7 @@ use super::slot_reuse::SlotReuse;
 use super::slot_state::SlotState;
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
+use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -442,11 +443,12 @@ impl<'a, T> SlotWriter<'a, T> {
         // SAFETY: Exclusive access via CAS claim, valid pointer.
         unsafe { (*this.slot_data).write(val) };
         WrittenSlot {
-            slot_data: this.slot_data,
+            // SAFETY: just initialized above; the CAS claim is exclusive
+            // and the Producer's Arc keeps the buffer alive.
+            value: unsafe { UncommittedSlot::armed(this.slot_data) },
             slot_sequence: this.slot_sequence,
             pos: this.pos,
             queue: this.queue,
-            committed: false,
         }
     }
 
@@ -485,11 +487,10 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// Call [`commit`](Self::commit) to publish. Dropped without
 /// committing → value is dropped and slot is tombstoned.
 pub struct WrittenSlot<'a, T> {
-    slot_data: *mut MaybeUninit<T>,
+    value: UncommittedSlot<T>,
     slot_sequence: &'a AtomicUsize,
     pos: usize,
     queue: &'a RingBuffer<T>,
-    committed: bool,
 }
 
 // SAFETY: Same as SlotWriter -- exclusive access to a slot in a RingBuffer
@@ -505,7 +506,7 @@ impl<T> WrittenSlot<'_, T> {
     /// consumers can already see.
     #[inline]
     pub fn commit(mut self) {
-        self.committed = true;
+        self.value.commit();
         self.slot_sequence
             .store(SlotState::published_word(self.pos), Ordering::Release);
         self.queue.notify_consumers();
@@ -514,11 +515,7 @@ impl<T> WrittenSlot<'_, T> {
 
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
-        if !self.committed {
-            // SAFETY: write() initialized this slot data.
-            unsafe {
-                self.slot_data.cast::<T>().drop_in_place();
-            }
+        if self.value.drop_if_uncommitted() {
             // See SlotWriter::drop: abandonment is a progress event for
             // consumers at this position and for producers waiting on
             // the aliasing slot.
