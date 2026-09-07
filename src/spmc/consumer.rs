@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -123,7 +123,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     fn claim_batch(&self, mask: usize) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
         let q = self.ring();
 
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             let head = q.cursors.head().load(Ordering::Relaxed);
             let mut tail = self.cached_tail.get();
@@ -156,7 +156,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 self.batch_end.set(new_head);
                 return Some(self.bind_pos(head, mask));
             }
-            crate::common::cas_backoff(&mut backoff);
+            backoff.spin();
         }
     }
 
@@ -257,7 +257,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     pub fn pop_block(&self) -> Option<T> {
         let q = self.ring();
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if let Some(v) = self.pop() {
                 return Some(v);
@@ -268,8 +268,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 }
                 return None;
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -360,13 +359,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if self.has_item() {
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
                 }
-                backoff = 0;
+                backoff.reset();
                 continue;
             }
             if self.ring().closed.is_closed() {
@@ -377,8 +376,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 // `has_item` saw and no producer will publish again.
                 return None;
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -391,7 +389,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 if let Some(claimed) = self.claim_detached() {
                     return Some(self.reader_for(claimed));
                 }
-                backoff = 0;
+                backoff.reset();
                 continue;
             }
             // SeqCst: post-arm half of the close handshake, paired

@@ -1,4 +1,5 @@
 pub mod atomics;
+pub mod backoff;
 pub mod close_state;
 pub mod cursors;
 #[cfg(all(test, loom, feature = "async"))]
@@ -81,7 +82,7 @@ pub trait SingleParkerProducer<T> {
     /// frees space. Returns `Err(val)` only when the consumer side is
     /// gone. Spins via the shared backoff schedule, then parks.
     fn push_block(&self, mut val: T) -> Result<(), T> {
-        let mut backoff = 0u32;
+        let mut backoff = backoff::Backoff::new();
         loop {
             if self.consumer_gone() {
                 return Err(val);
@@ -90,8 +91,7 @@ pub trait SingleParkerProducer<T> {
                 Ok(()) => return Ok(()),
                 Err(returned) => val = returned,
             }
-            if backoff < park::BACKOFF_PARK_THRESHOLD {
-                cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
             self.arm_park();
@@ -143,7 +143,7 @@ pub trait SingleParkerConsumer<T> {
     /// publishes. Returns `None` only once the producer is gone and the
     /// ring has drained.
     fn pop_block(&mut self) -> Option<T> {
-        let mut backoff = 0u32;
+        let mut backoff = backoff::Backoff::new();
         loop {
             if let Some(v) = self.try_pop() {
                 return Some(v);
@@ -153,8 +153,7 @@ pub trait SingleParkerConsumer<T> {
                 // drop; that item must be drained before returning None.
                 return self.try_pop();
             }
-            if backoff < park::BACKOFF_PARK_THRESHOLD {
-                cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
             self.arm_park();
@@ -225,7 +224,7 @@ pub trait SingleParkerConsumerRef {
     /// Zero-copy pop, blocking until an item is ready. Returns `None`
     /// only once the producer is gone and the ring has drained.
     fn pop_ref_block(&mut self) -> Option<Self::Reader<'_>> {
-        let mut backoff = 0u32;
+        let mut backoff = backoff::Backoff::new();
         loop {
             if self.ready_for_claim() {
                 return self.try_pop_ref();
@@ -236,8 +235,7 @@ pub trait SingleParkerConsumerRef {
                 }
                 return None;
             }
-            if backoff < park::BACKOFF_PARK_THRESHOLD {
-                cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
             self.arm_park();
@@ -417,47 +415,6 @@ impl<T> Drop for AlignedBuf<T> {
 // Send/Sync follow from T's bounds, same as Box<[T]>.
 unsafe impl<T: Send> Send for AlignedBuf<T> {}
 unsafe impl<T: Sync> Sync for AlignedBuf<T> {}
-
-/// Exponential backoff for CAS contention. Marked `#[inline(never)]` to
-/// keep the hot CAS loop's instruction footprint small — this code only
-/// matters under real contention.
-///
-/// Schedule:
-/// - calls 1-2: no spin (counter ramp-up only)
-/// - calls 3-7: 4, 8, 16, 32, 64 pauses (~17μs total)
-/// - calls 8+: 64 pauses (capped) + `yield_now` once we've spun
-///   long enough (~17μs) that the holder is more likely preempted
-///   than just slow. The yield is sparse — once the counter
-///   saturates — so it doesn't fire on contention bursts.
-#[inline(never)]
-pub fn cas_backoff(failures: &mut u32) {
-    // Under Miri, spin_loop() is an interleaving point. Exponential
-    // spin counts explode the state space, so we just yield instead.
-    // The counter still advances: it gates the park branch, and pinning
-    // it at zero makes every waiter spin forever and hides all
-    // park/unpark logic from Miri.
-    #[cfg(miri)]
-    {
-        std::thread::yield_now();
-        *failures = failures.saturating_add(1).min(12);
-    }
-    #[cfg(not(miri))]
-    {
-        let f = *failures;
-        if f > 1 {
-            for _ in 0..1u32 << f.min(6) {
-                std::hint::spin_loop();
-            }
-        }
-        // After we've saturated at f=6 and called again, we've spun
-        // 64 pauses repeatedly. Yield to give the holder a chance to
-        // run if it was preempted.
-        if f >= 8 {
-            std::thread::yield_now();
-        }
-        *failures = f.saturating_add(1).min(12);
-    }
-}
 
 /// Cache-line-sized padding to prevent false sharing between atomics.
 #[repr(align(64))]

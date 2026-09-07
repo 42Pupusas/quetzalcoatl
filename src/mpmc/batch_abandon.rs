@@ -49,7 +49,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
     fn release(&self, pos: usize) {
         let q = self.queue;
         let done = q.done_slot(pos);
-        let mut backoff = 0u32;
+        let mut backoff = crate::common::backoff::Backoff::new();
         while done.load(Ordering::Acquire) != pos {
             // SeqCst: the post-arm half of the close handshake, as in
             // the blocking paths.
@@ -62,7 +62,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
             // cycle.
             q.consumer_park.wake_one();
             q.notify_consumers();
-            crate::common::cas_backoff(&mut backoff);
+            backoff.spin();
         }
         q.ready_slot(pos).store(pos + 2, Ordering::Release);
         // SeqCst: drains the store buffer so the wake below cannot miss

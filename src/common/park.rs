@@ -36,15 +36,6 @@ pub const PARK_MASK: usize = PARK_SLOTS - 1;
 #[allow(clippy::cast_possible_truncation)]
 const PARK_MASK_U32: u32 = (PARK_SLOTS as u32) - 1;
 
-/// `cas_backoff` failure-counter threshold past which the slow path
-/// stops spinning and parks.
-///
-/// The schedule in [`crate::common::cas_backoff`] saturates at f=12
-/// (64 pauses per call + sparse `yield_now`); waiting that long means
-/// we've already burned ~tens of microseconds and a futex round-trip
-/// (1–10μs) is amortized.
-pub const BACKOFF_PARK_THRESHOLD: u32 = 12;
-
 /// One side's park state — a 64-bit wake bitmap plus a parker table
 /// of `Thread` handles indexed by park slot. Producers and consumers
 /// have independent [`WakeSet`]s.

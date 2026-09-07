@@ -7,7 +7,7 @@ use std::task::Poll;
 use super::slot_release::SlotRelease;
 use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -325,7 +325,7 @@ impl<T, C: Config> Consumer<T, C> {
     pub fn pop_block(&self) -> Option<T> {
         let q = &*self.queue;
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if let Some(v) = self.pop() {
                 return Some(v);
@@ -337,10 +337,9 @@ impl<T, C: Config> Consumer<T, C> {
                 }
                 return None;
             }
-            // Spin until cas_backoff fully escalates (~tens of μs
+            // Spin until the schedule fully escalates (~tens of μs
             // including yields) before paying for park.
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -420,7 +419,7 @@ impl<T, C: Config> Consumer<T, C> {
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
         let park_slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             // Non-mutating gate: avoid CAS-claiming a slot that the
             // discarded SlotReader would then have to release.
@@ -428,7 +427,7 @@ impl<T, C: Config> Consumer<T, C> {
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
-                backoff = 0;
+                backoff.reset();
                 continue;
             }
             if self.queue.closed.is_closed() {
@@ -440,8 +439,7 @@ impl<T, C: Config> Consumer<T, C> {
                 // again, so the ring is drained for this consumer.
                 return None;
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -454,7 +452,7 @@ impl<T, C: Config> Consumer<T, C> {
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
-                backoff = 0;
+                backoff.reset();
                 continue;
             }
             // SeqCst: post-arm half of the close handshake, paired

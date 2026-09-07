@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -93,7 +93,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let mut current_tail = self.ring().cursors.tail().load(Ordering::Relaxed);
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
                 let head = self.ring().cursors.head().load(Ordering::Acquire);
@@ -116,7 +116,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 }
                 Err(observed_tail) => {
                     current_tail = observed_tail;
-                    crate::common::cas_backoff(&mut backoff);
+                    backoff.spin();
                 }
             }
         }
@@ -152,7 +152,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = self.ring();
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if q.consumer_closed.is_closed() {
                 return Err(val);
@@ -161,8 +161,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Ok(()) => return Ok(()),
                 Err(returned) => val = returned,
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -190,7 +189,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             slot.park();
             q.producer_park.disarm(slot);
-            backoff = 0;
+            backoff.reset();
         }
     }
 
@@ -275,7 +274,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
     fn claim_slot_block(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if self.ring().consumer_closed.is_closed() {
                 return None;
@@ -283,8 +282,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             if let Some(claim) = self.claim_slot() {
                 return Some(claim);
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -302,7 +300,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             slot.park();
             self.ring().producer_park.disarm(slot);
-            backoff = 0;
+            backoff.reset();
         }
     }
 

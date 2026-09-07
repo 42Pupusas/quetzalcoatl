@@ -6,7 +6,7 @@ use std::task::Poll;
 
 use super::batch_abandon::BatchAbandon;
 use super::{Config, DefaultConfig, RingBuffer};
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -224,7 +224,7 @@ impl<T, C: Config> Producer<T, C> {
     /// when you want zero-copy writes plus blocking.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T, C>> {
         let park_slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if self.queue.consumer_closed.is_closed() {
                 return None;
@@ -235,8 +235,7 @@ impl<T, C: Config> Producer<T, C> {
             if self.reserve().is_some() {
                 return self.reserve();
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -272,7 +271,7 @@ impl<T, C: Config> Producer<T, C> {
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = &*self.queue;
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             match self.push(val) {
                 Ok(()) => return Ok(()),
@@ -281,10 +280,9 @@ impl<T, C: Config> Producer<T, C> {
             if q.consumer_closed.is_closed() {
                 return Err(val);
             }
-            // Spin until cas_backoff fully escalates (~tens of μs
+            // Spin until the schedule fully escalates (~tens of μs
             // including yields) before paying for park.
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 

@@ -8,7 +8,7 @@ use super::consumer_floor::ConsumerFloor;
 use super::slot_reuse::SlotReuse;
 use super::slot_state::SlotState;
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
@@ -91,7 +91,7 @@ impl<T> Producer<T> {
     /// a producer only ever owns a slot it is allowed to write.
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         let reuse = SlotReuse::new(self.queue.cap);
         let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
         let pos = loop {
@@ -114,7 +114,7 @@ impl<T> Producer<T> {
                 Ok(_) => break current_tail,
                 Err(observed) => {
                     current_tail = observed;
-                    crate::common::cas_backoff(&mut backoff);
+                    backoff.spin();
                 }
             }
         };
@@ -230,7 +230,7 @@ impl<T> Producer<T> {
     pub fn push_block(&self, mut val: T) -> Result<(), T> {
         let q = &*self.queue;
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         // Gate on `has_space()` (a real min_head scan) *before* calling
         // `push`. `push`/`claim_slot` does an unconditional `tail.fetch_add`
         // and then spins unboundedly on `min_head` if the slot it claimed
@@ -251,13 +251,12 @@ impl<T> Producer<T> {
                     Ok(()) => return Ok(()),
                     Err(returned) => {
                         val = returned;
-                        backoff = 0;
+                        backoff.reset();
                         continue;
                     }
                 }
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
@@ -277,13 +276,13 @@ impl<T> Producer<T> {
             }
             if self.has_space() {
                 q.producer_park.disarm(slot);
-                backoff = 0;
+                backoff.reset();
                 continue;
             }
 
             slot.park();
             q.producer_park.disarm(slot);
-            backoff = 0;
+            backoff.reset();
         }
     }
 
@@ -294,7 +293,7 @@ impl<T> Producer<T> {
     /// Same wait protocol as [`push_block`](Self::push_block).
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
         let slot = self.park_slot;
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if !any_consumer_active(&self.queue) {
                 return None;
@@ -302,8 +301,7 @@ impl<T> Producer<T> {
             if self.has_space() {
                 return self.reserve();
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 

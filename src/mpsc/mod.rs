@@ -1512,7 +1512,7 @@ mod tests {
         drop(p);
 
         // Give producers time to attempt the push and park. 50ms is
-        // plenty for them to escalate cas_backoff and reach park.
+        // plenty for them to escalate the backoff and reach park.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Single drain — frees CAP=4 slots. With wake_n(4) all 4

@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING: `cas_backoff` is replaced by the `Backoff` type.** The
+  free function took `&mut u32` and every caller kept that counter
+  itself, which meant the schedule was only half of it. The other half
+  was `if backoff < BACKOFF_PARK_THRESHOLD` before the call and
+  `backoff = 0` after a park, written out at fourteen sites across
+  five rings, with the threshold exported as a separate constant so
+  the comparison could be spelled the same way each time.
+
+  `Backoff` owns the counter and names the three operations: `spin`
+  for a CAS retry that will never park, `spin_unless_exhausted` for
+  the pre-park gate that spins and reports whether to continue, and
+  `reset` after a park returns or a lap sees progress it cannot use.
+  `BACKOFF_PARK_THRESHOLD` is gone; the threshold is now internal,
+  since the comparison it existed for is no longer at the call sites.
+
+  Code using it as a building block changes from
+  `let mut b = 0u32; cas_backoff(&mut b)` to
+  `let mut b = Backoff::new(); b.spin()`.
 - **The head/tail cursor pair is now owned by `Cursors`.** spsc, mpsc
   and spmc each declared two `CachePadded<AtomicUsize>` cursors and
   then restated the same three derived operations against them:

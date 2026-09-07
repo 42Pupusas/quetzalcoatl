@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
@@ -158,7 +158,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// Returns `None` only when the last
     /// [`Consumer`](super::Consumer) has been dropped.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             if self.ring().consumer_closed.is_closed() {
                 return None;
@@ -166,8 +166,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             if self.has_space() {
                 return self.reserve();
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 

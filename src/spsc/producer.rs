@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::RingBuffer;
-use crate::common::park::BACKOFF_PARK_THRESHOLD;
+use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
@@ -182,7 +182,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     /// [`reserve`](Self::reserve) for non-blocking or
     /// [`push_block`](Self::push_block) for value-copy writes.
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
-        let mut backoff = 0u32;
+        let mut backoff = Backoff::new();
         loop {
             // Check consumer_closed *before* attempting reserve.
             // Once the consumer drops it sets `consumer_closed = true`;
@@ -196,8 +196,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             if self.has_space() {
                 return self.reserve();
             }
-            if backoff < BACKOFF_PARK_THRESHOLD {
-                crate::common::cas_backoff(&mut backoff);
+            if backoff.spin_unless_exhausted() {
                 continue;
             }
 
