@@ -41,6 +41,7 @@
 pub mod arc;
 mod consumer;
 mod consumer_floor;
+mod consumer_registry;
 mod producer;
 mod slot_reuse;
 mod slot_state;
@@ -60,11 +61,12 @@ use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
+use consumer_registry::ConsumerRegistry;
 use slot_state::SequenceWord;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub(super) struct BroadcastSlot<T> {
@@ -88,12 +90,6 @@ impl<T> BroadcastSlot<T> {
     }
 }
 
-/// Per-consumer slot in the fixed-size consumer registry.
-pub(super) struct ConsumerSlot {
-    pub head: CachePadded<AtomicUsize>,
-    pub active: AtomicBool,
-}
-
 /// Lock-free MPMC broadcast ring buffer.
 ///
 /// Every consumer sees every item published after it subscribes.
@@ -105,7 +101,7 @@ pub(super) struct ConsumerSlot {
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<BroadcastSlot<T>>,
     pub(crate) capacity: Capacity,
-    pub(crate) consumer_slots: Box<[ConsumerSlot]>,
+    consumers: ConsumerRegistry,
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Shared L2 cache of the consumer floor's position. Updated by any
     /// producer after a full scan; read by all producers to avoid
@@ -164,18 +160,11 @@ impl<T> RingBuffer<T> {
     /// Panics if `max_consumers` is 0.
     #[must_use]
     pub fn new(capacity: Capacity, max_consumers: usize) -> Self {
-        assert!(max_consumers > 0, "max_consumers must be > 0");
         let cap = capacity.get();
         let buf = AlignedBuf::new_with(cap, || BroadcastSlot {
             data: UnsafeCell::new(MaybeUninit::uninit()),
             sequence: SequenceWord::vacant(),
         });
-        let consumer_slots: Vec<ConsumerSlot> = (0..max_consumers)
-            .map(|_| ConsumerSlot {
-                head: CachePadded(AtomicUsize::new(0)),
-                active: AtomicBool::new(false),
-            })
-            .collect();
         Self {
             buf,
             capacity,
@@ -183,7 +172,7 @@ impl<T> RingBuffer<T> {
             min_head_cache: CachePadded(AtomicUsize::new(0)),
             producer_park: WakeSet::new(),
             producer_park_slots: ParkRegistry::new(),
-            consumer_slots: consumer_slots.into_boxed_slice(),
+            consumers: ConsumerRegistry::new(max_consumers),
             #[cfg(feature = "async")]
             producer_count: EndpointCount::new(),
             #[cfg(feature = "async")]
@@ -256,9 +245,7 @@ impl<T> RingBuffer<T> {
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
 
-        // Claim the first consumer slot.
-        arc.consumer_slots[0].active.store(true, Ordering::Relaxed);
-        arc.consumer_slots[0].head.store(0, Ordering::Relaxed);
+        let slot_index = arc.consumers.subscribe_first();
 
         let park_slot = arc.producer_park_slots.lease();
         let producer = Producer {
@@ -268,32 +255,14 @@ impl<T> RingBuffer<T> {
         };
         let consumer = Consumer {
             queue: arc,
-            slot_index: 0,
+            slot_index,
         };
         (producer, consumer)
     }
 
-    /// Scans the consumer registry for the slowest active head.
-    ///
-    /// Returns [`ConsumerFloor::NoConsumers`] when no consumer is
-    /// active. That case is kept distinct from a position so callers
-    /// cannot compare an already-claimed slot against a floor ahead of
-    /// it; see [`ConsumerFloor`].
+    /// The slowest active consumer's position; see [`ConsumerFloor`].
     pub(super) fn consumer_floor(&self) -> ConsumerFloor {
-        let mut min = usize::MAX;
-        for slot in &*self.consumer_slots {
-            if slot.active.load(Ordering::Relaxed) {
-                let head = slot.head.load(Ordering::Acquire);
-                if head < min {
-                    min = head;
-                }
-            }
-        }
-        if min == usize::MAX {
-            ConsumerFloor::NoConsumers
-        } else {
-            ConsumerFloor::At(min)
-        }
+        self.consumers.floor()
     }
 
     /// Returns the number of items between the slowest consumer and the tail.
@@ -316,24 +285,6 @@ impl<T> RingBuffer<T> {
         self.len() >= self.capacity.get()
     }
 
-    /// Claims an inactive consumer slot. Returns the slot index.
-    ///
-    /// Panics if all consumer slots are taken.
-    pub(crate) fn claim_consumer_slot(&self) -> usize {
-        for (i, slot) in self.consumer_slots.iter().enumerate() {
-            if slot
-                .active
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return i;
-            }
-        }
-        panic!(
-            "broadcast: max consumer limit ({}) exceeded",
-            self.consumer_slots.len()
-        );
-    }
 }
 
 impl<T> Drop for RingBuffer<T> {

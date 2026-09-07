@@ -41,13 +41,9 @@ impl<T> Clone for Consumer<T> {
     /// Panics if the maximum consumer count is exceeded.
     fn clone(&self) -> Self {
         let tail = self.queue.tail.load(Ordering::Acquire);
-        let idx = self.queue.claim_consumer_slot();
-        self.queue.consumer_slots[idx]
-            .head
-            .store(tail, Ordering::Relaxed);
         Self {
             queue: Arc::clone(&self.queue),
-            slot_index: idx,
+            slot_index: self.queue.consumers.subscribe_at(tail),
         }
     }
 }
@@ -57,9 +53,7 @@ impl<T> Drop for Consumer<T> {
         // Deactivate this consumer's slot. Does NOT drain items —
         // data is shared with other consumers and cleaned up by
         // the producer (on overwrite) or RingBuffer (on drop).
-        self.queue.consumer_slots[self.slot_index]
-            .active
-            .store(false, Ordering::Release);
+        self.queue.consumers.unsubscribe(self.slot_index);
         // Flush blocking producers parked in push_block/reserve_block.
         // Going inactive raises `min_head` (this consumer no longer
         // pins a slot) and may have been the last consumer — either way
@@ -83,9 +77,7 @@ impl<T> Consumer<T> {
     /// a capacity-releasing event a blocked producer must learn about.
     #[inline]
     fn advance_head(&self, head: usize) {
-        self.queue.consumer_slots[self.slot_index]
-            .head
-            .store(head + 1, Ordering::Release);
+        self.queue.consumers.publish_head_past(self.slot_index, head);
         self.queue.wake_producer();
         self.queue.notify_producers();
     }
@@ -105,9 +97,7 @@ impl<T> Consumer<T> {
         T: Clone,
     {
         loop {
-            let head = self.queue.consumer_slots[self.slot_index]
-                .head
-                .load(Ordering::Relaxed);
+            let head = self.queue.consumers.head_of(self.slot_index);
 
             let slot = self.queue.slot(head);
 
@@ -189,9 +179,7 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         loop {
-            let head = self.queue.consumer_slots[self.slot_index]
-                .head
-                .load(Ordering::Relaxed);
+            let head = self.queue.consumers.head_of(self.slot_index);
 
             let slot = self.queue.slot(head);
 
@@ -217,10 +205,7 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn len(&self) -> usize {
         let tail = self.queue.tail.load(Ordering::Relaxed);
-        let head = self.queue.consumer_slots[self.slot_index]
-            .head
-            .load(Ordering::Relaxed);
-        tail.wrapping_sub(head)
+        tail.wrapping_sub(self.queue.consumers.head_of(self.slot_index))
     }
 
     /// Returns `true` if this consumer has no items to read.

@@ -41,16 +41,6 @@ impl<T> Clone for Producer<T> {
     }
 }
 
-/// Returns true if at least one consumer slot is currently active.
-/// Used by `push_block` / `push_async` to detect "all consumers gone"
-/// without an explicit consumer-count atomic — the per-slot `active`
-/// flags are the existing source of truth.
-fn any_consumer_active<T>(q: &RingBuffer<T>) -> bool {
-    q.consumer_slots
-        .iter()
-        .any(|s| s.active.load(Ordering::Acquire))
-}
-
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
         self.queue.producer_park_slots.release(self.park_slot);
@@ -180,7 +170,7 @@ impl<T> Producer<T> {
     /// `cap` positions with no consumer ever having existed.
     #[inline]
     fn permits_with_refresh(&self, pos: usize) -> bool {
-        if any_consumer_active(&self.queue) {
+        if self.queue.consumers.any_subscribed() {
             if self.cached_floor().permits(pos, self.queue.capacity.get()) {
                 return true;
             }
@@ -238,7 +228,7 @@ impl<T> Producer<T> {
         // forever and never reaches the park below. `has_space` claims
         // nothing, so we only `push` once a slot is genuinely free.
         loop {
-            if !any_consumer_active(q) {
+            if !q.consumers.any_subscribed() {
                 return Err(val);
             }
             if self.has_space() {
@@ -270,7 +260,7 @@ impl<T> Producer<T> {
             // (or dropped) between our has_space check and the fetch_or
             // would otherwise have nothing left to wake us. Either we make
             // progress here, or the consumer's wake_one/flush sees the bit.
-            if !any_consumer_active(q) {
+            if !q.consumers.any_subscribed() {
                 q.producer_park.disarm(slot);
                 return Err(val);
             }
@@ -295,7 +285,7 @@ impl<T> Producer<T> {
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
-            if !any_consumer_active(&self.queue) {
+            if !self.queue.consumers.any_subscribed() {
                 return None;
             }
             if self.has_space() {
@@ -309,7 +299,7 @@ impl<T> Producer<T> {
             // See push_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            if !any_consumer_active(&self.queue) {
+            if !self.queue.consumers.any_subscribed() {
                 self.queue.producer_park.disarm(slot);
                 return None;
             }
@@ -343,7 +333,7 @@ impl<T> Producer<T> {
             // No active consumers means a push would just sit until
             // overwritten — treat as Err so producers can detect the
             // shutdown.
-            if !any_consumer_active(&self.queue) {
+            if !self.queue.consumers.any_subscribed() {
                 return Poll::Ready(Err(v));
             }
             match self.push(v) {
@@ -351,7 +341,7 @@ impl<T> Producer<T> {
                 Err(returned) => {
                     val = Some(returned);
                     parked.arm(cx);
-                    if !any_consumer_active(&self.queue) {
+                    if !self.queue.consumers.any_subscribed() {
                         return Poll::Ready(Err(val.take().unwrap()));
                     }
                     match self.push(val.take().unwrap()) {

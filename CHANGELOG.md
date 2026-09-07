@@ -16,6 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **`ConsumerRegistry` owns the broadcast consumer table.**
+  `ConsumerSlot` was declared inline in `broadcast/mod.rs` with both
+  fields `pub(crate)`, and its protocol was spread across three files:
+  `mod.rs` CAS'd the active flag and scanned for the slowest head,
+  `consumer.rs` loaded and stored heads through the raw slot array at
+  six sites, and `producer.rs` answered "is anyone still listening?"
+  from a free function walking the array.
+
+  The registry now owns the seats and the questions asked of them:
+  `subscribe_first` / `subscribe_at` / `unsubscribe` / `head_of` /
+  `publish_head_past` / `floor` / `any_subscribed`. `ConsumerSlot`'s
+  fields drop to private — nothing outside broadcast used them.
+
+  The asm probe caught a real regression in the first cut: the
+  registry's accessors carry no generics, so without `#[inline]` LLVM
+  would not pull the single-load `head_of` or the single-store
+  `publish_head_past` across the crate boundary, and the consumer hot
+  path gained two real calls per lap. Generic code (like `SequenceWord`'s
+  methods) inlines across crates by default; these needed the attribute
+  spelled out. With it, push/pop/pop_ref/reserve+commit are again
+  byte-identical to 598f63e (20/76/91/31 instructions).
+
 - **`SequenceWord` owns the broadcast slot's sequence word.**
   `SlotState` could already decode the word, but the `AtomicUsize`
   itself was passed around raw — threaded through `SlotWriter` and
