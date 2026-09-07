@@ -235,10 +235,26 @@ impl<T, C: Config> RingBuffer<T, C> {
     /// Call sites are unconditional; this pair is where the
     /// `backstop-metrics` feature enters the park path.
     #[cfg(feature = "backstop-metrics")]
-    pub(crate) const fn watch_backstop(&self) -> backstop_monitor::BackstopWatch {
+    pub(crate) const fn watch_backstop_producer(&self) -> backstop_monitor::BackstopWatch {
         // SAFETY: the monitor lives in this ring, which every caller
         // holds through an `Arc` for the whole of its park loop.
-        unsafe { backstop_monitor::BackstopWatch::new(std::ptr::from_ref(&self.backstop)) }
+        unsafe {
+            backstop_monitor::BackstopWatch::new(
+                std::ptr::from_ref(&self.backstop),
+                backstop_monitor::WaiterSide::Producer,
+            )
+        }
+    }
+
+    #[cfg(feature = "backstop-metrics")]
+    pub(crate) const fn watch_backstop_consumer(&self) -> backstop_monitor::BackstopWatch {
+        // SAFETY: as above.
+        unsafe {
+            backstop_monitor::BackstopWatch::new(
+                std::ptr::from_ref(&self.backstop),
+                backstop_monitor::WaiterSide::Consumer,
+            )
+        }
     }
 
     #[cfg(not(feature = "backstop-metrics"))]
@@ -246,7 +262,16 @@ impl<T, C: Config> RingBuffer<T, C> {
         clippy::unused_self,
         reason = "signature mirrors the instrumented twin so call sites need no cfg"
     )]
-    pub(crate) const fn watch_backstop(&self) -> backstop_monitor::BackstopWatch {
+    pub(crate) const fn watch_backstop_producer(&self) -> backstop_monitor::BackstopWatch {
+        backstop_monitor::BackstopWatch
+    }
+
+    #[cfg(not(feature = "backstop-metrics"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "signature mirrors the instrumented twin so call sites need no cfg"
+    )]
+    pub(crate) const fn watch_backstop_consumer(&self) -> backstop_monitor::BackstopWatch {
         backstop_monitor::BackstopWatch
     }
 
@@ -2031,6 +2056,13 @@ mod tests {
             }
         });
 
+        #[cfg(feature = "backstop-metrics")]
+        let (
+            mut futile_total,
+            mut producer_futile_total,
+            mut rescue_total,
+            mut timeout_total,
+        ) = (0u64, 0u64, 0u64, 0u64);
         for iter in 0..200 {
             if iter % 10 == 0 {
                 eprintln!("iter {iter}");
@@ -2104,6 +2136,10 @@ mod tests {
                 if stats.saw_rescue() || stats.saw_futile_wake() {
                     eprintln!("iter {iter}: {stats:?}");
                 }
+                futile_total += stats.futile_wakes;
+                producer_futile_total += stats.producer_futile_wakes;
+                rescue_total += stats.rescues;
+                timeout_total += stats.unwoken_timeouts;
                 assert!(
                     !stats.saw_unexplained_rescue(),
                     "iter {iter}: a waiter was rescued by the timeout with no peer parked to \
@@ -2115,6 +2151,11 @@ mod tests {
         }
         test_done.store(true, Ordering::Release);
         watchdog.join().unwrap();
+        #[cfg(feature = "backstop-metrics")]
+        eprintln!(
+            "TOTALS futile={futile_total} (producer={producer_futile_total}) \
+             rescues={rescue_total} unwoken_timeouts={timeout_total}"
+        );
     }
 
     #[test]

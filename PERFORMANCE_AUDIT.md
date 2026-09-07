@@ -246,6 +246,48 @@ What is proven: the pin is real, and a wake can be spent on a producer
 that cannot use it. What is *not* proven: that this is what strands a
 producer in the wild. The stress rescues remain too few to attribute.
 
+### Position-targeted wakes: built, measured, rejected
+
+The obvious fix follows from the pin: have a waiter publish the
+position it is blocked on, and have a waker that frees one specific
+position wake *that* waiter rather than picking one by rotation. It was
+built — a table of awaited positions beside the wake bitmap, targeting
+with a fallback to rotation when nobody is pinned, producers reporting
+the lowest position in their batch, and both `Consumer::pop` and
+`SlotRelease` routing by the position they free.
+
+It is not in the tree. Measured against baseline on
+`block_stress_diagnostic`:
+
+| | futile wakes | of which producer | unwoken timeouts |
+|---|---|---|---|
+| baseline, run 1 | 46 | 9 | 5 |
+| baseline, run 2 | 51 | 13 | 0 |
+| targeted | 28 | 8 | 1 |
+
+Producer futile wakes are the only figure targeting can move, and 8
+against a baseline of 9 and 13 is noise. The drop in the total is
+consumer-side variance, not an effect of the change.
+
+Splitting the counter by side is what showed this, and it is the
+finding worth keeping: **roughly 80% of futile wakes are consumers**,
+which no amount of position routing can address, because a consumer
+scans for any published slot and is genuinely interchangeable. The
+misrouting story explains a real mechanism but a small share of the
+observed events.
+
+One run of the targeted build also produced a `sole_waiter_rescue`, the
+first this campaign has ever seen, which did not reproduce. Whether the
+targeting introduced it or merely perturbed the timing was not
+established — another reason not to keep an unproven change on the park
+path.
+
+The negative result redirects the question: before routing wakes
+better, find out what the *consumer* futile wakes are. A woken consumer
+that finds nothing has usually lost the slot to a peer that claimed it
+first, which is ordinary contention rather than a lost wake, but that
+is a hypothesis and not yet a measurement.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -267,6 +309,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
-7. **Settle whether futile wakes cause the residual rescues.** The mechanism is now proven deterministically (see "The pin, proven without threads"): a producer holding a partial batch waits on one exact position, and a `pop` can spend its single wake on a producer that cannot use the freed slot. What is still unproven is that this is what strands a producer under stress — the rescues are too few to attribute. Run both wake policies for thousands of iterations and compare rescues *per unwoken timeout*, not per run. Note the rate-limiting event is the unwoken timeout (3 per 200 iterations), so a powered comparison needs a campaign on the order of tens of thousands of iterations per policy, i.e. hours. If the link holds, the fix is to route wakes by the position a waiter awaits rather than by park slot, which means the wake bitmap must carry that position instead of just "someone is parked here." That is a protocol change, so measure first.
+7. **Find out what the consumer futile wakes are.** Splitting the counter by side showed roughly 80% of futile wakes fall on consumers (see "Position-targeted wakes"), which position routing cannot touch. The likely explanation is an ordinary lost race — a woken consumer whose slot was claimed by a peer first — which would make them a cost rather than a defect. Confirm or refute that before treating the total as a defect count. Position-targeted wakes were built for the producer side and measured as no better than baseline; the code was reverted rather than kept on the strength of the mechanism alone.
 8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

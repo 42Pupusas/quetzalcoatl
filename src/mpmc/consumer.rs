@@ -293,7 +293,7 @@ impl<T, C: Config> Consumer<T, C> {
         let q = &*self.queue;
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
-        let mut watch = q.watch_backstop();
+        let mut watch = q.watch_backstop_consumer();
         loop {
             if let Some(v) = self.pop() {
                 watch.made_progress();
@@ -397,7 +397,7 @@ impl<T, C: Config> Consumer<T, C> {
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
         let park_slot = self.park_slot;
         let mut backoff = Backoff::new();
-        let mut watch = self.queue.watch_backstop();
+        let mut watch = self.queue.watch_backstop_consumer();
         loop {
             // Non-mutating gate: avoid CAS-claiming a slot that the
             // discarded SlotReader would then have to release.

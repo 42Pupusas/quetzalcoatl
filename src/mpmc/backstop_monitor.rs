@@ -88,6 +88,14 @@ pub struct BackstopStats {
     /// Rescues where no other waiter was parked on this side, so
     /// round-robin cannot explain the wake going elsewhere.
     pub sole_waiter_rescues: u64,
+    /// Futile wakes suffered by producers specifically.
+    ///
+    /// Only producers can be pinned to a position, so only theirs can
+    /// be removed by routing a wake to the position it frees. Counting
+    /// both sides together hides that: a consumer scans for any
+    /// published slot and its futile wakes are ordinary lost races,
+    /// not misrouting.
+    pub producer_futile_wakes: u64,
     /// Parks that a peer's wake genuinely ended, but whose waiter
     /// then found nothing to do and parked again.
     ///
@@ -138,6 +146,19 @@ pub struct BackstopMonitor {
     rescues: AtomicU64,
     sole_waiter_rescues: AtomicU64,
     futile_wakes: AtomicU64,
+    producer_futile_wakes: AtomicU64,
+}
+
+/// Which side of the ring a watched waiter sits on.
+///
+/// Producers can be pinned to a specific position; consumers take any
+/// published slot. The distinction decides whether a futile wake is
+/// something wake routing could have prevented.
+#[cfg(feature = "backstop-metrics")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaiterSide {
+    Producer,
+    Consumer,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -148,6 +169,7 @@ impl BackstopMonitor {
             rescues: AtomicU64::new(0),
             sole_waiter_rescues: AtomicU64::new(0),
             futile_wakes: AtomicU64::new(0),
+            producer_futile_wakes: AtomicU64::new(0),
         }
     }
 
@@ -162,8 +184,11 @@ impl BackstopMonitor {
         }
     }
 
-    fn record_futile_wake(&self) {
+    fn record_futile_wake(&self, side: WaiterSide) {
         self.futile_wakes.fetch_add(1, Ordering::Relaxed);
+        if matches!(side, WaiterSide::Producer) {
+            self.producer_futile_wakes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Reads both counters.
@@ -177,6 +202,7 @@ impl BackstopMonitor {
             rescues: self.rescues.load(Ordering::Relaxed),
             sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
             futile_wakes: self.futile_wakes.load(Ordering::Relaxed),
+            producer_futile_wakes: self.producer_futile_wakes.load(Ordering::Relaxed),
         }
     }
 }
@@ -200,6 +226,7 @@ impl Default for BackstopMonitor {
 #[cfg(feature = "backstop-metrics")]
 pub struct BackstopWatch {
     monitor: *const BackstopMonitor,
+    side: WaiterSide,
     timed_out: bool,
     sole_waiter: bool,
     woken: bool,
@@ -210,9 +237,10 @@ impl BackstopWatch {
     /// # Safety
     ///
     /// `monitor` must stay live until this watch is dropped.
-    pub(super) const unsafe fn new(monitor: *const BackstopMonitor) -> Self {
+    pub(super) const unsafe fn new(monitor: *const BackstopMonitor, side: WaiterSide) -> Self {
         Self {
             monitor,
+            side,
             timed_out: false,
             sole_waiter: false,
             woken: false,
@@ -234,7 +262,7 @@ impl BackstopWatch {
     /// no work, and is parking again.
     pub(crate) fn about_to_park(&mut self, peers_parked: u32) {
         if std::mem::replace(&mut self.woken, false) {
-            self.monitor().record_futile_wake();
+            self.monitor().record_futile_wake(self.side);
         }
         self.sole_waiter = peers_parked == 0;
     }

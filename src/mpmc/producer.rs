@@ -231,7 +231,7 @@ impl<T, C: Config> Producer<T, C> {
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T, C>> {
         let park_slot = self.park_slot;
         let mut backoff = Backoff::new();
-        let mut watch = self.queue.watch_backstop();
+        let mut watch = self.queue.watch_backstop_producer();
         loop {
             if self.queue.consumer_closed.is_closed() {
                 return None;
@@ -287,7 +287,7 @@ impl<T, C: Config> Producer<T, C> {
         let q = &*self.queue;
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
-        let mut watch = q.watch_backstop();
+        let mut watch = q.watch_backstop_producer();
         loop {
             match self.push(val) {
                 Ok(()) => {

@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interchangeable, so the pin requires out-of-order consumption to
   arise — which is why the residual rate is low rather than constant.
 
+  The count is now split by side, because only producers can be pinned
+  to a position. That split is what settled the fix: **roughly 80% of
+  futile wakes are consumers**, who scan for any published slot and are
+  genuinely interchangeable. Wake routing by awaited position was built
+  for the producer side and measured no better than baseline (8 producer
+  futile wakes against a baseline of 9 and 13), so it was reverted
+  rather than kept on the strength of its mechanism. See
+  `PERFORMANCE_AUDIT.md`.
+
   Off by default: the ring carries no counters and the call sites
   compile to nothing.
 
