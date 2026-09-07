@@ -1,12 +1,12 @@
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
 use super::consumer_floor::ConsumerFloor;
 use super::slot_reuse::SlotReuse;
-use super::slot_state::SlotState;
+use super::slot_state::SequenceWord;
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
 use crate::common::UncommittedSlot;
@@ -91,7 +91,7 @@ impl<T> Producer<T> {
     /// never advance. Validating the position as part of the claim means
     /// a producer only ever owns a slot it is allowed to write.
     #[inline]
-    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &SequenceWord, usize)> {
         let mut backoff = Backoff::new();
         let reuse = SlotReuse::new(self.queue.capacity.get());
         let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
@@ -124,8 +124,7 @@ impl<T> Producer<T> {
 
         // Drop old value if this slot was previously written.
         if std::mem::needs_drop::<T>() {
-            let old = slot.sequence.swap(SlotState::VACANT, Ordering::Acquire);
-            if SlotState::decode(old).holds_value() {
+            if slot.sequence.claim_taking_previous().holds_value() {
                 // SAFETY: a published marker means data was initialized
                 // by a prior push. We own the slot via our CAS claim.
                 unsafe {
@@ -133,7 +132,7 @@ impl<T> Producer<T> {
                 }
             }
         } else {
-            slot.sequence.store(SlotState::VACANT, Ordering::Relaxed);
+            slot.sequence.claim();
         }
 
         Some((slot.data.get(), &slot.sequence, pos))
@@ -153,7 +152,7 @@ impl<T> Producer<T> {
             Some((data_ptr, slot_seq, pos)) => {
                 // SAFETY: We exclusively own this slot via our CAS claim.
                 unsafe { (*data_ptr).write(val) };
-                slot_seq.store(SlotState::published_word(pos), Ordering::Release);
+                slot_seq.publish(pos);
                 self.queue.notify_consumers();
                 Ok(())
             }
@@ -416,7 +415,7 @@ impl<T> Producer<T> {
 /// Dropped without writing → slot is tombstoned (consumers skip it).
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_sequence: &'a AtomicUsize,
+    slot_sequence: &'a SequenceWord,
     pos: usize,
     queue: &'a RingBuffer<T>,
 }
@@ -460,8 +459,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.slot_sequence
-            .store(SlotState::published_word(self.pos), Ordering::Release);
+        self.slot_sequence.publish(self.pos);
         self.queue.notify_consumers();
         std::mem::forget(self);
     }
@@ -474,8 +472,7 @@ impl<T> Drop for SlotWriter<'_, T> {
         // aliasing slot can now reclaim it. Both are progress and both
         // need the wake — without it a consumer parked on this position
         // waits for a publication that will never come.
-        self.slot_sequence
-            .store(SlotState::abandoned_word(self.pos), Ordering::Release);
+        self.slot_sequence.abandon(self.pos);
         self.queue.notify_consumers();
         self.queue.wake_producer();
         self.queue.notify_producers();
@@ -488,7 +485,7 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// committing → value is dropped and slot is tombstoned.
 pub struct WrittenSlot<'a, T> {
     value: UncommittedSlot<T>,
-    slot_sequence: &'a AtomicUsize,
+    slot_sequence: &'a SequenceWord,
     pos: usize,
     queue: &'a RingBuffer<T>,
 }
@@ -507,8 +504,7 @@ impl<T> WrittenSlot<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.value.commit();
-        self.slot_sequence
-            .store(SlotState::published_word(self.pos), Ordering::Release);
+        self.slot_sequence.publish(self.pos);
         self.queue.notify_consumers();
     }
 }
@@ -519,8 +515,7 @@ impl<T> Drop for WrittenSlot<'_, T> {
             // See SlotWriter::drop: abandonment is a progress event for
             // consumers at this position and for producers waiting on
             // the aliasing slot.
-            self.slot_sequence
-                .store(SlotState::abandoned_word(self.pos), Ordering::Release);
+            self.slot_sequence.abandon(self.pos);
             self.queue.notify_consumers();
             self.queue.wake_producer();
             self.queue.notify_producers();

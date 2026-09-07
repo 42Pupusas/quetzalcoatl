@@ -60,7 +60,7 @@ use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
-use slot_state::SlotState;
+use slot_state::SequenceWord;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -69,11 +69,12 @@ use std::sync::Arc;
 
 pub(super) struct BroadcastSlot<T> {
     pub data: UnsafeCell<MaybeUninit<T>>,
-    /// See [`SlotState`] for the encoding. Unlike the MPSC/SPMC rings,
-    /// broadcast markers must name their position: a consumer never
-    /// clears one (the other consumers still have to see it), so a
-    /// positionless marker would be re-read on every later lap.
-    pub sequence: AtomicUsize,
+    /// See [`SlotState`](slot_state::SlotState) for the encoding. Unlike
+    /// the MPSC/SPMC rings, broadcast markers must name their position:
+    /// a consumer never clears one (the other consumers still have to
+    /// see it), so a positionless marker would be re-read on every later
+    /// lap.
+    sequence: SequenceWord,
 }
 
 impl<T> BroadcastSlot<T> {
@@ -83,7 +84,7 @@ impl<T> BroadcastSlot<T> {
         &self,
         pos: usize,
     ) -> crate::common::SlotSnapshot<*const MaybeUninit<T>> {
-        SlotState::classify(&self.sequence, &self.data, pos)
+        self.sequence.classify(&self.data, pos)
     }
 }
 
@@ -167,7 +168,7 @@ impl<T> RingBuffer<T> {
         let cap = capacity.get();
         let buf = AlignedBuf::new_with(cap, || BroadcastSlot {
             data: UnsafeCell::new(MaybeUninit::uninit()),
-            sequence: AtomicUsize::new(SlotState::VACANT),
+            sequence: SequenceWord::vacant(),
         });
         let consumer_slots: Vec<ConsumerSlot> = (0..max_consumers)
             .map(|_| ConsumerSlot {
@@ -354,8 +355,7 @@ impl<T> Drop for RingBuffer<T> {
         let start = tail.wrapping_sub(tail.min(self.capacity.get()));
         for pos in start..tail {
             let slot = &mut self.buf[self.capacity.index_of(pos)];
-            let seq = *slot.sequence.get_mut();
-            if SlotState::decode(seq).holds_value() {
+            if slot.sequence.state_mut().holds_value() {
                 // SAFETY: a published marker means data was initialized
                 // by a producer and not cleared by a subsequent
                 // claim_slot. Exclusive access in drop (&mut self)

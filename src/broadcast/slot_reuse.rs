@@ -1,10 +1,6 @@
 //! Producer-side ownership of a slot's previous occupant.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Sequence value of a slot that a producer has claimed but not yet
-/// published or tombstoned.
-const IN_PROGRESS: usize = 0;
+use super::slot_state::SequenceWord;
 
 /// Whether the slot backing a position may be reused yet.
 ///
@@ -20,8 +16,8 @@ const IN_PROGRESS: usize = 0;
 /// producers the same storage.
 ///
 /// The test is local: the slot backing `pos` holds position
-/// `pos - cap`, and [`IN_PROGRESS`] there means its occupant is
-/// unresolved.
+/// `pos - cap`, and an unresolved claim there means its occupant is
+/// still being written.
 pub(super) struct SlotReuse {
     cap: usize,
 }
@@ -33,8 +29,8 @@ impl SlotReuse {
 
     /// Whether the previous occupant of the slot backing `pos` has
     /// resolved. Positions in the first lap have no previous occupant.
-    pub(super) fn prior_occupant_resolved(&self, pos: usize, sequence: &AtomicUsize) -> bool {
-        pos < self.cap || sequence.load(Ordering::Acquire) != IN_PROGRESS
+    pub(super) fn prior_occupant_resolved(&self, pos: usize, sequence: &SequenceWord) -> bool {
+        pos < self.cap || !sequence.is_claim_in_progress()
     }
 }
 
@@ -45,7 +41,7 @@ mod tests {
     #[test]
     fn first_lap_has_no_prior_occupant() {
         let reuse = SlotReuse::new(4);
-        let seq = AtomicUsize::new(IN_PROGRESS);
+        let seq = SequenceWord::vacant();
         assert!(reuse.prior_occupant_resolved(0, &seq));
         assert!(reuse.prior_occupant_resolved(3, &seq));
     }
@@ -53,19 +49,21 @@ mod tests {
     #[test]
     fn outstanding_reservation_blocks_reuse() {
         let reuse = SlotReuse::new(4);
-        let seq = AtomicUsize::new(IN_PROGRESS);
+        let seq = SequenceWord::vacant();
         assert!(!reuse.prior_occupant_resolved(4, &seq));
         assert!(!reuse.prior_occupant_resolved(400, &seq));
     }
 
     #[test]
     fn published_or_abandoned_occupant_permits_reuse() {
-        use super::super::slot_state::SlotState;
-
         let reuse = SlotReuse::new(4);
-        let published = AtomicUsize::new(SlotState::published_word(0));
+
+        let published = SequenceWord::vacant();
+        published.publish(0);
         assert!(reuse.prior_occupant_resolved(4, &published));
-        let abandoned = AtomicUsize::new(SlotState::abandoned_word(0));
+
+        let abandoned = SequenceWord::vacant();
+        abandoned.abandon(0);
         assert!(reuse.prior_occupant_resolved(4, &abandoned));
     }
 }

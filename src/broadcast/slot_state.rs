@@ -5,6 +5,81 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A broadcast slot's sequence word.
+///
+/// The word is the slot's whole protocol: a producer claims by storing
+/// [`SlotState::VACANT`], then resolves the claim by publishing or
+/// abandoning it at its own position. Consumers only ever read.
+///
+/// See [`SlotState`] for what the stored words mean.
+#[repr(transparent)]
+pub(super) struct SequenceWord(AtomicUsize);
+
+impl SequenceWord {
+    /// A word for a slot that has never been written.
+    pub(super) const fn vacant() -> Self {
+        Self(AtomicUsize::new(SlotState::VACANT))
+    }
+
+    /// Publishes the value written at `pos`, making it readable.
+    #[inline]
+    pub(super) fn publish(&self, pos: usize) {
+        self.0
+            .store(SlotState::published_word(pos), Ordering::Release);
+    }
+
+    /// Marks the reservation at `pos` as resolved without a value.
+    ///
+    /// The marker names `pos` so a consumer that walks past it does not
+    /// read it again as its own on a later lap.
+    #[inline]
+    pub(super) fn abandon(&self, pos: usize) {
+        self.0
+            .store(SlotState::abandoned_word(pos), Ordering::Release);
+    }
+
+    /// Takes the slot for a new claim, reporting what it held.
+    ///
+    /// `Acquire` on the swap pairs with the publishing producer's
+    /// `Release`, so a returned [`SlotState::Published`] guarantees the
+    /// value it names is visible to this thread — which is what makes
+    /// dropping it sound.
+    #[inline]
+    pub(super) fn claim_taking_previous(&self) -> SlotState {
+        SlotState::decode(self.0.swap(SlotState::VACANT, Ordering::Acquire))
+    }
+
+    /// Takes the slot for a new claim, discarding what it held.
+    ///
+    /// For a `T` with no drop glue, where the previous state cannot
+    /// oblige this producer to do anything.
+    #[inline]
+    pub(super) fn claim(&self) {
+        self.0.store(SlotState::VACANT, Ordering::Relaxed);
+    }
+
+    /// Whether a producer's reservation on this slot is still unresolved.
+    #[inline]
+    pub(super) fn is_claim_in_progress(&self) -> bool {
+        self.0.load(Ordering::Acquire) == SlotState::VACANT
+    }
+
+    /// Classifies the slot for a consumer reading `pos`.
+    #[inline]
+    pub(super) fn classify<T>(
+        &self,
+        data: &UnsafeCell<MaybeUninit<T>>,
+        pos: usize,
+    ) -> SlotSnapshot<*const MaybeUninit<T>> {
+        SlotState::classify(&self.0, data, pos)
+    }
+
+    /// The state at teardown, when the ring is uniquely borrowed.
+    pub(super) fn state_mut(&mut self) -> SlotState {
+        SlotState::decode(*self.0.get_mut())
+    }
+}
+
 /// What a broadcast slot's sequence word says about the slot.
 ///
 /// Broadcast consumers cannot clear a marker after reading it — every
@@ -91,6 +166,72 @@ impl SlotState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_word_reads_as_vacant() {
+        let mut word = SequenceWord::vacant();
+        assert_eq!(word.state_mut(), SlotState::Vacant);
+    }
+
+    #[test]
+    fn a_fresh_word_is_an_unresolved_claim() {
+        assert!(SequenceWord::vacant().is_claim_in_progress());
+    }
+
+    #[test]
+    fn publishing_and_abandoning_both_resolve_the_claim() {
+        let published = SequenceWord::vacant();
+        published.publish(7);
+        assert!(!published.is_claim_in_progress());
+
+        let abandoned = SequenceWord::vacant();
+        abandoned.abandon(7);
+        assert!(!abandoned.is_claim_in_progress());
+    }
+
+    #[test]
+    fn a_claim_reports_the_published_value_it_displaces() {
+        let word = SequenceWord::vacant();
+        word.publish(3);
+        assert!(word.claim_taking_previous().holds_value());
+    }
+
+    #[test]
+    fn a_claim_over_an_abandoned_slot_owes_no_destructor() {
+        let word = SequenceWord::vacant();
+        word.abandon(3);
+        assert!(!word.claim_taking_previous().holds_value());
+    }
+
+    #[test]
+    fn a_claim_leaves_the_slot_unresolved_again() {
+        let word = SequenceWord::vacant();
+        word.publish(3);
+        let _ = word.claim_taking_previous();
+        assert!(word.is_claim_in_progress());
+    }
+
+    #[test]
+    fn the_teardown_state_agrees_with_what_was_published() {
+        let mut word = SequenceWord::vacant();
+        assert_eq!(word.state_mut(), SlotState::Vacant);
+        word.publish(9);
+        assert_eq!(word.state_mut(), SlotState::Published(9));
+        word.abandon(9);
+        assert_eq!(word.state_mut(), SlotState::Abandoned(9));
+    }
+
+    #[test]
+    fn the_word_is_the_width_of_the_atomic_it_wraps() {
+        assert_eq!(
+            std::mem::size_of::<SequenceWord>(),
+            std::mem::size_of::<AtomicUsize>()
+        );
+        assert_eq!(
+            std::mem::align_of::<SequenceWord>(),
+            std::mem::align_of::<AtomicUsize>()
+        );
+    }
 
     #[test]
     fn words_round_trip_through_decode() {

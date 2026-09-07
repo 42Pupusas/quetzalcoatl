@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **`SequenceWord` owns the broadcast slot's sequence word.**
+  `SlotState` could already decode the word, but the `AtomicUsize`
+  itself was passed around raw — threaded through `SlotWriter` and
+  `WrittenSlot` as a bare `&AtomicUsize`, with `store(published_word(pos),
+  Release)` spelled out at three sites and `store(abandoned_word(pos),
+  Release)` at two.
+
+  This removed a genuine duplicate: `slot_reuse` declared its own
+  `IN_PROGRESS = 0` for the value `slot_state` calls `VACANT`, the same
+  constant defined twice in two modules with nothing keeping them
+  equal. The claim check is now `is_claim_in_progress`, and the
+  constant has one home.
+
 - **`DoneWord` owns the SPMC slot's release word.** The consumer's
   `done[s] = pos + cap` was written out at five sites and the
   producer's matching `load(Acquire) == pos` at two, with the teardown
