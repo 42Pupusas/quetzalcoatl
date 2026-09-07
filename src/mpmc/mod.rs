@@ -439,6 +439,10 @@ mod tests {
 
         let stats = ring.backstop_stats();
         assert!(
+            stats.saw_unexplained_rescue(),
+            "the consumer was the only waiter, so nothing can explain the lost wake away: {stats:?}"
+        );
+        assert!(
             stats.saw_rescue(),
             "the backstop released a waiter whose wake went missing, so it must be counted: {stats:?}"
         );
@@ -1853,6 +1857,11 @@ mod tests {
                 if stats.saw_rescue() {
                     eprintln!("iter {iter}: backstop rescue — {stats:?}");
                 }
+                assert!(
+                    !stats.saw_unexplained_rescue(),
+                    "iter {iter}: a waiter was rescued by the timeout with no peer parked to \
+                     absorb its wake — round-robin cannot explain this: {stats:?}"
+                );
             }
             drop(stats_q);
             progress.fetch_add(1, Ordering::Release);

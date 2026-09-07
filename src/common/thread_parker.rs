@@ -32,9 +32,10 @@
 //! so the handle a waker claims mid-call names the thread that armed it.
 //! Staleness only spans calls, which is exactly what re-arming fixes.
 
+use super::atomics::{thread, AtomicPtr};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::thread::Thread;
+use std::sync::atomic::Ordering;
+use thread::Thread;
 
 /// A re-armable park handle for one waiter.
 pub struct ThreadParker {
@@ -42,8 +43,19 @@ pub struct ThreadParker {
 }
 
 impl ThreadParker {
+    // Loom's `AtomicPtr::new` is not const, so the loom twin takes the
+    // weaker form; std callers keep const use.
+    #[cfg(not(loom))]
     #[must_use]
     pub const fn new() -> Self {
+        Self {
+            handle: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    #[cfg(loom)]
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             handle: AtomicPtr::new(ptr::null_mut()),
         }
@@ -57,7 +69,7 @@ impl ThreadParker {
     /// a handle here.
     #[inline]
     pub fn arm(&self) {
-        let next = Box::into_raw(Box::new(std::thread::current()));
+        let next = Box::into_raw(Box::new(thread::current()));
         let prev = self.handle.swap(next, Ordering::AcqRel);
         if !prev.is_null() {
             // SAFETY: the swap removed `prev` from the slot, so this
@@ -100,8 +112,8 @@ impl ThreadParker {
     /// Test-only: identifies *which* thread a wake would reach, which
     /// is the property that separates a re-armable parker from a
     /// write-once one.
-    #[cfg(test)]
-    fn armed_id(&self) -> Option<std::thread::ThreadId> {
+    #[cfg(all(test, not(loom)))]
+    fn armed_id(&self) -> Option<thread::ThreadId> {
         let armed = self.handle.load(Ordering::Acquire);
         if armed.is_null() {
             return None;
@@ -121,7 +133,9 @@ impl Default for ThreadParker {
 
 impl Drop for ThreadParker {
     fn drop(&mut self) {
-        let stored = *self.handle.get_mut();
+        // Loom's AtomicPtr has no `get_mut`; a Relaxed load is
+        // equivalent here, since `&mut self` proves exclusivity.
+        let stored = self.handle.load(Ordering::Relaxed);
         if !stored.is_null() {
             // SAFETY: `&mut self` proves no peer holds a reference, and
             // the pointer was last published by `arm`.
@@ -162,6 +176,8 @@ mod tests {
     /// This is the migration case: a handle parks, is woken by
     /// something other than its peer, and parks again elsewhere. A
     /// write-once cell keeps naming the first thread.
+    #[cfg_attr(loom, ignore = "spawns real threads; the loom twin models this")]
+    #[cfg(not(loom))]
     #[test]
     fn rearming_without_an_intervening_wake_replaces_the_thread() {
         let parker = std::sync::Arc::new(ThreadParker::new());
@@ -185,6 +201,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn a_rearmed_parker_wakes_the_current_thread() {
         let parker = std::sync::Arc::new(ThreadParker::new());

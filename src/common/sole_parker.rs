@@ -54,9 +54,8 @@ use std::sync::atomic::{fence, AtomicBool, Ordering};
 /// Park state for a side with exactly one waiter: a re-armable thread
 /// handle plus the flag that says whether it is in use.
 ///
-/// Thread parking is out of loom's scope (it does not mock
-/// `std::thread::park`), so this uses std atomics directly rather than
-/// the [`atomics`](super::atomics) shim, matching [`ThreadParker`].
+/// Parking routes through the [`atomics`](super::atomics) shim, so
+/// loom's mocked `park`/`unpark` apply under the model.
 pub struct SoleParker {
     parker: ThreadParker,
     /// `true` ↔ the sole waiter is parked, or is committed to parking.
@@ -66,8 +65,20 @@ pub struct SoleParker {
 }
 
 impl SoleParker {
+    // Loom's atomics are not const-constructible, so the loom twin
+    // takes the weaker form; std callers keep const use.
+    #[cfg(not(loom))]
     #[must_use]
     pub const fn new() -> Self {
+        Self {
+            parker: ThreadParker::new(),
+            parked: CachePadded(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(loom)]
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             parker: ThreadParker::new(),
             parked: CachePadded(AtomicBool::new(false)),

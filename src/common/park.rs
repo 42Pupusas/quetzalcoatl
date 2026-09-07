@@ -16,7 +16,8 @@
 //! it. Close paths additionally `flush()` both wake sets so a parked
 //! waiter never observes "closed but still parked."
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::atomics::{fence, AtomicU64};
+use std::sync::atomic::Ordering;
 
 use super::park_registry::ParkSlot;
 use super::thread_parker::ThreadParker;
@@ -102,7 +103,7 @@ impl WakeSet {
         // Callers that publish with a `SeqCst` *store* (an `xchg` on
         // x86, which drains the store buffer itself) already satisfy
         // this and must call [`wake_one_published`] instead.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         self.wake_one_published();
     }
 
@@ -169,7 +170,7 @@ impl WakeSet {
         // See wake_one — drain the caller's store buffer before
         // sampling the bitmap so prior Release stores on
         // `ready`/`done` are globally visible.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         let mut cursor = self.cursor.load(Ordering::Relaxed);
         for _ in 0..n {
             // Acquire (not Relaxed) — see wake_one for the rationale.
@@ -245,6 +246,17 @@ impl WakeSet {
     #[inline]
     pub fn disarm(&self, slot: ParkSlot) {
         self.wake.fetch_and(!slot.mask(), Ordering::Relaxed);
+    }
+
+    /// How many waiters *other* than `slot` are parked right now.
+    ///
+    /// Diagnostic: [`wake_one`](Self::wake_one) serves one slot per
+    /// event, so a waiter can be passed over rather than lost. A zero
+    /// here says no peer was available to absorb a wake meant for us.
+    #[must_use]
+    #[inline]
+    pub fn others_parked(&self, slot: ParkSlot) -> u32 {
+        (self.wake.load(Ordering::SeqCst) & !slot.mask()).count_ones()
     }
 }
 

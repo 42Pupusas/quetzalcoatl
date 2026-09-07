@@ -30,6 +30,18 @@
 //! matrix is therefore strong evidence the bound is unnecessary; a
 //! non-zero one is a starting point, not a verdict.
 //!
+//! `sole_waiter_rescues` narrows it. It counts the rescues where no
+//! other waiter on this side was parked when the sleep ended, so there
+//! was nobody for round-robin to have preferred at that moment. Those
+//! are much harder to explain away as scheduling policy.
+//!
+//! The count is sampled both before the sleep and after it, and only a
+//! rescue with no peer at *either* end is counted, which catches a peer
+//! that was already waiting or is still waiting. It is still not a
+//! proof: a peer that parks and leaves entirely within our sleep falls
+//! between the samples. Treat a sole-waiter rescue as the strongest
+//! available evidence of a lost wake, not as a closed case.
+//!
 //! # Cost
 //!
 //! Gated behind the `backstop-metrics` feature. Without it
@@ -47,6 +59,9 @@ pub struct BackstopStats {
     pub unwoken_timeouts: u64,
     /// Unwoken timeouts whose next re-check found work waiting.
     pub rescues: u64,
+    /// Rescues where no other waiter was parked on this side, so
+    /// round-robin cannot explain the wake going elsewhere.
+    pub sole_waiter_rescues: u64,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -57,6 +72,14 @@ impl BackstopStats {
     pub const fn saw_rescue(self) -> bool {
         self.rescues > 0
     }
+
+    /// Whether a rescue happened with no peer parked to absorb the
+    /// wake. Round-robin cannot account for these: the wake was owed
+    /// to this waiter and never arrived.
+    #[must_use]
+    pub const fn saw_unexplained_rescue(self) -> bool {
+        self.sole_waiter_rescues > 0
+    }
 }
 
 /// Per-ring backstop counters.
@@ -64,6 +87,7 @@ impl BackstopStats {
 pub struct BackstopMonitor {
     unwoken_timeouts: AtomicU64,
     rescues: AtomicU64,
+    sole_waiter_rescues: AtomicU64,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -72,6 +96,7 @@ impl BackstopMonitor {
         Self {
             unwoken_timeouts: AtomicU64::new(0),
             rescues: AtomicU64::new(0),
+            sole_waiter_rescues: AtomicU64::new(0),
         }
     }
 
@@ -79,8 +104,11 @@ impl BackstopMonitor {
         self.unwoken_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_rescue(&self) {
+    fn record_rescue(&self, sole_waiter: bool) {
         self.rescues.fetch_add(1, Ordering::Relaxed);
+        if sole_waiter {
+            self.sole_waiter_rescues.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Reads both counters.
@@ -92,6 +120,7 @@ impl BackstopMonitor {
         BackstopStats {
             unwoken_timeouts: self.unwoken_timeouts.load(Ordering::Relaxed),
             rescues: self.rescues.load(Ordering::Relaxed),
+            sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
         }
     }
 }
@@ -116,6 +145,7 @@ impl Default for BackstopMonitor {
 pub struct BackstopWatch {
     monitor: *const BackstopMonitor,
     timed_out: bool,
+    sole_waiter: bool,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -127,6 +157,7 @@ impl BackstopWatch {
         Self {
             monitor,
             timed_out: false,
+            sole_waiter: false,
         }
     }
 
@@ -136,11 +167,21 @@ impl BackstopWatch {
         unsafe { &*self.monitor }
     }
 
+    /// Records the peer count sampled just before the sleep, so a
+    /// waiter that was already parked when we went to sleep is not
+    /// mistaken for an absent one.
+    pub(crate) const fn about_to_park(&mut self, peers_parked: u32) {
+        self.sole_waiter = peers_parked == 0;
+    }
+
     /// Records how the park that just returned ended. `unwoken` is
     /// whether this waiter's handle was still armed, meaning no peer
-    /// claimed it.
-    pub(crate) fn parked(&mut self, unwoken: bool) {
+    /// claimed it; `peers_parked` is how many other waiters on this
+    /// side were parked, which is what round-robin could have served
+    /// instead of us.
+    pub(crate) fn parked(&mut self, unwoken: bool, peers_parked: u32) {
         self.timed_out = unwoken;
+        self.sole_waiter = self.sole_waiter && peers_parked == 0;
         if unwoken {
             self.monitor().record_timeout();
         }
@@ -150,7 +191,7 @@ impl BackstopWatch {
     /// preceding park ended on the timeout.
     pub(crate) fn made_progress(&mut self) {
         if std::mem::replace(&mut self.timed_out, false) {
-            self.monitor().record_rescue();
+            self.monitor().record_rescue(self.sole_waiter);
         }
     }
 }
@@ -167,7 +208,10 @@ pub struct BackstopWatch;
 )]
 impl BackstopWatch {
     #[inline]
-    pub(crate) const fn parked(&mut self, _unwoken: bool) {}
+    pub(crate) const fn about_to_park(&mut self, _peers_parked: u32) {}
+
+    #[inline]
+    pub(crate) const fn parked(&mut self, _unwoken: bool, _peers_parked: u32) {}
 
     #[inline]
     pub(crate) const fn made_progress(&mut self) {}

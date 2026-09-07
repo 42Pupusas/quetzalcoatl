@@ -100,8 +100,13 @@ impl ParkSlot {
     #[inline]
     pub fn park(self) {
         match self {
-            Self::Leased(_) => std::thread::park(),
+            Self::Leased(_) => super::atomics::thread::park(),
+            #[cfg(not(loom))]
             Self::Shared => std::thread::park_timeout(SHARED_PARK_INTERVAL),
+            // Loom does not mock `park_timeout`; a slotless waiter
+            // under the model relies on its peers' wakes instead.
+            #[cfg(loom)]
+            Self::Shared => super::atomics::thread::park(),
         }
     }
 

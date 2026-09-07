@@ -262,10 +262,14 @@ impl<T, C: Config> Producer<T, C> {
             }
 
             // Bounded park — see push_block.
+            watch.about_to_park(self.queue.producer_park.others_parked(park_slot));
             park_slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.
-            watch.parked(self.queue.producer_park.is_armed(park_slot));
+            watch.parked(
+                self.queue.producer_park.is_armed(park_slot),
+                self.queue.producer_park.others_parked(park_slot),
+            );
             self.queue.producer_park.disarm(park_slot);
         }
     }
@@ -329,10 +333,14 @@ impl<T, C: Config> Producer<T, C> {
             // 5000-item runs). Exclusive slot leasing is the likelier
             // cause and is now fixed, though not proven to be the only
             // one, so the bound stays until it is.
+            watch.about_to_park(q.producer_park.others_parked(slot));
             slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.
-            watch.parked(q.producer_park.is_armed(slot));
+            watch.parked(
+                q.producer_park.is_armed(slot),
+                q.producer_park.others_parked(slot),
+            );
             q.producer_park.disarm(slot);
         }
     }

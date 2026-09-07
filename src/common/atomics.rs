@@ -6,11 +6,16 @@
 //! modeled primitives route their atomics through this module.
 //!
 //! Scope: the async wake machinery (`wake_async`, `waker_overflow`,
-//! `park_registry`). Thread parking stays on std — loom does not mock
-//! `std::thread::park`, so a parked model fiber would block the one
-//! real thread the model runs on. The ring slot machinery is out of
-//! scope for the same reason a model of it would be: far too large to
-//! enumerate.
+//! `park_registry`) and the blocking park/wake handshake.
+//!
+//! Loom does mock `park` and `unpark`, so parking is modelable; the
+//! [`thread`] alias below routes it. What loom does not mock is
+//! `park_timeout`, which is why a model must exercise the handshake
+//! without the `PARK_BACKSTOP` bound — that is the point, since the
+//! bound is what hides the defect.
+//!
+//! The ring slot machinery stays out of scope: a model of it would be
+//! far too large to enumerate.
 //!
 //! Not a cargo feature: the switch is the `cfg(loom)` flag that cargo
 //! itself sets from `[target.'cfg(loom)'.dependencies]`, so default
@@ -24,6 +29,12 @@
 pub use loom::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU64};
 #[cfg(not(loom))]
 pub use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU64};
+
+/// `park`/`unpark` and thread spawning: loom's mocks when modeling.
+#[cfg(loom)]
+pub use loom::thread;
+#[cfg(not(loom))]
+pub use std::thread;
 
 /// Backs test-only counters; the name only exists under `cfg(test)`.
 #[cfg(all(test, loom))]

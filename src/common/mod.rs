@@ -17,6 +17,8 @@ pub mod endpoint_count;
 #[cfg(all(test, loom, feature = "async"))]
 mod loom_models;
 pub mod park;
+#[cfg(all(test, loom))]
+mod park_handshake_model;
 #[cfg(test)]
 pub mod park_probe;
 #[cfg(feature = "async")]
