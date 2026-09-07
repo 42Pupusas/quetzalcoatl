@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suggestive but not yet causal; the event counts are too small to
   separate from noise. See `PERFORMANCE_AUDIT.md`.
 
+  The mechanism itself is now proven without threads or timing. A
+  producer holding a partial batch stays blocked with **three of four**
+  ring slots free, because only its own position releases it; a `pop`
+  then spends its single wake on that producer, for which the freed
+  position is useless. A third test bounds the claim: producers blocked
+  by a genuinely full ring hold no reservation and *are*
+  interchangeable, so the pin requires out-of-order consumption to
+  arise — which is why the residual rate is low rather than constant.
+
   Off by default: the ring carries no counters and the call sites
   compile to nothing.
 

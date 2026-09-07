@@ -217,6 +217,35 @@ effect from noise. The experiment was reverted. Establishing the link
 needs thousands of iterations at both settings, comparing rescues per
 unwoken timeout rather than per run.
 
+### The pin, proven without threads
+
+The stress numbers say misrouting happens; they do not show the
+mechanism. Three deterministic tests do, with no timing to argue about:
+
+`a_producer_holding_a_partial_batch_is_pinned_to_its_own_position`
+builds a producer holding one reserved position, frees **three of the
+ring's four slots**, and shows it still cannot proceed. Only its own
+position releases it. A held `SlotReader` supplies the out-of-order
+consumption that lets a batch span a blocked slot and a free one.
+
+`a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot` takes
+the consequence: a `pop` frees one position, wakes one producer by park
+slot, and the wake lands on the producer for which that position is
+useless. Deleting just the `pop` makes the futile wake never appear, so
+the counter fires from that wake and not incidentally.
+
+`producers_blocked_by_a_full_ring_can_absorb_each_others_wakes` bounds
+the claim. `refill_batch` returns `None` *before* touching the `claim`
+cursor when the ring is full, so producers that park in that state hold
+no reservation and are genuinely interchangeable. Misrouting is
+harmless there. The pin needs a **partial batch**, which needs
+out-of-order consumption to arise — which is why the residual rate is
+low rather than constant.
+
+What is proven: the pin is real, and a wake can be spent on a producer
+that cannot use it. What is *not* proven: that this is what strands a
+producer in the wild. The stress rescues remain too few to attribute.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -238,6 +267,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
-7. **Settle whether futile wakes cause the residual rescues.** `futile_wakes` shows wake routing is lossy under saturation (see "Futile wakes"), and every rescue observed since co-occurred with one, but the event counts are far too small to call it causal. Run both wake policies for thousands of iterations and compare rescues *per unwoken timeout*. If the link holds, the fix is to route wakes by what a waiter is waiting for rather than by park slot — which means the wake bitmap needs to carry the awaited position, not just "someone is parked here." That is a protocol change, so measure first.
+7. **Settle whether futile wakes cause the residual rescues.** The mechanism is now proven deterministically (see "The pin, proven without threads"): a producer holding a partial batch waits on one exact position, and a `pop` can spend its single wake on a producer that cannot use the freed slot. What is still unproven is that this is what strands a producer under stress — the rescues are too few to attribute. Run both wake policies for thousands of iterations and compare rescues *per unwoken timeout*, not per run. Note the rate-limiting event is the unwoken timeout (3 per 200 iterations), so a powered comparison needs a campaign on the order of tens of thousands of iterations per policy, i.e. hours. If the link holds, the fix is to route wakes by the position a waiter awaits rather than by park slot, which means the wake bitmap must carry that position instead of just "someone is parked here." That is a protocol change, so measure first.
 8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

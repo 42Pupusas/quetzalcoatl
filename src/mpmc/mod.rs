@@ -351,6 +351,16 @@ impl<T, C: Config> RingBuffer<T, C> {
         )
     }
 
+    /// How many producers are currently parked.
+    ///
+    /// A bit is set per parked producer, so the population count is
+    /// the number of waiters. Reads a bitmap that peers mutate, so
+    /// treat it as a sample rather than an invariant.
+    #[doc(hidden)]
+    pub fn parked_producer_count(&self) -> u32 {
+        self.producer_park.wake.load(Ordering::Acquire).count_ones()
+    }
+
     /// Splits the ring into a [`Producer`] and a [`Consumer`].
     /// Both handles are cloneable for additional producer/consumer
     /// threads.
@@ -483,6 +493,185 @@ mod tests {
         assert_eq!(
             stats.futile_wakes, 1,
             "the push that ended the call delivered a wake the consumer used: {stats:?}"
+        );
+    }
+
+    /// A producer holding a partial batch is pinned to one exact
+    /// position, and freeing every *other* slot in the ring does not
+    /// release it.
+    ///
+    /// This is the claim the "round-robin explains it" dismissal needs
+    /// to be false, so it is built without threads, timing or parking:
+    /// only the batch and slot bookkeeping decide the outcome.
+    ///
+    /// A held `SlotReader` keeps slot 0 unreleased while its
+    /// neighbours are consumed, which is what lets a later batch span
+    /// a blocked slot and a free one. The producer publishes into the
+    /// free half out of order and is left holding the blocked half.
+    #[test]
+    fn a_producer_holding_a_partial_batch_is_pinned_to_its_own_position() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
+        let filler = producer.clone();
+        // Both consumers start at slot 0 (the stagger is capacity/8,
+        // which floors to 0 here), so claim order is deterministic.
+        let drainer = consumer.clone();
+        let mut holder = consumer;
+
+        producer.push(0).unwrap();
+        producer.push(1).unwrap();
+        filler.push(2).unwrap();
+        filler.push(3).unwrap();
+
+        // Slot 0 stays unreleased for as long as this lives.
+        let held = holder.pop_ref().unwrap();
+        assert_eq!(*held, 0);
+
+        assert_eq!(drainer.pop(), Some(1));
+        assert_eq!(drainer.pop(), Some(2));
+
+        // Two slots free, so the next batch is positions 4 and 5.
+        // Position 4 is slot 0 (still held); position 5 is slot 1.
+        // The producer publishes into 5 and keeps 4 reserved.
+        producer.push(99).unwrap();
+        assert!(
+            producer.push(100).is_err(),
+            "the batch's remaining position is slot 0, which is still held"
+        );
+
+        // Free every other slot in the ring.
+        let mut freed = vec![drainer.pop(), drainer.pop()];
+        freed.sort_unstable();
+        assert_eq!(freed, vec![Some(3), Some(99)]);
+
+        assert!(
+            producer.push(100).is_err(),
+            "three of four slots are now free, and none of them is the \
+             position this producer reserved: a wake delivered here buys \
+             nothing"
+        );
+
+        drop(held);
+        assert!(
+            producer.push(100).is_ok(),
+            "only the producer's own position releases it"
+        );
+    }
+
+    /// The consequence of the pin: a `pop` frees one exact position
+    /// and wakes one producer by park slot, so the wake can land on a
+    /// producer for which that position is useless.
+    ///
+    /// `pinned` holds position 4 (slot 0) and is parked in
+    /// `push_block`. The freed position is 5 (slot 1), which only
+    /// `pinned` cannot use — so the wake is spent on it, it re-parks,
+    /// and the futile-wake counter records the loss.
+    ///
+    /// Without the backstop timeout this would be a hang rather than a
+    /// counted event, which is what makes the counter worth having.
+    #[test]
+    #[cfg(feature = "backstop-metrics")]
+    fn a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
+        let filler = producer.clone();
+        let ring = std::sync::Arc::clone(&producer.queue);
+        let drainer = consumer.clone();
+        let mut holder = consumer;
+
+        producer.push(0).unwrap();
+        producer.push(1).unwrap();
+        filler.push(2).unwrap();
+        filler.push(3).unwrap();
+
+        let held = holder.pop_ref().unwrap();
+        assert_eq!(*held, 0);
+        assert_eq!(drainer.pop(), Some(1));
+        assert_eq!(drainer.pop(), Some(2));
+
+        producer.push(99).unwrap();
+        assert!(producer.push(100).is_err(), "pinned to slot 0");
+
+        let pinned = std::thread::spawn(move || {
+            producer.push_block(100).expect("consumers dropped");
+        });
+
+        ParkProbe::new().expect_until("the pinned producer to park", || {
+            ring.producer_park.wake.load(Ordering::Relaxed) != 0
+        });
+
+        // Frees position 5 (slot 1) and wakes one producer. The only
+        // parked producer is the one that needs slot 0.
+        assert_eq!(drainer.pop(), Some(3));
+
+        ParkProbe::new().expect_until("the wake to be spent and the producer to re-park", || {
+            ring.backstop_stats().saw_futile_wake()
+        });
+
+        drop(held);
+        pinned.join().unwrap();
+
+        let stats = ring.backstop_stats();
+        assert!(
+            stats.futile_wakes >= 1,
+            "a pop's wake reached a producer that could not use the freed \
+             position: {stats:?}"
+        );
+    }
+
+    /// The bound on the pin: producers blocked by a *full ring* are
+    /// interchangeable, so misrouting is harmless there.
+    ///
+    /// This is the case that limits the argument. `refill_batch`
+    /// returns `None` before touching the `claim` cursor when the ring
+    /// is full, so a producer that parks in that state holds no
+    /// reservation and will take whichever position frees first. Any
+    /// parked producer can absorb the wake.
+    ///
+    /// So the misrouting only bites when a producer parks holding a
+    /// *partial batch* — which needs out-of-order consumption to
+    /// arise, as in
+    /// [`a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot`].
+    /// Recording the boundary keeps the claim from being stated more
+    /// broadly than the evidence supports.
+    #[test]
+    #[cfg(feature = "backstop-metrics")]
+    fn producers_blocked_by_a_full_ring_can_absorb_each_others_wakes() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<1, 128, 1>>::new(Capacity::exact(4)).split();
+        let second = producer.clone();
+        let ring = std::sync::Arc::clone(&producer.queue);
+
+        for v in 0..4u64 {
+            producer.push(v).unwrap();
+        }
+
+        // Both producers park: the ring is full, so neither holds a
+        // reservation and each will take the next position it can.
+        let a = std::thread::spawn(move || producer.push_block(100));
+        let b = std::thread::spawn(move || second.push_block(101));
+
+        ParkProbe::new().expect_until("both producers to park", || {
+            ring.parked_producer_count() == 2
+        });
+
+        // One pop, one freed position, one wake.
+        assert_eq!(consumer.pop(), Some(0));
+
+        ParkProbe::new().expect_until("a producer to take the freed position", || {
+            ring.parked_producer_count() == 1
+        });
+
+        for expected in [1, 2, 3] {
+            assert_eq!(consumer.pop(), Some(expected));
+        }
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+
+        let stats = ring.backstop_stats();
+        assert!(
+            !stats.saw_unexplained_rescue(),
+            "a producer was released only by the timeout: {stats:?}"
         );
     }
 
