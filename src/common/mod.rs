@@ -2,6 +2,7 @@ pub mod atomics;
 pub mod backoff;
 pub mod close_state;
 pub mod cursors;
+pub mod endpoint_count;
 #[cfg(all(test, loom, feature = "async"))]
 mod loom_models;
 pub mod park;

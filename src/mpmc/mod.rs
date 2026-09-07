@@ -76,6 +76,7 @@ use crate::common::park_registry::ParkRegistry;
 pub(crate) const PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
+use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
@@ -173,9 +174,9 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// Producers use it to bound their per-batch FAA on `claim`.
     pub(crate) consumed: CachePadded<AtomicUsize>,
     /// Live producer count; last-drop sets `producer_closed`.
-    pub(crate) producer_count: CachePadded<AtomicUsize>,
+    pub(crate) producer_count: EndpointCount,
     /// Live consumer count; last-drop sets `consumer_closed`.
-    pub(crate) consumer_count_live: CachePadded<AtomicUsize>,
+    pub(crate) consumer_count_live: EndpointCount,
     /// Set by the last `Consumer` drop. `Producer::push_block`
     /// observes this and returns `Err(val)` instead of hanging
     /// (no consumer left to drain).
@@ -194,9 +195,6 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// `ready[s]` publish. Producers wake one parked consumer after
     /// each publish (gated on the bitmap being non-zero).
     pub(crate) consumer_park: WakeSet,
-    /// Monotonic counter for assigning stable park-slot indices to
-    /// `Consumer` clones. Bumped at clone time only.
-    pub(crate) consumer_count: CachePadded<AtomicUsize>,
     /// Leases park-slot indices to `Producer` handles, reclaiming each
     /// on drop so a slot is never shared by two live producers.
     pub(crate) producer_slots: ParkRegistry,
@@ -283,8 +281,8 @@ impl<T, C: Config> RingBuffer<T, C> {
             done,
             claim: CachePadded(AtomicUsize::new(0)),
             consumed: CachePadded(AtomicUsize::new(0)),
-            producer_count: CachePadded(AtomicUsize::new(1)),
-            consumer_count_live: CachePadded(AtomicUsize::new(1)),
+            producer_count: EndpointCount::new(),
+            consumer_count_live: EndpointCount::new(),
             clone_counter: CachePadded(AtomicUsize::new(0)),
             closed: CloseState::new(),
             consumer_closed: CloseState::new(),
@@ -294,7 +292,6 @@ impl<T, C: Config> RingBuffer<T, C> {
             producer_slots: ParkRegistry::new(),
             consumer_slots: ParkRegistry::new(),
             consumer_park: WakeSet::new(),
-            consumer_count: CachePadded(AtomicUsize::new(0)),
             #[cfg(feature = "async")]
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]

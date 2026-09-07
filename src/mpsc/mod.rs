@@ -41,7 +41,8 @@ use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::cursors::Cursors;
-use crate::common::{AlignedBuf, CachePadded, SeqSlot};
+use crate::common::endpoint_count::EndpointCount;
+use crate::common::{AlignedBuf, SeqSlot};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -62,7 +63,7 @@ pub struct RingBuffer<T> {
     pub(crate) mask: usize,
     pub(crate) cursors: Cursors,
     /// Live producer count; last-drop sets [`closed`].
-    pub(crate) producer_count: CachePadded<AtomicUsize>,
+    pub(crate) producer_count: EndpointCount,
     /// Set by the last [`Producer`] drop. [`Consumer::pop_block`]
     /// observes this and returns `None` once the queue drains.
     pub(crate) closed: CloseState,
@@ -118,7 +119,7 @@ impl<T> RingBuffer<T> {
             cursors: Cursors::new(),
             cap,
             mask: capacity.mask,
-            producer_count: CachePadded(AtomicUsize::new(1)),
+            producer_count: EndpointCount::new(),
             closed: CloseState::new(),
             consumer_closed: CloseState::new(),
             producer_park: WakeSet::new(),

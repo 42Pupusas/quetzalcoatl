@@ -31,7 +31,7 @@ pub struct Producer<T> {
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         #[cfg(feature = "async")]
-        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        self.queue.producer_count.register();
         Self {
             queue: Arc::clone(&self.queue),
             cached_min_head: std::cell::Cell::new(0),
@@ -64,7 +64,7 @@ impl<T> Producer<T> {
     /// build has no close to signal here.
     #[cfg(feature = "async")]
     fn close_if_last(&self) {
-        if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.queue.producer_count.release() {
             // Last producer gone: flag closed and flush all parked
             // consumers so their pop_async can return None after
             // their backlog drains.

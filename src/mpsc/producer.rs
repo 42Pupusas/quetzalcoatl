@@ -33,7 +33,7 @@ pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
 
 impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
-        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        self.queue.producer_count.register();
         let park_slot = self.queue.producer_slots.lease();
         Self {
             queue: Arc::clone(&self.queue),
@@ -64,7 +64,7 @@ impl<'a, T> Producer<T, &'a RingBuffer<T>> {
     #[must_use]
     pub fn new_producer(&self) -> Self {
         let queue: &'a RingBuffer<T> = self.queue;
-        queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        queue.producer_count.register();
         let park_slot = queue.producer_slots.lease();
         Self::new_with(queue, park_slot)
     }
@@ -326,7 +326,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
         self.ring().producer_slots.release(self.park_slot);
-        if self.ring().producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.ring().producer_count.release() {
             // SeqCst: pairs with the consumer's post-arm SeqCst load
             // and with wake_consumer's SeqCst load of the parked flag.
             self.ring().closed.close();

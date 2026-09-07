@@ -55,6 +55,8 @@ use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
+#[cfg(feature = "async")]
+use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
@@ -125,7 +127,7 @@ pub struct RingBuffer<T> {
     /// Live producer count (only tracked when `async` is enabled). When
     /// it reaches zero `closed` is set so `pop_async` can resolve to `None`.
     #[cfg(feature = "async")]
-    pub(crate) producer_count: CachePadded<AtomicUsize>,
+    pub(crate) producer_count: EndpointCount,
     /// Set by the last producer drop. Consumers' `pop_async` observe
     /// it and resolve to `None` once their backlog drains.
     #[cfg(feature = "async")]
@@ -183,7 +185,7 @@ impl<T> RingBuffer<T> {
             producer_park_slots: ParkRegistry::new(),
             consumer_slots: consumer_slots.into_boxed_slice(),
             #[cfg(feature = "async")]
-            producer_count: CachePadded(AtomicUsize::new(1)),
+            producer_count: EndpointCount::new(),
             #[cfg(feature = "async")]
             closed: CloseState::new(),
             #[cfg(feature = "async")]

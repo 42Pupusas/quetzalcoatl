@@ -59,7 +59,8 @@ use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::cursors::Cursors;
-use crate::common::{AlignedBuf, CachePadded};
+use crate::common::endpoint_count::EndpointCount;
+use crate::common::AlignedBuf;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -103,10 +104,7 @@ pub struct RingBuffer<T> {
     /// (no consumer left to drain).
     pub(crate) consumer_closed: CloseState,
     /// Live consumer count; last-drop sets `consumer_closed`.
-    pub(crate) consumer_count_live: CachePadded<AtomicUsize>,
-    /// Monotonic counter for assigning stable park-slot indices to
-    /// `Consumer` clones. Bumped at clone time only.
-    pub(crate) consumer_count: CachePadded<AtomicUsize>,
+    pub(crate) consumer_count_live: EndpointCount,
     /// Leases park-slot indices to `Consumer` handles, reclaiming each
     /// on drop so a slot is never shared by two live consumers.
     pub(crate) consumer_slots: ParkRegistry,
@@ -159,8 +157,7 @@ impl<T> RingBuffer<T> {
             cursors: Cursors::new(),
             closed: CloseState::new(),
             consumer_closed: CloseState::new(),
-            consumer_count_live: CachePadded(AtomicUsize::new(1)),
-            consumer_count: CachePadded(AtomicUsize::new(0)),
+            consumer_count_live: EndpointCount::new(),
             consumer_slots: ParkRegistry::new(),
             producer_park: SoleParker::new(),
             consumer_park: WakeSet::new(),

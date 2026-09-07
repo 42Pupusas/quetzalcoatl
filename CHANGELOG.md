@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Dead `consumer_count` field in the mpmc and spmc rings.** Both
+  incremented it on every consumer clone and never read it: no load,
+  no decrement, no use anywhere. Its doc comment said it assigned
+  stable park-slot indices, which `ParkRegistry::lease` has done since
+  the registry was introduced. Each clone paid an atomic RMW and a
+  cache line for a number nothing consulted.
+
 ### Changed
+- **Endpoint reference counts are now the `EndpointCount` type.** Five
+  rings tracked how many handles remained on a side —
+  `producer_count` in mpsc, mpmc and broadcast, `consumer_count_live`
+  in spmc and mpmc — each as a bare `CachePadded<AtomicUsize>` with
+  the protocol spelled out at every site: `fetch_add(1, Relaxed)` on
+  clone, `fetch_sub(1, AcqRel) == 1` on drop to detect the last
+  handle.
+
+  The orderings are the reason this is a type rather than a
+  convention. `Relaxed` is right for the increment and `AcqRel` is
+  load-bearing for the decrement: the last endpoint closes the ring
+  and wakes the peers, so the departing endpoints' writes have to be
+  visible to it. Both facts now live in one documented place instead
+  of being re-derived at ten call sites.
+
+  `release` returns whether the caller was last and is `#[must_use]`,
+  so decrementing the count while forgetting to close is no longer
+  something the code can express.
 - **BREAKING: `cas_backoff` is replaced by the `Backoff` type.** The
   free function took `&mut u32` and every caller kept that counter
   itself, which meant the schedule was only half of it. The other half

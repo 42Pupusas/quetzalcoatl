@@ -38,12 +38,7 @@ impl<T, C: Config> Clone for Consumer<T, C> {
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         let stagger = (n * (self.queue.cap / 8).max(1)) & self.queue.mask;
-        self.queue.consumer_count.fetch_add(1, Ordering::Relaxed);
-        // Bump the live-consumer count so producers can detect
-        // "all consumers gone" via consumer_closed.
-        self.queue
-            .consumer_count_live
-            .fetch_add(1, Ordering::Relaxed);
+        self.queue.consumer_count_live.register();
         Self {
             queue: Arc::clone(&self.queue),
             next_scan: Cell::new(stagger),
@@ -509,12 +504,7 @@ impl<T, C: Config> Drop for Consumer<T, C> {
         // Last-consumer drop: flag `consumer_closed` and wake any
         // producers parked in `push_block` so they can observe it
         // and return Err.
-        if self
-            .queue
-            .consumer_count_live
-            .fetch_sub(1, Ordering::AcqRel)
-            == 1
-        {
+        if self.queue.consumer_count_live.release() {
             // SeqCst: pairs with each producer's post-arm SeqCst load.
             self.queue.consumer_closed.close();
             self.queue.producer_park.flush();

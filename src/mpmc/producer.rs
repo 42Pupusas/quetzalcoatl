@@ -38,7 +38,7 @@ pub struct Producer<T, C: Config = DefaultConfig> {
 
 impl<T, C: Config> Clone for Producer<T, C> {
     fn clone(&self) -> Self {
-        self.queue.producer_count.fetch_add(1, Ordering::Relaxed);
+        self.queue.producer_count.register();
         Self {
             queue: Arc::clone(&self.queue),
             batch_start: Cell::new(0),
@@ -369,7 +369,7 @@ impl<T, C: Config> Drop for Producer<T, C> {
         BatchAbandon::new(&self.queue).release_all(self.batch_start.get(), self.batch_unused.get());
 
         self.queue.producer_slots.release(self.park_slot);
-        if self.queue.producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.queue.producer_count.release() {
             // SeqCst pairs with consumer's `closed.load(SeqCst)` in
             // pop_block's recheck after fetch_or — see consumer.rs.
             self.queue.closed.close();

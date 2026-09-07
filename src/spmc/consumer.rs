@@ -34,10 +34,7 @@ const BATCH_SIZE: usize = 4;
 // Clone only for the Arc variant.
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
-        self.queue.consumer_count.fetch_add(1, Ordering::Relaxed);
-        self.queue
-            .consumer_count_live
-            .fetch_add(1, Ordering::Relaxed);
+        self.queue.consumer_count_live.register();
         Self {
             queue: Arc::clone(&self.queue),
             cached_tail: Cell::new(0),
@@ -81,8 +78,7 @@ impl<'a, T> Consumer<T, &'a RingBuffer<T>> {
     #[must_use]
     pub fn new_consumer(&self) -> Self {
         let queue: &'a RingBuffer<T> = self.queue;
-        queue.consumer_count.fetch_add(1, Ordering::Relaxed);
-        queue.consumer_count_live.fetch_add(1, Ordering::Relaxed);
+        queue.consumer_count_live.register();
         Self::new_with(queue, queue.consumer_slots.lease())
     }
 }
@@ -445,7 +441,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
             q.done_slot(pos).store(pos + cap, Ordering::Release);
         }
         q.consumer_slots.release(self.park_slot);
-        if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if q.consumer_count_live.release() {
             // SeqCst store + wake_producer's SeqCst load of the parked
             // flag are the two halves of the close handshake. Reading
             // the parker handle directly skips the load and lets the
