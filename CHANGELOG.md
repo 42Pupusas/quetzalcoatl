@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A panicking payload destructor stranded its reservation.**
+  `WrittenSlot::drop` asked `UncommittedSlot::drop_if_uncommitted()`
+  whether it still owed the slot release — but that call runs `T::drop`
+  first and only then returns. Unwinding out of the destructor skipped
+  the release entirely, in all three rings that owe one: mpsc never
+  tombstoned the position, broadcast never published its abandonment
+  marker, and mpmc never returned the bit to the producer's batch.
+
+  The consequence was lost progress, not lost memory. An mpsc consumer
+  stopped at the unresolved position and every later value behind it
+  became unreachable; the same for a broadcast consumer; an mpmc
+  producer lost the position for the rest of the handle's life. Miri
+  saw nothing, because nothing here is undefined — the ring simply
+  stops.
+
+  Each ring now arms its release *before* running the destructor, in
+  `mpsc::ReservationRelease`, `broadcast::ReservationAbandon` and
+  `mpmc::ReservationReturn` — the same RAII shape the consumer side
+  already used for `SlotRelease`. `UncommittedSlot::is_armed` is what
+  lets the decision be made ahead of the drop, and its docs now say why
+  the returned flag cannot be used for this.
+
+  The mpmc test needs the ring to wrap through the lost position before
+  it fails: with spare batch positions available, a single reserve
+  after the panic still succeeds and the bug hides.
+
+- **A panicking waker in `commit_unchecked` destroyed a published
+  value.** The method published the slot, woke the consumer, and only
+  then called `mem::forget(self)`. A `Waker` is user code and may
+  panic — an unwind between the publish and the forget ran
+  `SlotWriter::drop`, which tombstoned (mpsc), abandoned (broadcast) or
+  reclaimed (mpmc) a position the consumer could already see. In mpsc
+  the committed value was silently lost: the consumer read `None`.
+
+  The writer is now disarmed before publishing, which is the ordering
+  the safe `commit` path already documented and enforced. spsc and
+  spmc were unaffected — their `SlotWriter::drop` has nothing to undo.
+
 - **The published crate could not be compiled.** `Cargo.toml`'s
   `include` listed `src/common` file by file, and nine modules declared
   in `common/mod.rs` were missing from it, so the 0.14.0 tarball failed

@@ -60,6 +60,7 @@ mod consumer;
 mod done_word;
 mod producer;
 mod ready_word;
+mod reservation_return;
 mod slot_release;
 
 pub use config::{Cfg, Config, DefaultConfig};
@@ -882,6 +883,54 @@ mod tests {
         let v = c.pop().unwrap();
         assert_eq!(v[0], 0xAB);
         assert_eq!(v[31], 0xAB);
+    }
+
+    /// The mpmc twin of the mpsc and broadcast cases: an uncommitted
+    /// reservation whose value panics on drop must still hand its
+    /// position back to the producer's batch bitmap, or the position is
+    /// lost until the handle is dropped.
+    #[test]
+    fn a_panicking_payload_still_returns_its_uncommitted_reservation() {
+        struct PanicOnDropGuard {
+            panics: bool,
+        }
+
+        impl PanicOnDropGuard {
+            const fn armed() -> Self {
+                Self { panics: true }
+            }
+            const fn disarmed() -> Self {
+                Self { panics: false }
+            }
+        }
+
+        impl Drop for PanicOnDropGuard {
+            fn drop(&mut self) {
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let (mut p, c) = RingBuffer::<PanicOnDropGuard>::new(Capacity::exact(4)).split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let w = p.reserve().unwrap();
+            drop(w.write(PanicOnDropGuard::armed()));
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        // The returned bit is what lets this producer reuse the
+        // position. A lost one costs a slot for the handle's lifetime,
+        // which only shows up once the ring has to wrap through it.
+        for _ in 0..16 {
+            p.reserve()
+                .expect("the released position must be reusable")
+                .write(PanicOnDropGuard::disarmed())
+                .commit();
+            assert!(
+                c.pop().is_some(),
+                "the consumer must reach each value published after the panic"
+            );
+        }
     }
 
     #[test]

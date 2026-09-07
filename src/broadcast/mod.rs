@@ -44,6 +44,7 @@ mod consumer_floor;
 mod consumer_registry;
 mod floor_cache;
 mod producer;
+mod reservation_abandon;
 mod slot_reuse;
 mod slot_state;
 
@@ -643,6 +644,60 @@ mod tests {
     /// Abandoning a written-but-uncommitted reservation drops the value
     /// and releases the position, exactly like abandoning an unwritten
     /// one.
+    /// The broadcast twin of the MPSC case: an uncommitted reservation
+    /// whose value panics on drop must still publish its abandonment
+    /// marker, or a consumer parked at that position waits for a
+    /// publication that never comes.
+    #[test]
+    fn a_panicking_payload_still_abandons_its_uncommitted_reservation() {
+        struct PanicOnDropGuard {
+            panics: bool,
+        }
+
+        impl PanicOnDropGuard {
+            const fn armed() -> Self {
+                Self { panics: true }
+            }
+            const fn disarmed() -> Self {
+                Self { panics: false }
+            }
+        }
+
+        impl Drop for PanicOnDropGuard {
+            fn drop(&mut self) {
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let ring = RingBuffer::<PanicOnDropGuard>::new(Capacity::exact(2), 2);
+        let (mut producer, mut consumer) = ring.split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let writer = producer.reserve().unwrap();
+            drop(writer.write(PanicOnDropGuard::armed()));
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        assert!(
+            consumer.pop_ref().is_none(),
+            "the abandoned position delivers no value"
+        );
+
+        // The marker is what lets the consumer advance past the
+        // position. Without it the consumer stops at the unresolved
+        // claim and never reaches anything published behind it.
+        producer
+            .reserve()
+            .expect("the ring must still accept a reservation")
+            .write(PanicOnDropGuard::disarmed())
+            .commit();
+
+        let reader = consumer
+            .pop_ref()
+            .expect("the consumer must advance past the abandoned position");
+        drop(reader);
+    }
+
     #[test]
     fn abandoning_a_written_slot_releases_its_position() {
         let counter = Arc::new(AtomicUsize::new(0));

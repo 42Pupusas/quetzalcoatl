@@ -28,6 +28,7 @@
 mod batch_release;
 mod consumer;
 mod producer;
+mod reservation_release;
 mod slot_release;
 
 pub use consumer::{Consumer, SlotReader};
@@ -1110,6 +1111,47 @@ mod tests {
         );
     }
 
+    /// An uncommitted reservation whose value panics on drop must still
+    /// tombstone its position. `WrittenSlot::drop` asks
+    /// `drop_if_uncommitted()` for permission to release, but that call
+    /// runs `T::drop` first — so an unwind out of the destructor skips
+    /// the tombstone, and the consumer stalls at a position that will
+    /// never be published.
+    #[test]
+    fn a_panicking_payload_still_releases_its_uncommitted_reservation() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("destructor failure");
+            }
+        }
+
+        let (mut producer, mut consumer) =
+            RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let writer = producer.reserve().unwrap();
+            drop(writer.write(PanicOnDrop));
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        assert!(
+            consumer.pop_ref().is_none(),
+            "the abandoned position delivers no value"
+        );
+
+        // Skipping the tombstone hands its slot back, so the whole ring
+        // is claimable again. A stranded position would cost capacity
+        // permanently and stall the consumer at that position.
+        for _ in 0..4 {
+            let writer = producer
+                .reserve()
+                .expect("the tombstoned position must be reusable");
+            drop(writer);
+        }
+    }
+
     #[test]
     #[ignore = "too slow for Miri"]
     fn concurrent_drain() {
@@ -1894,6 +1936,57 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the value is dropped exactly once, by its consumer"
+        );
+    }
+
+    /// The `commit_unchecked` twin of the case above. It publishes,
+    /// wakes, and only then forgets the writer, so an unwind out of the
+    /// wake path runs `SlotWriter::drop` and tombstones a position the
+    /// consumer may already have taken.
+    #[test]
+    #[cfg(feature = "async")]
+    fn panicking_waker_during_commit_unchecked_does_not_tombstone_published_value() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+        struct PanicWaker;
+
+        impl PanicWaker {
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(std::ptr::null(), &Self::VTABLE),
+                |_| panic!("waker failure"),
+                |_| panic!("waker failure"),
+                |_| {},
+            );
+
+            fn waker() -> Waker {
+                // SAFETY: the vtable's functions are consistent with a
+                // stateless waker carrying a null data pointer.
+                unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &Self::VTABLE)) }
+            }
+        }
+
+        let ring = RingBuffer::<u64>::new(Capacity::exact(4));
+
+        let waker = PanicWaker::waker();
+        ring.consumer_waker.register(
+            crate::common::park_registry::ParkSlot::SOLE,
+            &Context::from_waker(&waker),
+        );
+
+        let (mut producer, mut consumer) = ring.split();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut w = producer.reserve().unwrap();
+            w.slot_mut().write(99);
+            // SAFETY: slot_mut().write initialized the slot above.
+            unsafe { w.commit_unchecked() };
+        }));
+        assert!(result.is_err(), "the waker panic must propagate");
+
+        assert_eq!(
+            consumer.pop(),
+            Some(99),
+            "the published value must survive the wake-path unwind"
         );
     }
 

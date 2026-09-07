@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::floor_cache::FloorCache;
+use super::reservation_abandon::ReservationAbandon;
 use super::slot_reuse::SlotReuse;
 use super::slot_state::SequenceWord;
 use super::RingBuffer;
@@ -416,11 +417,16 @@ impl<'a, T> SlotWriter<'a, T> {
     ///
     /// The caller must have initialized the slot data via
     /// [`slot_mut`](Self::slot_mut).
+    ///
+    /// The abandoning `Drop` is disarmed *before* the sequence is
+    /// published, not after the wake: a panicking waker between the two
+    /// would otherwise mark a position abandoned that consumers can
+    /// already see, losing the value it published.
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.slot_sequence.publish(self.pos);
-        self.queue.notify_consumers();
-        std::mem::forget(self);
+        let this = std::mem::ManuallyDrop::new(self);
+        this.slot_sequence.publish(this.pos);
+        this.queue.notify_consumers();
     }
 }
 
@@ -470,14 +476,15 @@ impl<T> WrittenSlot<'_, T> {
 
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
-        if self.value.drop_if_uncommitted() {
-            // See SlotWriter::drop: abandonment is a progress event for
-            // consumers at this position and for producers waiting on
-            // the aliasing slot.
-            self.slot_sequence.abandon(self.pos);
-            self.queue.notify_consumers();
-            self.queue.wake_producer();
-            self.queue.notify_producers();
+        if !self.value.is_armed() {
+            return;
         }
+        // See SlotWriter::drop: abandonment is a progress event for
+        // consumers at this position and for producers waiting on the
+        // aliasing slot. It is armed before the value is dropped so that
+        // a panicking `T::drop` still resolves the claim — unwinding
+        // past it would strand every consumer at this position.
+        let _abandon = ReservationAbandon::new(self.slot_sequence, self.pos, self.queue);
+        self.value.drop_if_uncommitted();
     }
 }

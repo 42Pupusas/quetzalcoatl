@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::batch_abandon::BatchAbandon;
+use super::reservation_return::ReservationReturn;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::backoff::Backoff;
 use crate::common::UncommittedSlot;
@@ -454,14 +455,19 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
     /// [`slot_mut`](Self::slot_mut) + [`MaybeUninit::write`].
     /// Committing without initializing causes consumers to read
     /// uninitialized memory (undefined behavior).
+    ///
+    /// The rollback `Drop` is disarmed *before* `ready` is published,
+    /// not after the wake: a panicking waker between the two would
+    /// otherwise return a position the consumers can already see to this
+    /// producer's batch, handing the same slot out twice.
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        let q = &*self.producer.queue;
-        q.ready_slot(self.pos).publish(self.pos);
+        // Skips SlotWriter::drop, which would restore the bit.
+        let this = std::mem::ManuallyDrop::new(self);
+        let q = &*this.producer.queue;
+        q.ready_slot(this.pos).publish(this.pos);
         q.consumer_park.wake_one();
         q.notify_consumers();
-        // Skip SlotWriter::drop (which would restore the bit).
-        std::mem::forget(self);
     }
 }
 
@@ -513,10 +519,14 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
 
 impl<T, C: Config> Drop for WrittenSlot<'_, T, C> {
     fn drop(&mut self) {
-        if self.value.drop_if_uncommitted() {
-            // Restore the bit so the position can be reused.
-            let unused = self.producer.batch_unused.get();
-            self.producer.batch_unused.set(unused | (1u32 << self.bit));
+        if !self.value.is_armed() {
+            return;
         }
+        // The bit is restored before the value is dropped so that a
+        // panicking `T::drop` still hands the position back. Unwinding
+        // past the return would reserve it for the rest of this
+        // handle's life.
+        let _return = ReservationReturn::new(&self.producer.batch_unused, self.bit);
+        self.value.drop_if_uncommitted();
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::reservation_release::ReservationRelease;
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
@@ -388,13 +389,18 @@ impl<'a, T> SlotWriter<'a, T> {
     ///
     /// The caller must have initialized the slot data via
     /// [`slot_mut`](Self::slot_mut).
+    ///
+    /// The tombstoning `Drop` is disarmed *before* the sequence is
+    /// published, not after the wake: a panicking waker between the two
+    /// would otherwise tombstone a position the consumer can already
+    /// see, losing the value it published.
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.slot_seq.publish(self.pos);
-        self.queue.wake_consumer();
+        let this = std::mem::ManuallyDrop::new(self);
+        this.slot_seq.publish(this.pos);
+        this.queue.wake_consumer();
         #[cfg(feature = "async")]
-        self.queue.wake_consumer_async();
-        std::mem::forget(self);
+        this.queue.wake_consumer_async();
     }
 }
 
@@ -441,11 +447,15 @@ impl<T> WrittenSlot<'_, T> {
 
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
-        if self.value.drop_if_uncommitted() {
-            self.slot_seq.tombstone();
-            self.queue.wake_consumer();
-            #[cfg(feature = "async")]
-            self.queue.wake_consumer_async();
+        if !self.value.is_armed() {
+            return;
         }
+        // The tombstone is armed before the value is dropped so that a
+        // panicking `T::drop` still hands this position back. Unwinding
+        // past the release would leave the position claimed forever: the
+        // consumer stops there waiting for a publication that never
+        // comes.
+        let _release = ReservationRelease::new(self.slot_seq, self.queue);
+        self.value.drop_if_uncommitted();
     }
 }

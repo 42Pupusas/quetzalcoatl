@@ -45,8 +45,23 @@ impl<T> UncommittedSlot<T> {
         self.armed = false;
     }
 
+    /// Whether the guard still owns a value, and so still owes both the
+    /// destructor and the slot release.
+    ///
+    /// Ask this *before* [`drop_if_uncommitted`](Self::drop_if_uncommitted)
+    /// when the release must survive a panicking `T::drop`: the return
+    /// value of that call is only observable once the destructor has
+    /// already run, so an unwind never reaches it.
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     /// Drops the value if it was never committed, and reports whether
     /// it did — a `true` means the caller still owes the slot release.
+    ///
+    /// The report is unreachable when `T::drop` panics; a caller whose
+    /// release must run on the unwind path should arm a guard from
+    /// [`is_armed`](Self::is_armed) instead of branching on this.
     ///
     /// Idempotent: a second call reports `false` and drops nothing.
     pub fn drop_if_uncommitted(&mut self) -> bool {
