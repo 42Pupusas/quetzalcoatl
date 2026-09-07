@@ -448,6 +448,64 @@ mod tests {
         );
     }
 
+    /// The futile-wake counter must be able to fire, and must not fire
+    /// on an ordinary wake that the waiter used.
+    ///
+    /// A consumer parks on an empty ring; a bare `wake_one` with
+    /// nothing published delivers a real unpark that buys the consumer
+    /// nothing, so it loops and parks again. That is a futile wake. The
+    /// later `push` ends the call for real and must not add another.
+    #[test]
+    #[cfg(feature = "backstop-metrics")]
+    fn the_monitor_counts_a_wake_that_bought_the_waiter_nothing() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let ring = std::sync::Arc::clone(&producer.queue);
+
+        let reader = std::thread::spawn(move || consumer.pop_block());
+
+        ParkProbe::new().expect_until("the consumer to park", || {
+            ring.consumer_park.wake.load(Ordering::Relaxed) != 0
+        });
+        // A real unpark, with nothing for the consumer to find.
+        ring.consumer_park.wake_one();
+        ParkProbe::new().expect_until("the consumer to park again", || {
+            ring.consumer_park.wake.load(Ordering::Relaxed) != 0
+        });
+
+        producer.push(7).unwrap();
+        assert_eq!(reader.join().unwrap(), Some(7));
+
+        let stats = ring.backstop_stats();
+        assert!(
+            stats.saw_futile_wake(),
+            "the consumer was woken, found nothing, and re-parked: {stats:?}"
+        );
+        assert_eq!(
+            stats.futile_wakes, 1,
+            "the push that ended the call delivered a wake the consumer used: {stats:?}"
+        );
+    }
+
+    /// The complement: a wake the waiter *could* use must not be
+    /// counted, or the metric would just track park counts.
+    #[test]
+    #[cfg(feature = "backstop-metrics")]
+    fn a_wake_the_waiter_uses_is_not_counted_as_futile() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let ring = std::sync::Arc::clone(&producer.queue);
+
+        let reader = std::thread::spawn(move || consumer.pop_block());
+
+        ParkProbe::new().expect_until("the consumer to park", || {
+            ring.consumer_park.wake.load(Ordering::Relaxed) != 0
+        });
+        producer.push(7).unwrap();
+
+        assert_eq!(reader.join().unwrap(), Some(7));
+        let stats = ring.backstop_stats();
+        assert!(!stats.saw_futile_wake(), "{stats:?}");
+    }
+
     #[test]
     fn basic_push_pop() {
         let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
@@ -1854,8 +1912,8 @@ mod tests {
             #[cfg(feature = "backstop-metrics")]
             {
                 let stats = stats_q.backstop_stats();
-                if stats.saw_rescue() {
-                    eprintln!("iter {iter}: backstop rescue — {stats:?}");
+                if stats.saw_rescue() || stats.saw_futile_wake() {
+                    eprintln!("iter {iter}: {stats:?}");
                 }
                 assert!(
                     !stats.saw_unexplained_rescue(),

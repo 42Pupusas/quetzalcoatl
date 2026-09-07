@@ -475,6 +475,61 @@ mod tests {
     /// never deliver one must still terminate: every iteration clears
     /// the bit it picked, so the bitmap drains and the `ws == 0` exit
     /// is reached rather than the loop spinning on undeliverable bits.
+    /// Round-robin is a fairness policy, not a delivery guarantee,
+    /// and the difference matters because mpmc producers are not
+    /// interchangeable waiters. Each parks holding a batch of
+    /// *specific* reserved positions, and `DoneWord::is_free_for`
+    /// matches an exact position, so a producer woken for a slot
+    /// outside its batch cannot use it and re-parks.
+    ///
+    /// So "the wake went to another waiter" is only harmless when
+    /// that waiter could actually consume it. When it could not, the
+    /// event is spent: `wake_one` delivers one unpark per publish,
+    /// and the producer that *was* waiting on that exact position
+    /// stays parked. This is the starvation the cursor was added to
+    /// fix, and the cursor does not close it — it only changes which
+    /// waiter is passed over.
+    ///
+    /// Here slot 0 is woken and re-parks (it cannot use the freed
+    /// position), while slot 1 is the one that needed it. The second
+    /// wake must reach slot 1 rather than returning to slot 0.
+    #[test]
+    fn a_waiter_that_cannot_use_its_wake_does_not_reclaim_the_next_one() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+
+        set.wake_one();
+        assert_eq!(set.parked_slots(), vec![1], "the first wake serves slot 0");
+
+        set.arm(ParkSlot::Leased(0));
+        set.wake_one();
+
+        assert_eq!(
+            set.parked_slots(),
+            vec![0],
+            "a waiter that re-parked must not consume the wake owed to slot 1"
+        );
+    }
+
+    /// The cursor is shared per side, so it is advanced by whichever
+    /// waker ran last rather than per waiter. Two publishers waking
+    /// concurrently must still walk both parked slots rather than
+    /// both landing on the same one.
+    #[test]
+    fn two_wakes_from_one_cursor_reach_two_distinct_slots() {
+        let set = WakeSet::new();
+        set.arm_all(&[4, 5]);
+
+        set.wake_one();
+        set.wake_one();
+
+        assert_eq!(
+            set.parked_bits(),
+            0,
+            "both waiters were parked and two wakes were issued, so neither may be skipped"
+        );
+    }
+
     #[test]
     fn a_batch_wake_terminates_when_no_bit_can_deliver() {
         let set = WakeSet::new();

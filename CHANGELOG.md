@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round-robin cannot explain the wake having gone elsewhere. Plain
   rescues turned out to be mostly round-robin artifacts.
 
+  A third counter, `futile_wakes`, tests that excuse rather than
+  trusting it. "Round-robin explains it" claims the wake reached
+  another waiter, which is only harmless if that waiter could use it —
+  and mpmc producers are not interchangeable. Each parks holding a
+  batch of *specific* reserved positions, and a slot is free only for
+  one exact position, so a producer woken for a position outside its
+  batch re-parks and the publish that woke it is spent. `futile_wakes`
+  counts a park that a peer's wake genuinely ended, whose waiter then
+  found no work and parked again.
+
+  Under saturated stress these are common — tens per run across ~15% of
+  iterations — so wake routing is measurably lossy even when nothing
+  hangs. Every rescue observed since co-occurred with one, which is
+  suggestive but not yet causal; the event counts are too small to
+  separate from noise. See `PERFORMANCE_AUDIT.md`.
+
   Off by default: the ring carries no counters and the call sites
   compile to nothing.
 

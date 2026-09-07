@@ -177,6 +177,46 @@ clean, but "no rescue observed" is the same evidence that was
 misleading before. The bound comes out only after a long instrumented
 campaign with a rescue count of zero.
 
+## Futile wakes
+
+Rescues were repeatedly dismissed as "round-robin explains it": the
+wake reached another waiter rather than being lost. That excuse was
+never tested, and it hides an assumption that is false here — that the
+other waiter could use the wake.
+
+mpmc producers are not interchangeable. Each parks holding a batch of
+*specific* reserved positions from the `claim` cursor, and `DoneWord`
+frees a slot for one exact position, so a producer woken for a position
+outside its batch cannot use it and re-parks. `wake_one` delivers one
+unpark per publish, so that publish is spent and the producer that was
+waiting on the position gets nothing. Round-robin does not fix this; it
+only changes who is passed over.
+
+`futile_wakes` measures it: a park a peer's wake genuinely ended, whose
+waiter then found no work and parked again. Two calibrations bracket
+the counter — one stages a futile wake, one confirms a usable wake is
+not counted.
+
+Measured on `block_stress_diagnostic` (200 iterations, 2 producers x
+5000 items, cap 16):
+
+| | rescues | futile wakes | iterations with futile wakes |
+|---|---|---|---|
+| `wake_one` | 2 | ~45 | 30 / 200 |
+| `flush` (experiment) | 0 | ~50 | 28 / 200 |
+
+Two findings. Futile wakes are **common** — tens per run, not a rare
+race — so wake routing is measurably lossy under saturation even when
+nothing hangs. And both rescues in the `wake_one` run co-occurred with
+a futile wake in the same iteration.
+
+That co-occurrence is suggestive, not causal. Waking every producer
+instead of one dropped rescues from 2 to 0, but the run had only 3
+unwoken timeouts against 1, which is far too few events to separate the
+effect from noise. The experiment was reverted. Establishing the link
+needs thousands of iterations at both settings, comparing rescues per
+unwoken timeout rather than per run.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -198,5 +238,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
-7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
-8. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
+7. **Settle whether futile wakes cause the residual rescues.** `futile_wakes` shows wake routing is lossy under saturation (see "Futile wakes"), and every rescue observed since co-occurred with one, but the event counts are far too small to call it causal. Run both wake policies for thousands of iterations and compare rescues *per unwoken timeout*. If the link holds, the fix is to route wakes by what a waiter is waiting for rather than by park slot — which means the wake bitmap needs to carry the awaited position, not just "someone is parked here." That is a protocol change, so measure first.
+8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
+9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

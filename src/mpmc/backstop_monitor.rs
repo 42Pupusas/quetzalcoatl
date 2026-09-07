@@ -42,6 +42,32 @@
 //! between the samples. Treat a sole-waiter rescue as the strongest
 //! available evidence of a lost wake, not as a closed case.
 //!
+//! # Futile wakes: what "round-robin explains it" is really claiming
+//!
+//! Attributing a rescue to round-robin says the wake reached another
+//! waiter instead. That is only harmless if the other waiter could use
+//! it, and in mpmc it often cannot: a producer parks holding a batch of
+//! *specific* reserved positions, and a slot is free only for the exact
+//! position [`DoneWord`](super::done_word::DoneWord) names. A producer
+//! woken for a position outside its batch re-parks, and the publish
+//! that woke it is spent — [`WakeSet::wake_one`] delivers one unpark per
+//! publish, so the producer that *was* waiting on that position does
+//! not get one.
+//!
+//! `futile_wakes` counts exactly that: a park a peer's wake genuinely
+//! ended, whose waiter then found nothing to do and parked again. It
+//! separates "the wake was lost" from "the wake was delivered to the
+//! wrong waiter", which the rescue counts cannot do alone. A rescue
+//! accompanied by futile wakes is a routing failure; a sole-waiter
+//! rescue with none is a genuinely lost wake.
+//!
+//! A non-zero count is not by itself a defect — a woken producer can
+//! lose a slot to a peer that claimed it first, which is ordinary
+//! contention. The count matters as a *rate* next to the rescues, and
+//! as the thing to watch when a wake-routing change is meant to help.
+//!
+//! [`WakeSet::wake_one`]: crate::common::park::WakeSet::wake_one
+//!
 //! # Cost
 //!
 //! Gated behind the `backstop-metrics` feature. Without it
@@ -62,6 +88,22 @@ pub struct BackstopStats {
     /// Rescues where no other waiter was parked on this side, so
     /// round-robin cannot explain the wake going elsewhere.
     pub sole_waiter_rescues: u64,
+    /// Parks that a peer's wake genuinely ended, but whose waiter
+    /// then found nothing to do and parked again.
+    ///
+    /// This is the cost of routing a wake by park slot when waiters
+    /// are not interchangeable. An mpmc producer parks holding a
+    /// batch of specific reserved positions and
+    /// [`DoneWord::is_free_for`](super::done_word::DoneWord) matches
+    /// an exact position, so a producer woken for a position outside
+    /// its batch cannot use it. The publish that woke it is spent,
+    /// and the producer that *was* waiting on that position is not
+    /// woken by it.
+    ///
+    /// Distinguishes "the wake was lost" from "the wake was
+    /// delivered to someone who could not use it", which the rescue
+    /// counts alone cannot.
+    pub futile_wakes: u64,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -80,6 +122,13 @@ impl BackstopStats {
     pub const fn saw_unexplained_rescue(self) -> bool {
         self.sole_waiter_rescues > 0
     }
+
+    /// Whether any delivered wake was spent on a waiter that could
+    /// not use it.
+    #[must_use]
+    pub const fn saw_futile_wake(self) -> bool {
+        self.futile_wakes > 0
+    }
 }
 
 /// Per-ring backstop counters.
@@ -88,6 +137,7 @@ pub struct BackstopMonitor {
     unwoken_timeouts: AtomicU64,
     rescues: AtomicU64,
     sole_waiter_rescues: AtomicU64,
+    futile_wakes: AtomicU64,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -97,6 +147,7 @@ impl BackstopMonitor {
             unwoken_timeouts: AtomicU64::new(0),
             rescues: AtomicU64::new(0),
             sole_waiter_rescues: AtomicU64::new(0),
+            futile_wakes: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +162,10 @@ impl BackstopMonitor {
         }
     }
 
+    fn record_futile_wake(&self) {
+        self.futile_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Reads both counters.
     ///
     /// The two loads are independent, so a concurrent waiter can be
@@ -121,6 +176,7 @@ impl BackstopMonitor {
             unwoken_timeouts: self.unwoken_timeouts.load(Ordering::Relaxed),
             rescues: self.rescues.load(Ordering::Relaxed),
             sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
+            futile_wakes: self.futile_wakes.load(Ordering::Relaxed),
         }
     }
 }
@@ -146,6 +202,7 @@ pub struct BackstopWatch {
     monitor: *const BackstopMonitor,
     timed_out: bool,
     sole_waiter: bool,
+    woken: bool,
 }
 
 #[cfg(feature = "backstop-metrics")]
@@ -158,6 +215,7 @@ impl BackstopWatch {
             monitor,
             timed_out: false,
             sole_waiter: false,
+            woken: false,
         }
     }
 
@@ -170,7 +228,14 @@ impl BackstopWatch {
     /// Records the peer count sampled just before the sleep, so a
     /// waiter that was already parked when we went to sleep is not
     /// mistaken for an absent one.
-    pub(crate) const fn about_to_park(&mut self, peers_parked: u32) {
+    /// Reaching this a second time without an intervening
+    /// [`made_progress`](Self::made_progress) means the wake that
+    /// ended the last park bought nothing: the waiter looped, found
+    /// no work, and is parking again.
+    pub(crate) fn about_to_park(&mut self, peers_parked: u32) {
+        if std::mem::replace(&mut self.woken, false) {
+            self.monitor().record_futile_wake();
+        }
         self.sole_waiter = peers_parked == 0;
     }
 
@@ -181,6 +246,7 @@ impl BackstopWatch {
     /// instead of us.
     pub(crate) fn parked(&mut self, unwoken: bool, peers_parked: u32) {
         self.timed_out = unwoken;
+        self.woken = !unwoken;
         self.sole_waiter = self.sole_waiter && peers_parked == 0;
         if unwoken {
             self.monitor().record_timeout();
@@ -190,6 +256,7 @@ impl BackstopWatch {
     /// Records that the waiter found work. Counts a rescue when the
     /// preceding park ended on the timeout.
     pub(crate) fn made_progress(&mut self) {
+        self.woken = false;
         if std::mem::replace(&mut self.timed_out, false) {
             self.monitor().record_rescue(self.sole_waiter);
         }
@@ -209,6 +276,7 @@ pub struct BackstopWatch;
 impl BackstopWatch {
     #[inline]
     pub(crate) const fn about_to_park(&mut self, _peers_parked: u32) {}
+
 
     #[inline]
     pub(crate) const fn parked(&mut self, _unwoken: bool, _peers_parked: u32) {}
