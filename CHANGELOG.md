@@ -58,6 +58,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interchangeable, so the pin requires out-of-order consumption to
   arise — which is why the residual rate is low rather than constant.
 
+- **Sole-waiter rescues are now split by whether the wake bit was
+  taken.** `WakeSet::wake_one` clears a waiter's bit *before* claiming
+  its handle, so "the handle is still armed" — previously the only
+  test for whether a peer had come — cannot distinguish a waiter
+  nobody touched from one whose bit a peer had already taken.
+
+  `WakeDelivery` reads the bit alongside the handle and names the
+  states, including `Slotless` for a waiter holding no park slot, whose
+  parks end on the timeout by construction and are no evidence of
+  anything. `RescueEvidence` accumulates the observations across a park
+  episode.
+
+  The split narrows where to look; it does **not** exonerate. A bit
+  cleared with no unpark arriving is equally the signature of a wake
+  that was *stolen* — which is exactly how the existing calibration
+  test stages a lost wake — so `bit_taken_rescues` is reported beside
+  the raw `sole_waiter_rescues` rather than subtracted from it, and the
+  stress assertion still reads the raw count. No verdict on the
+  rescues yet: four runs since produced none.
+
 - **Fixed: a consumer could report an empty ring after one lost CAS.**
   `claim_slot` budgeted a lap at `cap` iterations but charged a lost
   CAS `CAS_FAIL_SKIP - 1` of them — 128 by default — so on any ring

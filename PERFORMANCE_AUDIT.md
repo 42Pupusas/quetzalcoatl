@@ -261,6 +261,46 @@ They are rare, they do not correlate with any change made so far, and
 they are what `PARK_BACKSTOP` is currently catching. The backstop
 cannot be removed while they occur.
 
+#### Sharpening the instrument, and one thing it cannot do
+
+"Was this waiter woken?" was answered by a single test: is its park
+handle still armed. That test is too coarse, because
+[`WakeSet::wake_one`](src/common/park.rs) clears a waiter's wake bit
+**before** claiming its handle. A timeout firing between those two
+steps finds an armed handle with the bit already gone.
+
+[`WakeDelivery`](src/common/wake_delivery.rs) reads both and names the
+states: `Delivered`, `InFlight` (bit gone, no unpark), `Untouched`, and
+`Slotless` for a [`ParkSlot::Shared`] waiter, which publishes no bit,
+arms no handle, and therefore times out by construction rather than by
+defect. [`RescueEvidence`](src/mpmc/rescue_evidence.rs) accumulates
+that over a park episode; observations never weaken, so a bit taken at
+any park in the episode stays on record.
+
+**The intended use of this split was wrong.** The plan was to subtract
+the in-flight population from the lost-wake count as benign. It is not
+benign: the crate's existing calibration test
+`the_monitor_counts_a_wake_that_never_arrived` stages a *genuinely
+lost* wake by clearing the waiter's bit so the publisher finds nobody
+to unpark — which leaves exactly the armed-handle-with-cleared-bit
+signature. A stolen wake and a late one are indistinguishable from the
+waiter's side.
+
+So `bit_taken_rescues` is documented as a weaker suspicion rather than
+an exoneration, the stress assertion stays on the raw
+`sole_waiter_rescues`, and the calibration test now asserts
+`bit_taken_rescues == 1` so the overlap is pinned in place and cannot
+be quietly reinterpreted as a filter later.
+
+**No verdict on the rescues themselves.** Four consecutive
+200-iteration runs after this work produced `rescues=0`, so the
+sharpened instrument has not yet observed the event it was built for.
+The rate quoted above (~1 per two or three runs) came from runs that
+also hit the assertion and aborted early, so it is an estimate from a
+small and biased sample, not a measured frequency. Slotless waiters are
+ruled out for this harness specifically: it uses two producers and two
+consumers against 64 park slots, so every waiter holds a lease.
+
 ### Position-targeted wakes: built, measured, rejected
 
 The obvious fix follows from the pin: have a waiter publish the
@@ -379,6 +419,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
 7. **Find out what the consumer *blind* futile wakes are.** Asking this question found and fixed one real defect — a lost CAS could exhaust the whole lap budget (see "The scan budget a single lost CAS could exhaust") — but fixing it did not move the count, so the cause is elsewhere. What is now known: blind futile wakes are almost entirely consumer-side, and the counter has a false-positive mode where an item published between the failed re-check and the sample looks like blindness. Before chasing it further, tighten the sample so the two are distinguishable — recording *which* position was visible and whether that position was still unclaimed when the waiter next ran would separate a genuine scan miss from a publish that simply arrived late. Position-targeted wakes were built for the producer side and measured as no better than baseline; the code was reverted rather than kept on the strength of the mechanism alone.
 
-8. **Explain the sole-waiter rescues before removing `PARK_BACKSTOP`.** They recur at roughly one per two or three 200-iteration runs, do not reproduce on an immediate re-run, and are uncorrelated with every change made so far (they were initially blamed on position-targeted wakes and then observed with that code reverted). Each is a waiter the timeout released with no peer parked to have absorbed its wake. This is the remaining reason the backstop cannot go.
+8. **Explain the sole-waiter rescues before removing `PARK_BACKSTOP`.** Each is a waiter the timeout released with no peer parked to have absorbed its wake, and this is the remaining reason the backstop cannot go. The instrument is now sharper (see "Sharpening the instrument"): rescues are split by whether the waiter's wake bit had been taken, and slotless waiters — which time out by construction — are separated out. What is *not* yet true is that the event has been caught with the sharper instrument: four consecutive runs since produced `rescues=0`. The quoted rate of one per two or three runs comes from a small, biased sample, because a run that hits the assertion aborts early. Next: get a real rate. The stress harness aborts on the event it is trying to measure, which is the wrong shape for estimating a frequency — accumulate across runs without aborting, then compare populations.
 8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
