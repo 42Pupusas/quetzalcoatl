@@ -3,6 +3,7 @@ use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use super::consumer_close::ConsumerClose;
 use super::head_publisher::HeadPublisher;
 use super::RingBuffer;
 #[cfg(feature = "async")]
@@ -328,12 +329,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     fn drop(&mut self) {
+        // Armed before the drain: `T::drop` is user code, and unwinding
+        // past the close would leave the ring looking open for as long
+        // as it lives. Symmetric to Producer::drop.
+        // SAFETY: the consumer's handle keeps the ring alive for the
+        // whole of this destructor.
+        let _close = unsafe { ConsumerClose::new(std::ptr::from_ref(&*self.queue)) };
         while self.pop().is_some() {}
-        // Symmetric to Producer::drop.
-        self.ring().consumer_closed.close();
-        self.ring().wake_producer();
-        #[cfg(feature = "async")]
-        self.ring().producer_waker.flush();
     }
 }
 

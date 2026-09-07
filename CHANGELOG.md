@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A panicking `T::drop` during consumer teardown left the ring
+  looking open.** spsc's `Consumer::drop` drains the backlog before it
+  closes, and spmc's drops its unread batch before it releases the park
+  slot and decrements the live count. Those destructors are user code:
+  unwinding past the close left `consumer_closed` unset (spsc) or the
+  live count permanently high (spmc), so a producer never learned its
+  peer was gone — `push_block` parks untimed, so it waited forever.
+
+  The close now runs from a `ConsumerClose` guard armed before the
+  drain, in both rings. The drain-then-close order is preserved, since
+  a producer woken by the close must find the freed positions already
+  published. mpsc was already correct: it closes *before* draining.
+
+  `RingBuffer::drop` has the same shape — one panicking value skips
+  every later slot — but the consequence is a leak, not a stall, and
+  `std` makes the same trade for `Vec`. Left as is.
+
 - **A panicking `T::drop` under an spmc `SlotReader` lost the slot.**
   `SlotReader::drop` ran the value's destructor and only then stored
   `done`, so an unwind in between never handed the position back. The

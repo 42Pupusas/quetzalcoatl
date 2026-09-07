@@ -2,10 +2,11 @@
 
 ## Status
 
-Performance work is screening only, and is not a sign-off. Five
-unwind-safety bugs were found by reading the reservation, drain and
-consumer-release paths, reproduced with failing tests, and fixed; see
-the changelog. The remaining correctness gaps below are still open.
+Performance work is screening only, and is not a sign-off. Seven
+unwind-safety bugs were found by reading the reservation, drain,
+consumer-release and teardown paths, reproduced with failing tests, and
+fixed; see the changelog. The remaining correctness gaps below are still
+open.
 
 Baseline: Git tag v0.14.0 (1b21acf), not the published tarball. The changelog reports missing source files in that tarball; the Git checkout builds. Baseline worktree: `/tmp/quetzalcoatl-audit-v014`. Separate target directories: `/tmp/quetzalcoatl-audit-target-v014` and `/tmp/quetzalcoatl-audit-target-head`.
 
@@ -78,6 +79,15 @@ test confirmed to fail before the fix.
 5. **A panicking `T::clone` in `broadcast::Consumer::pop`** skipped the
    head advance, leaving the consumer re-reading the same position
    forever and pinning `min_head` against the producer.
+6. **A panicking `T::drop` during spsc `Consumer::drop`** skipped the
+   close, so the ring looked open for as long as it lived.
+7. **The same during spmc `Consumer::drop`** skipped the park-slot
+   release and the live-count decrement, so the ring never reported
+   itself closed.
+
+The endpoint destructors are now covered. `RingBuffer::drop` shares the
+shape — one panicking value skips every later slot — but leaks rather
+than stalls, which is the trade `std` makes for `Vec`; it is left as is.
 
 Searching for the shape rather than the instance found all but the
 first: a release, wake or cursor advance gated behind code that may
@@ -86,8 +96,14 @@ unwind. The user code that can unwind is not only `T::drop` — it is also
 
 The fix each time is the same RAII shape the codebase already used in
 `SlotRelease`, `BatchRelease` and `HeadPublisher`; the gaps were the
-places that had not adopted it. spsc and mpsc were consistently ahead of
-the other rings here.
+places that had not adopted it. No ring was uniformly ahead: spsc and
+mpsc already guarded the reader paths, mpsc alone ordered its teardown
+close before the drain, and spsc needed the same fix as spmc there.
+
+Ordering is sometimes the whole fix. mpsc closes before it drains and
+was correct for free; spsc and spmc drain first, which they must, since
+a producer woken by the close has to find the freed positions already
+published — so they need the guard instead.
 
 Several first-draft tests passed while the bug was present — the mpmc
 async one because `await` re-polls and finds the space regardless of any
@@ -119,7 +135,7 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 2. Reproduce MPSC spin/8–16 and broadcast regressions with that harness. Bisect fixes versus subsequent owner-extraction refactors; inspect cross-crate generated code and cache-line placement before changing synchronization.
 3. Cover all five topologies: push/pop, reserve/commit/pop_ref, drain, saturation, empty-to-nonempty wake latency, endpoint churn, and cancellation. Include async on/off and >64 live waiters for overflow paths.
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
-5. Audit the endpoint destructors, the only unwind paths not yet covered: `Producer::drop`, `Consumer::drop`, `RingBuffer::drop` and `BatchAbandon`, where a panicking `T::drop` during teardown can skip the close/flush that lets peers exit.
+5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. Decide whether mpmc's `PARK_BACKSTOP` should stay. It converted this bug from a hang into a stall and so hid it from the blocking tests; the comment already records that it is a backstop against an unproven residual race.
 7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers.
 8. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

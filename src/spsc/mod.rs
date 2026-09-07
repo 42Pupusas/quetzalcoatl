@@ -25,6 +25,7 @@
 //! ```
 
 mod consumer;
+mod consumer_close;
 mod head_publisher;
 #[cfg(test)]
 mod pinned_ring;
@@ -1196,6 +1197,42 @@ mod tests {
         assert!(result.is_err(), "the callback panic must propagate");
 
         assert_eq!(pusher.join().unwrap(), Ok(()));
+    }
+
+    /// `Consumer::drop` drains the backlog and only then closes. The
+    /// drain runs `T::drop`, which is user code: unwinding past the
+    /// close leaves the ring looking open forever, so a producer never
+    /// learns its peer is gone.
+    #[test]
+    fn a_panicking_drop_during_consumer_teardown_still_closes() {
+        #[derive(Debug)]
+        struct PanicOnDrop {
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let (p, c) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+        p.push(PanicOnDrop { panics: true }).unwrap();
+        p.push(PanicOnDrop { panics: false }).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c)));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        assert!(
+            p.queue.consumer_closed.is_closed(),
+            "the producer must observe the consumer as closed"
+        );
+        // `push_block` parks untimed, so a missed close hangs here
+        // rather than failing.
+        assert!(
+            p.push_block(PanicOnDrop { panics: false }).is_err(),
+            "a blocking push must refuse to fill space that will never be read"
+        );
     }
 
     #[test]

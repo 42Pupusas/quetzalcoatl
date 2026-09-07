@@ -47,6 +47,7 @@
 
 mod consumer;
 mod done_word;
+mod consumer_close;
 mod drain_wake;
 mod producer;
 mod slot_release;
@@ -1274,6 +1275,49 @@ mod tests {
     /// `SlotReader::drop` runs `T::drop` before storing `done`, so an
     /// unwind in between never releases the slot — the producer can
     /// never reuse that position, and one blocked on it never wakes.
+    /// `Consumer::drop` drops its unread batch and only then, on the
+    /// last consumer, closes. Those drops are user code: unwinding past
+    /// the close leaves the ring looking open forever, so a producer in
+    /// `push_block` — which parks untimed — never learns its peers are
+    /// gone.
+    #[test]
+    fn a_panicking_drop_during_consumer_teardown_still_closes() {
+        #[derive(Debug)]
+        struct PanicOnDrop {
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let (producer, mut consumer) =
+            RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+        // The first value is read out here; the second stays unread in
+        // the consumer's claimed batch, so teardown is what runs its
+        // destructor, and it is the one that panics.
+        producer.push(PanicOnDrop { panics: false }).unwrap();
+        producer.push(PanicOnDrop { panics: true }).unwrap();
+
+        assert!(consumer.pop_ref().is_some());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(consumer)));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        assert!(
+            producer.queue.consumer_closed.is_closed(),
+            "the producer must observe the last consumer as closed"
+        );
+        // `push_block` parks untimed, so a missed close hangs here
+        // rather than failing.
+        assert!(
+            producer.push_block(PanicOnDrop { panics: false }).is_err(),
+            "a blocking push must refuse to fill space that will never be read"
+        );
+    }
+
     #[test]
     fn a_panicking_slot_reader_drop_still_releases_its_slot() {
         // Only the first value panics: a second unwinding destructor

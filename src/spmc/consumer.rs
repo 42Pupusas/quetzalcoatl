@@ -8,6 +8,7 @@ use std::task::Poll;
 
 use super::done_word::DoneWord;
 use super::drain_wake::DrainWake;
+use super::consumer_close::ConsumerClose;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
 use crate::capacity::Capacity;
@@ -432,6 +433,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     fn drop(&mut self) {
         let q = self.ring();
+        // Armed before the batch drops: `T::drop` is user code, and
+        // unwinding past the retire would leave the live count high
+        // forever, so the ring never reports itself closed.
+        // SAFETY: the consumer's handle keeps the ring alive for the
+        // whole of this destructor, and `park_slot` is ours, unreleased.
+        let _close = unsafe { ConsumerClose::new(std::ptr::from_ref(q), self.park_slot) };
         let next = self.batch_next.get();
         let end = self.batch_end.get();
         for pos in next..end {
@@ -439,17 +446,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
                 q.data_slot(pos).get().cast::<T>().drop_in_place();
             }
             q.done_slot(pos).release(pos, q.capacity);
-        }
-        q.consumer_slots.release(self.park_slot);
-        if q.consumer_count_live.release() {
-            // SeqCst store + wake_producer's SeqCst load of the parked
-            // flag are the two halves of the close handshake. Reading
-            // the parker handle directly skips the load and lets the
-            // producer park after we decide not to wake it.
-            q.consumer_closed.close();
-            q.wake_producer();
-            #[cfg(feature = "async")]
-            q.producer_waker.flush();
         }
     }
 }
