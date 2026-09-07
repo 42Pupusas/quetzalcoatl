@@ -289,12 +289,7 @@ impl<T, C: Config> Producer<T, C> {
                 self.has_free_slot(),
             );
             park_slot.park_bounded(PARK_BACKSTOP);
-            // A wake claims the handle, so one still armed means the
-            // sleep ended on the timeout instead.
-            watch.parked(
-                self.queue.producer_park.is_armed(park_slot),
-                self.queue.producer_park.others_parked(park_slot),
-            );
+            watch.parked_at(&self.queue.producer_park, park_slot);
             self.queue.producer_park.disarm(park_slot);
         }
     }
@@ -360,12 +355,7 @@ impl<T, C: Config> Producer<T, C> {
             // one, so the bound stays until it is.
             watch.about_to_park(q.producer_park.others_parked(slot), self.has_free_slot());
             slot.park_bounded(PARK_BACKSTOP);
-            // A wake claims the handle, so one still armed means the
-            // sleep ended on the timeout instead.
-            watch.parked(
-                q.producer_park.is_armed(slot),
-                q.producer_park.others_parked(slot),
-            );
+            watch.parked_at(&q.producer_park, slot);
             q.producer_park.disarm(slot);
         }
     }

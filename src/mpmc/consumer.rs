@@ -335,12 +335,7 @@ impl<T, C: Config> Consumer<T, C> {
             // Bounded park backstop — see Producer::push_block.
             watch.about_to_park(q.consumer_park.others_parked(slot), self.has_item());
             slot.park_bounded(PARK_BACKSTOP);
-            // A wake claims the handle, so one still armed means the
-            // sleep ended on the timeout instead.
-            watch.parked(
-                q.consumer_park.is_armed(slot),
-                q.consumer_park.others_parked(slot),
-            );
+            watch.parked_at(&q.consumer_park, slot);
             q.consumer_park.disarm(slot);
         }
     }
@@ -449,12 +444,7 @@ impl<T, C: Config> Consumer<T, C> {
                 self.has_item(),
             );
             park_slot.park_bounded(PARK_BACKSTOP);
-            // A wake claims the handle, so one still armed means the
-            // sleep ended on the timeout instead.
-            watch.parked(
-                self.queue.consumer_park.is_armed(park_slot),
-                self.queue.consumer_park.others_parked(park_slot),
-            );
+            watch.parked_at(&self.queue.consumer_park, park_slot);
             self.queue.consumer_park.disarm(park_slot);
         }
     }

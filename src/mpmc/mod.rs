@@ -63,6 +63,8 @@ mod drain_wake;
 mod producer;
 mod ready_word;
 mod reservation_return;
+#[cfg(feature = "backstop-metrics")]
+mod rescue_evidence;
 mod scan_budget;
 mod slot_release;
 
@@ -481,6 +483,11 @@ mod tests {
         assert!(
             stats.saw_rescue(),
             "the backstop released a waiter whose wake went missing, so it must be counted: {stats:?}"
+        );
+        assert_eq!(
+            stats.bit_taken_rescues, 1,
+            "a cleared bit over an armed handle is what a stolen wake leaves behind, \
+             and is why that reading cannot be treated as benign: {stats:?}"
         );
     }
 
@@ -2070,7 +2077,9 @@ mod tests {
             mut producer_blind_total,
             mut rescue_total,
             mut timeout_total,
-        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            mut sole_total,
+            mut bit_taken_total,
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         for iter in 0..200 {
             if iter % 10 == 0 {
                 eprintln!("iter {iter}");
@@ -2150,6 +2159,16 @@ mod tests {
                 producer_blind_total += stats.producer_blind_futile_wakes;
                 rescue_total += stats.rescues;
                 timeout_total += stats.unwoken_timeouts;
+                sole_total += stats.sole_waiter_rescues;
+                bit_taken_total += stats.bit_taken_rescues;
+                // Deliberately the raw sole-waiter count, not the
+                // in-flight-adjusted one: a cleared bit over an armed
+                // handle cannot distinguish a wake that raced the
+                // clock from one that was stolen outright, so
+                // subtracting it would hide the very defect this
+                // watches for. See `the_monitor_counts_a_wake_that
+                // _never_arrived`, which is a lost wake that the
+                // in-flight test calls explained.
                 assert!(
                     !stats.saw_unexplained_rescue(),
                     "iter {iter}: a waiter was rescued by the timeout with no peer parked to \
@@ -2165,7 +2184,8 @@ mod tests {
         eprintln!(
             "TOTALS futile={futile_total} (producer={producer_futile_total}, \
              blind={blind_futile_total}, producer_blind={producer_blind_total}) \
-             rescues={rescue_total} unwoken_timeouts={timeout_total}"
+             rescues={rescue_total} (sole={sole_total}, bit_taken={bit_taken_total}) \
+             unwoken_timeouts={timeout_total}"
         );
     }
 
