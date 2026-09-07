@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **The broadcast consumer-floor cache has an owner.**
+  A producer answers "may I write this position?" from a private
+  `Cell`, then a shared atomic, then a full registry scan. The three
+  levels were spread across `mod.rs` (the atomic, cache-padded and
+  `pub(crate)`) and `producer.rs` (the `Cell` and the escalation), with
+  no test reaching them directly. `SharedFloor` and `FloorCache` in
+  `broadcast/floor_cache.rs` now own them, including the `fetch_max`
+  that keeps the shared value monotonic and the `any_subscribed` gate
+  that stops a cache seeded at 0 from permitting the first `cap`
+  positions before any consumer exists. 12 tests, `Producer` shrinks by
+  a field and three methods, and the shared atomic becomes private.
+
 - **mpmc's compile-time tuning moved out of `mpmc/mod.rs`.**
   `Config`, `DefaultConfig`, `Cfg` and `ConfigBounds` now live in
   `mpmc/config.rs`; the public paths are unchanged (`mpmc::Config`

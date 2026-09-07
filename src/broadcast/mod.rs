@@ -42,6 +42,7 @@ pub mod arc;
 mod consumer;
 mod consumer_floor;
 mod consumer_registry;
+mod floor_cache;
 mod producer;
 mod slot_reuse;
 mod slot_state;
@@ -62,6 +63,7 @@ use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
 use consumer_registry::ConsumerRegistry;
+use floor_cache::{FloorCache, SharedFloor};
 use slot_state::SequenceWord;
 
 use std::cell::UnsafeCell;
@@ -103,11 +105,7 @@ pub struct RingBuffer<T> {
     pub(crate) capacity: Capacity,
     consumers: ConsumerRegistry,
     pub(crate) tail: CachePadded<AtomicUsize>,
-    /// Shared L2 cache of the consumer floor's position. Updated by any
-    /// producer after a full scan; read by all producers to avoid
-    /// redundant O(N) scans. Always ≤ the actual floor (conservative),
-    /// so a stale value is safe.
-    pub(crate) min_head_cache: CachePadded<AtomicUsize>,
+    min_head_cache: SharedFloor,
     /// Sync producer-side park state. Bit `i` of `producer_park.wake` is
     /// set while the producer in park slot `i` is blocked in
     /// [`Producer::push_block`] waiting for the slowest consumer to
@@ -169,7 +167,7 @@ impl<T> RingBuffer<T> {
             buf,
             capacity,
             tail: CachePadded(AtomicUsize::new(0)),
-            min_head_cache: CachePadded(AtomicUsize::new(0)),
+            min_head_cache: SharedFloor::new(),
             producer_park: WakeSet::new(),
             producer_park_slots: ParkRegistry::new(),
             consumers: ConsumerRegistry::new(max_consumers),
@@ -250,7 +248,7 @@ impl<T> RingBuffer<T> {
         let park_slot = arc.producer_park_slots.lease();
         let producer = Producer {
             queue: Arc::clone(&arc),
-            cached_min_head: std::cell::Cell::new(0),
+            floor_cache: FloorCache::new(),
             park_slot,
         };
         let consumer = Consumer {

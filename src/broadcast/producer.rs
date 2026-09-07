@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
-use super::consumer_floor::ConsumerFloor;
+use super::floor_cache::FloorCache;
 use super::slot_reuse::SlotReuse;
 use super::slot_state::SequenceWord;
 use super::RingBuffer;
@@ -21,7 +21,7 @@ use crate::common::park_registry::ParkSlot;
 /// by compare-and-swap on the tail.
 pub struct Producer<T> {
     pub(super) queue: Arc<RingBuffer<T>>,
-    pub(super) cached_min_head: std::cell::Cell<usize>,
+    pub(super) floor_cache: FloorCache,
     /// Park slot leased for this producer handle's lifetime and
     /// returned on drop. Used by [`Producer::push_block`] /
     /// [`Producer::reserve_block`] to register on the producer wake
@@ -35,7 +35,7 @@ impl<T> Clone for Producer<T> {
         self.queue.producer_count.register();
         Self {
             queue: Arc::clone(&self.queue),
-            cached_min_head: std::cell::Cell::new(0),
+            floor_cache: FloorCache::new(),
             park_slot: self.queue.producer_park_slots.lease(),
         }
     }
@@ -160,49 +160,18 @@ impl<T> Producer<T> {
         self.permits_with_refresh(self.queue.tail.load(Ordering::Relaxed))
     }
 
-    /// Whether `pos` is writable, consulting the per-producer cache,
-    /// then the shared cache, then a full registry scan — stopping at
-    /// the first level that says yes.
-    ///
-    /// Both caches hold a bare position and cannot represent "no
-    /// consumers", so they are only consulted while a consumer is
-    /// registered. Otherwise a cache seeded at 0 would permit the first
-    /// `cap` positions with no consumer ever having existed.
+    /// Whether `pos` is writable; see [`FloorCache::permits`].
     #[inline]
     fn permits_with_refresh(&self, pos: usize) -> bool {
-        if self.queue.consumers.any_subscribed() {
-            if self.cached_floor().permits(pos, self.queue.capacity.get()) {
-                return true;
-            }
-            let shared = self.queue.min_head_cache.load(Ordering::Acquire);
-            self.cached_min_head.set(shared);
-            if ConsumerFloor::At(shared).permits(pos, self.queue.capacity.get()) {
-                return true;
-            }
-        }
-        self.refresh_floor().permits(pos, self.queue.capacity.get())
+        self.floor_cache.permits(
+            pos,
+            self.queue.capacity.get(),
+            self.queue.consumers.any_subscribed(),
+            &self.queue.min_head_cache,
+            || self.queue.consumer_floor(),
+        )
     }
 
-    /// The last floor this producer observed, as a constraint.
-    ///
-    /// The cache holds a plain position, so it is always treated as
-    /// constraining; a stale floor only costs a redundant scan.
-    #[inline]
-    const fn cached_floor(&self) -> ConsumerFloor {
-        ConsumerFloor::At(self.cached_min_head.get())
-    }
-
-    /// Rescans the registry and republishes the result to both cache
-    /// levels.
-    #[inline]
-    fn refresh_floor(&self) -> ConsumerFloor {
-        let floor = self.queue.consumer_floor();
-        if let ConsumerFloor::At(head) = floor {
-            self.queue.min_head_cache.fetch_max(head, Ordering::Release);
-            self.cached_min_head.set(head);
-        }
-        floor
-    }
 
     /// Pushes a value, blocking the calling thread when the ring is full
     /// (the slowest consumer hasn't caught up) until a consumer advances
