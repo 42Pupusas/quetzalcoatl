@@ -22,17 +22,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *rescue*: the waiter was waiting for something already there, and only
   the clock released it.
 
-  **The result: the bug is still live.** `block_stress_diagnostic`
-  reported two rescues in one iteration out of 400 (2 producers x 5000
-  items through a 16-slot ring). Exclusive park-slot leasing, which was
-  the likeliest explanation, did not eliminate it — only made it roughly
-  a thousand times rarer than the original 3%. Removing the backstop
-  would turn each of those into a permanent hang, so it stays.
+  **The result: it found the bug.** `block_stress_diagnostic` reported
+  rescues under saturated load (2 producers x 5000 items through a
+  16-slot ring), which ruled out the assumption that exclusive
+  park-slot leasing had already fixed the race and led to the stale-bit
+  defect fixed below.
+
+  `sole_waiter_rescues` is the count that carried the signal: a rescue
+  with no other waiter parked at either end of the sleep, so
+  round-robin cannot explain the wake having gone elsewhere. Plain
+  rescues turned out to be mostly round-robin artifacts.
 
   Off by default: the ring carries no counters and the call sites
   compile to nothing.
 
 ### Fixed
+- **A wake could be consumed by a park slot with no waiter behind it,
+  leaving a real waiter asleep on work that was ready.** This is the
+  missed wake `PARK_BACKSTOP` was added to survive.
+
+  A set bit in the wake bitmap did not imply a wakeable waiter, and
+  `wake_one` treated the two as equivalent. `arm` publishes the park
+  handle first and the bit second, while a waker clears the bit first
+  and claims the handle second, so the pair is never updated as a unit
+  and a bit can outlive the handle it advertises:
+
+  1. Waiter `w` arms bit 0 and parks.
+  2. Peer `p1` clears bit 0, taking ownership of that wake, and is
+     descheduled before it claims the handle.
+  3. `w`'s `PARK_BACKSTOP` expires independently and it re-arms: a
+     fresh handle, and bit 0 set once more.
+  4. `p1` resumes and claims *that* handle. Bit 0 is now set with
+     nothing behind it.
+  5. Peer `p2` publishes work and wakes. It picks bit 0, clears it,
+     finds no handle, and returns having woken nobody — while a waiter
+     parked on another bit sleeps on work that is ready.
+
+  `ThreadParker::wake` already reported whether it delivered an unpark;
+  `wake_one` discarded that answer. It now keeps searching when the
+  answer is `false`, since retiring a stale bit is not the wake the
+  caller asked for. `wake_n` had the same defect and a second one: it
+  counted loop iterations rather than delivered unparks, so a stale bit
+  consumed one of the `n` wakes a drain owed to real waiters. It now
+  counts unparks.
+
+  The mechanism is self-reinforcing, which is why it was so rare and
+  why the backstop hid it so well: step 3 requires a backstop timeout,
+  so each occurrence needs a previous near-miss to set it up.
+
+  Three unit tests reproduce it deterministically and single-threaded,
+  with no timing dependence; all three fail on the previous code.
+
+  `PARK_BACKSTOP` stays for now. This is one confirmed defect on the
+  path, not proof it was the only one, and "no rescue observed" is the
+  same evidence that misled before.
+
 - **A panicking `T::drop` during consumer teardown left the ring
   looking open.** spsc's `Consumer::drop` drains the backlog before it
   closes, and spmc's drops its unread batch before it releases the park

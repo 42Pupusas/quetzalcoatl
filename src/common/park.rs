@@ -75,17 +75,24 @@ impl WakeSet {
 
     /// Wakes one peer parked on the bitmap.
     ///
+    /// Guarantees an unpark was *delivered*, not merely that a bit
+    /// was retired. A set bit does not imply a waiter is reachable:
+    /// `arm` publishes the handle then the bit, and a waker clears
+    /// the bit then claims the handle, so a bit can outlive the
+    /// handle it advertised. Clearing such a bit wakes nobody, so
+    /// this keeps searching rather than counting it as the wake.
+    ///
     /// Concurrent peers racing on the same set bit: only one's
     /// `fetch_and` actually clears it; the loser observes the bit
-    /// already clear and skips the unpark.
+    /// already clear and moves to another.
     ///
-    /// The fast-path load uses `Acquire` (not `Relaxed`) so it
-    /// synchronizes with the peer's `fetch_or(bit, SeqCst)`. With
-    /// `Relaxed` the load could miss a freshly-set bit, leaving the
-    /// peer permanently parked when no further progress events
-    /// follow — surfaces under high-volume bench loops at small
-    /// capacities (cap=16 with 2 producers + 2 consumers reliably
-    /// hits this).
+    /// The fast-path load is `SeqCst` so it participates in the total
+    /// order with the peer's `fetch_or(bit, SeqCst)` in
+    /// [`arm`](Self::arm). With `Relaxed` the load could miss a
+    /// freshly-set bit, leaving the peer permanently parked when no
+    /// further progress events follow — surfaces under high-volume
+    /// bench loops at small capacities (cap=16 with 2 producers + 2
+    /// consumers reliably hits this).
     #[inline]
     pub fn wake_one(&self) {
         // Drain the caller's store buffer before sampling the wake
@@ -151,8 +158,14 @@ impl WakeSet {
             // Advance cursor past this slot for the next caller.
             self.cursor
                 .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
-            self.parkers[bit as usize].wake();
-            return;
+            if self.parkers[bit as usize].wake() {
+                return;
+            }
+            // The bit was set but its handle was already claimed, so
+            // this cleared a bit without delivering anything. Keep
+            // looking: retiring the stale bit is not the wake the
+            // caller asked for. See `a_wake_is_not_consumed_by_a_slot
+            // _whose_handle_is_already_claimed`.
         }
     }
 
@@ -161,10 +174,15 @@ impl WakeSet {
     /// `n` parkers at once. Caps at the number of currently parked
     /// waiters; extra wakes (when `n` exceeds parkers) are no-ops.
     ///
-    /// Each iteration is `wake_one`'s logic: pick the lowest set bit,
-    /// CAS it clear, unpark the slot. Implemented as a loop rather
-    /// than swap-bits-once because we want to wake *exactly* `n` if
-    /// available, not all of them.
+    /// Each iteration is `wake_one`'s logic: pick the next set bit in
+    /// round-robin order, clear it, unpark the slot. Implemented as a
+    /// loop rather than swap-bits-once because we want to wake
+    /// *exactly* `n` if available, not all of them.
+    ///
+    /// `n` counts unparks delivered, not bits retired — a bit whose
+    /// handle was already claimed advertises a waiter that is not
+    /// there, and stopping on it would strand a real one. See
+    /// [`wake_one`](Self::wake_one).
     #[inline]
     pub fn wake_n(&self, n: usize) {
         // See wake_one — drain the caller's store buffer before
@@ -172,28 +190,30 @@ impl WakeSet {
         // `ready`/`done` are globally visible.
         fence(Ordering::SeqCst);
         let mut cursor = self.cursor.load(Ordering::Relaxed);
-        for _ in 0..n {
-            // Acquire (not Relaxed) — see wake_one for the rationale.
+        let mut woken = 0usize;
+        while woken < n {
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 self.cursor.store(cursor, Ordering::Relaxed);
                 return;
             }
-            // Round-robin via cursor — see wake_one.
             #[allow(clippy::cast_possible_truncation)]
             let shift = cursor as u32 & PARK_MASK_U32;
             let rotated = ws.rotate_right(shift);
             let rel_bit = rotated.trailing_zeros();
             let bit = (rel_bit + shift) & PARK_MASK_U32;
             let mask = 1u64 << bit;
-            let prev = self.wake.fetch_and(!mask, Ordering::Relaxed);
+            let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
+            cursor = u64::from(bit).wrapping_add(1);
             if prev & mask == 0 {
-                // Lost the race on this bit — try again. Don't count
-                // this iteration since we didn't wake anything.
+                // Lost the race on this bit, or it was stale — either
+                // way nothing was delivered, so this does not count
+                // against `n`. `woken` is what advances the count.
                 continue;
             }
-            cursor = u64::from(bit).wrapping_add(1);
-            self.parkers[bit as usize].wake();
+            if self.parkers[bit as usize].wake() {
+                woken += 1;
+            }
         }
         self.cursor.store(cursor, Ordering::Relaxed);
     }
@@ -391,6 +411,98 @@ mod tests {
         set.arm_all(&[5, 6]);
         set.wake_n(32);
         assert_eq!(set.parked_bits(), 0);
+    }
+
+    /// A slot's bit can be set while its handle is already claimed.
+    /// `arm` publishes the handle *then* the bit, and a waker claims
+    /// the handle *after* clearing the bit, so the two are not
+    /// updated atomically together: a waker that clears a bit and
+    /// then finds the handle gone has consumed a wake it never
+    /// delivered. If it stops there, a genuinely parked waiter on
+    /// another slot is never woken, and nothing records the debt.
+    ///
+    /// Reached in the ring like this, with waiter `w` on bit 0 and
+    /// peers `p1`/`p2`:
+    ///
+    /// - `w` arms bit 0 and parks.
+    /// - `p1` clears bit 0, taking ownership of the wake, and is
+    ///   descheduled before it claims the handle.
+    /// - `w`'s `PARK_BACKSTOP` expires independently. It re-arms: a
+    ///   fresh handle, and bit 0 set again.
+    /// - `p1` resumes and claims that handle. Bit 0 is now set with
+    ///   no handle behind it.
+    /// - `p2` publishes work and wakes. It picks bit 0, clears it,
+    ///   finds no handle, and returns having woken nobody — while
+    ///   the waiter on bit 1 stays parked on work that is ready.
+    #[test]
+    fn a_wake_is_not_consumed_by_a_slot_whose_handle_is_already_claimed() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Leased(0));
+        set.arm(ParkSlot::Leased(1));
+
+        assert!(
+            set.parkers[0].wake(),
+            "claim slot 0's handle, leaving its bit set behind it"
+        );
+        assert_eq!(set.parked_bits(), 0b11, "both bits are still published");
+
+        set.wake_one();
+
+        assert!(
+            !set.is_armed(ParkSlot::Leased(1)),
+            "the wake must reach slot 1, the only slot with a waiter behind it"
+        );
+    }
+
+    /// The same defect on the batch path: `wake_n(1)` must deliver
+    /// one wake, not merely retire one bit.
+    #[test]
+    fn a_batch_wake_skips_slots_whose_handles_are_already_claimed() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1, 2]);
+        assert!(set.parkers[0].wake());
+        assert!(set.parkers[1].wake());
+
+        set.wake_n(1);
+
+        assert!(
+            !set.is_armed(ParkSlot::Leased(2)),
+            "the one requested wake must reach the one real waiter"
+        );
+    }
+
+    /// `wake_n` counts delivered unparks, so a set of bits that can
+    /// never deliver one must still terminate: every iteration clears
+    /// the bit it picked, so the bitmap drains and the `ws == 0` exit
+    /// is reached rather than the loop spinning on undeliverable bits.
+    #[test]
+    fn a_batch_wake_terminates_when_no_bit_can_deliver() {
+        let set = WakeSet::new();
+        let every: Vec<u32> = (0..u32::try_from(PARK_SLOTS).unwrap()).collect();
+        set.arm_all(&every);
+        for bit in 0..PARK_SLOTS {
+            assert!(set.parkers[bit].wake());
+        }
+
+        set.wake_n(8);
+
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    #[test]
+    fn a_wake_with_no_reachable_waiter_clears_the_stale_bits() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        assert!(set.parkers[0].wake());
+        assert!(set.parkers[1].wake());
+
+        set.wake_one();
+
+        assert_eq!(
+            set.parked_bits(),
+            0,
+            "bits with no handle behind them must not persist as wake sinks"
+        );
     }
 
     #[test]

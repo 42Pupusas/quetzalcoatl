@@ -135,6 +135,48 @@ serves one slot per event in round-robin order, so a waiter can be
 passed over rather than lost. A zero count across the matrix would be
 strong evidence the bound can go; a non-zero one is a starting point.
 
+## The lost wake, found
+
+A set bit in the wake bitmap did not imply a wakeable waiter, and
+`wake_one` treated the two as the same thing.
+
+`arm` publishes the handle first and the bit second; a waker clears the
+bit first and claims the handle second. The pair is not updated
+atomically, so a bit can outlive the handle it advertises:
+
+1. Waiter `w` arms bit 0 and parks.
+2. Peer `p1` clears bit 0, taking ownership of that wake, and is
+   descheduled before claiming the handle.
+3. `w`'s `PARK_BACKSTOP` expires on its own. It re-arms — new handle,
+   bit 0 set again.
+4. `p1` resumes and claims that handle. Bit 0 is now set with nothing
+   behind it.
+5. Peer `p2` publishes work and calls `wake_one`. It picks bit 0,
+   clears it, finds no handle, and returns having woken nobody. A
+   waiter parked on another bit stays asleep on work that is ready.
+
+`ThreadParker::wake` already returned `bool` for exactly this, and
+`wake_one` discarded it. The fix is to keep searching when the return
+is `false`: a retired stale bit is not a delivered wake. `wake_n` had
+the same defect, plus a related one — it counted loop iterations rather
+than unparks, so a stale bit consumed one of the `n` a drain owed to
+real waiters.
+
+The mechanism is self-reinforcing, which explains the rarity and why
+the backstop masked it so well: step 3 *requires* a backstop timeout,
+so the bug needs a previous near-miss to set up the next one.
+
+Three unit tests reproduce it deterministically, single-threaded, with
+no timing dependence (`a_wake_is_not_consumed_by_a_slot_whose_handle
+_is_already_claimed` and neighbours in `common::park`). All three fail
+on the previous code.
+
+This is not yet grounds for removing `PARK_BACKSTOP`. It is one
+confirmed defect on the path, and the stress matrix has since been
+clean, but "no rescue observed" is the same evidence that was
+misleading before. The bound comes out only after a long instrumented
+campaign with a rescue count of zero.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -155,6 +197,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 3. Cover all five topologies: push/pop, reserve/commit/pop_ref, drain, saturation, empty-to-nonempty wake latency, endpoint churn, and cancellation. Include async on/off and >64 live waiters for overflow paths.
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
-6. **Find the cause of the mpmc missed wake.** The `backstop-metrics` feature now measures it: it counts parks that ended on the `PARK_BACKSTOP` timeout rather than a peer's wake, and among those, the ones whose next re-check found work already available. That second count is a *rescue* — the waiter was waiting for something already there. `block_stress_diagnostic` reported two rescues in one iteration of 400, so the bug is still live, roughly a thousand times rarer than the original 3% but not gone. `PARK_BACKSTOP` therefore stays: removing it turns each rescue into a permanent hang. Instrument the rescue path to capture ring state at the timeout, as `block_stress_diagnostic` already does for the deadlock.
-7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers.
+6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
+7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 8. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
