@@ -1,7 +1,5 @@
 //! Unwind-safe release of a consumed MPMC slot.
 
-use std::sync::atomic::Ordering;
-
 use super::{Config, RingBuffer};
 
 /// Owns the obligation to hand one consumed slot back to the producers.
@@ -43,15 +41,9 @@ impl<'a, T, C: Config> SlotRelease<'a, T, C> {
 
 impl<T, C: Config> Drop for SlotRelease<'_, T, C> {
     fn drop(&mut self) {
-        // SeqCst — see Consumer::pop. The store-buffer drain is
-        // necessary so the upcoming wake_one's wake.load doesn't miss a
-        // parked producer's bit.
         self.queue
             .done_slot(self.pos)
-            .store(
-                self.round_pos + self.queue.capacity.get(),
-                Ordering::SeqCst,
-            );
+            .release(self.round_pos, self.queue.capacity);
         self.queue.producer_park.wake_one();
         self.queue.notify_producers();
     }

@@ -82,12 +82,7 @@ impl<T, C: Config> Consumer<T, C> {
         let q = &*self.queue;
         let start = self.next_scan.get();
         for offset in 0..q.capacity.get() {
-            let scan = start + offset;
-            let s = q.capacity.index_of(scan);
-            let r = q.ready_slot(scan).load(Ordering::Acquire);
-            let delta = r.wrapping_sub(s);
-            let state = q.capacity.wrap(delta);
-            if state == 1 {
+            if q.ready_state(start + offset).is_published() {
                 return true;
             }
         }
@@ -96,10 +91,9 @@ impl<T, C: Config> Consumer<T, C> {
 
     /// Scans for a published slot and CAS-claims it. Returns the
     /// `(pos, round_pos)` of the claimed slot on success. After a
-    /// successful claim the slot is in state "claimed but not
-    /// released" (`ready[s] = round_pos + 2`) and the caller is
-    /// responsible for reading the value and storing
-    /// `done[s] = round_pos + cap` to release the slot for reuse.
+    /// successful claim the slot is claimed but not released, and the
+    /// caller is responsible for reading the value and releasing the
+    /// slot's `done` word for reuse.
     ///
     /// Updates `next_scan` and bumps `local_consumed` (with a flush
     /// to the shared watermark every `CONSUMED_FLUSH`) on success;
@@ -116,19 +110,11 @@ impl<T, C: Config> Consumer<T, C> {
         let mut iters = 0usize;
 
         loop {
-            // Decode `ready[s] = s + R*cap + state`, state ∈ {0,1,2}.
-            let s = q.capacity.index_of(scan);
-            let r = q.ready_slot(scan).load(Ordering::Acquire);
-            let delta = r.wrapping_sub(s);
-            let state = q.capacity.wrap(delta);
-            let round_pos = r.wrapping_sub(state);
+            let state = q.ready_state(scan);
+            let round_pos = state.round_pos();
 
-            if state == 1 {
-                let claimed_marker = round_pos + 2;
-                if q.ready_slot(scan)
-                    .compare_exchange(r, claimed_marker, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
+            if state.is_published() {
+                if q.ready_slot(scan).claim(round_pos) {
                     // Advance scan past the consumed slot, keeping
                     // it monotonic in case we claimed a future slot.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
@@ -171,15 +157,9 @@ impl<T, C: Config> Consumer<T, C> {
         let q = &*self.queue;
         // SAFETY: the successful CAS in claim_slot gave us unique
         // ownership of slot `pos & mask` for this round. The
-        // producer committed the value before storing state=1.
+        // producer committed the value before publishing.
         let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-        // SeqCst (not Release) on done.store: drains the store buffer
-        // so the SeqCst load of `producer_park.wake` inside wake_one
-        // can't be satisfied before our store reaches global
-        // visibility. wake_one's leading SeqCst fence is theoretically
-        // equivalent, but writing the SeqCst on the store keeps the
-        // pairing local to the call site.
-        q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
+        q.done_slot(pos).release(round_pos, q.capacity);
         // Wake one parked producer if any.
         q.producer_park.wake_one();
         q.notify_producers();
@@ -240,10 +220,7 @@ impl<T, C: Config> Consumer<T, C> {
             // SAFETY: claim_slot's CAS gave us unique ownership of
             // (pos, round_pos). Producer committed before publishing.
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-            // SeqCst (see Consumer::pop): drains the store buffer so
-            // the upcoming wake_n's wake.load cannot miss a parked
-            // producer bit set just after our store landed.
-            q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
+            q.done_slot(pos).release(round_pos, q.capacity);
             count += 1;
             f(val);
         }
@@ -269,8 +246,7 @@ impl<T, C: Config> Consumer<T, C> {
             };
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
-            // SeqCst — see Consumer::pop.
-            q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
+            q.done_slot(pos).release(round_pos, q.capacity);
             count += 1;
             f(val);
         }

@@ -55,11 +55,16 @@
 
 mod batch_abandon;
 mod consumer;
+mod done_word;
 mod producer;
+mod ready_word;
 mod slot_release;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
+
+use done_word::DoneWord;
+use ready_word::{ReadyState, ReadyWord};
 
 use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
@@ -160,11 +165,10 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// Per-slot tri-state with round encoding (free / published /
     /// claimed). Packed 8 per cacheline (not `CachePadded`) so a
     /// consumer scan amortizes one line load across 8 slots.
-    pub(crate) ready: AlignedBuf<AtomicUsize>,
-    /// Per-slot "consumer released" marker. Producer for logical
-    /// `pos` waits on `done[s] == pos`; consumer for `pos` stores
-    /// `done[s] = pos + cap`.
-    pub(crate) done: AlignedBuf<AtomicUsize>,
+    pub(in crate::mpmc) ready: AlignedBuf<ReadyWord>,
+    /// Per-slot "consumer released" marker, handing each slot from one
+    /// round's consumer to the next round's producer.
+    pub(in crate::mpmc) done: AlignedBuf<DoneWord>,
     pub(crate) capacity: Capacity,
     /// Producer claim cursor. FAA'd to reserve batches of positions.
     pub(crate) claim: CachePadded<AtomicUsize>,
@@ -258,18 +262,15 @@ impl<T, C: Config> RingBuffer<T, C> {
         let cap = capacity.get();
         assert!(cap >= 4, "mpmc requires capacity >= 4");
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
-        // ready[s] = s → free for round 0 at logical pos s.
         let mut ridx = 0usize;
         let ready = AlignedBuf::new_with(cap, || {
-            let r = AtomicUsize::new(ridx);
+            let r = ReadyWord::free_at(ridx);
             ridx += 1;
             r
         });
-        // done[s] = s → previous round (-1) released this slot, so
-        // the round-0 producer's check `done[s] == s` holds.
         let mut didx = 0usize;
         let done = AlignedBuf::new_with(cap, || {
-            let d = AtomicUsize::new(didx);
+            let d = DoneWord::released_for(didx);
             didx += 1;
             d
         });
@@ -346,14 +347,21 @@ impl<T, C: Config> RingBuffer<T, C> {
     }
 
     #[inline]
-    pub(crate) fn ready_slot(&self, pos: usize) -> &AtomicUsize {
+    pub(in crate::mpmc) fn ready_slot(&self, pos: usize) -> &ReadyWord {
         let idx = self.capacity.index_of(pos);
         unsafe { std::hint::assert_unchecked(idx < self.ready.len()) };
         &self.ready[idx]
     }
 
+    /// The state of the slot serving `pos`, decoded.
     #[inline]
-    pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
+    pub(in crate::mpmc) fn ready_state(&self, pos: usize) -> ReadyState {
+        self.ready_slot(pos)
+            .state(self.capacity.index_of(pos), self.capacity)
+    }
+
+    #[inline]
+    pub(in crate::mpmc) fn done_slot(&self, pos: usize) -> &DoneWord {
         let idx = self.capacity.index_of(pos);
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
         &self.done[idx]
@@ -364,10 +372,10 @@ impl<T, C: Config> RingBuffer<T, C> {
     pub fn debug_snapshot(&self) -> (usize, Vec<usize>, Vec<usize>) {
         let claim = self.claim.load(Ordering::Acquire);
         let r: Vec<usize> = (0..self.capacity.get())
-            .map(|s| self.ready[s].load(Ordering::Acquire))
+            .map(|s| self.ready[s].word())
             .collect();
         let d: Vec<usize> = (0..self.capacity.get())
-            .map(|s| self.done[s].load(Ordering::Acquire))
+            .map(|s| self.done[s].word())
             .collect();
         (claim, r, d)
     }
@@ -391,7 +399,7 @@ impl<T, C: Config> RingBuffer<T, C> {
         while bits != 0 {
             let b = bits.trailing_zeros();
             let p = start + b as usize;
-            if self.done_slot(p).load(Ordering::Acquire) == p {
+            if self.done_slot(p).is_free_for(p) {
                 return Some((b, p));
             }
             bits &= bits - 1;
@@ -414,26 +422,25 @@ impl<T, C: Config> RingBuffer<T, C> {
 impl<T, C: Config> Drop for RingBuffer<T, C> {
     fn drop(&mut self) {
         // All Producer/Consumer handles are gone (we hold &mut self),
-        // so we can read state non-atomically. A slot holds live
-        // data when ready[s] is `published` (state 1) or `claimed
-        // but not released` (state 2 with done[s] != round_pos+cap).
-        let cap = self.capacity.get();
-        for s in 0..cap {
-            let r = *self.ready[s].get_mut();
-            let d = *self.done[s].get_mut();
-            let delta = r.wrapping_sub(s);
-            let state = self.capacity.wrap(delta);
-            let round = delta / cap;
-            let round_pos = s + round * cap;
-            if state == 1 {
-                // SAFETY: published, never claimed → initialized,
-                // never moved.
-                unsafe {
-                    self.data[s].get().cast::<T>().drop_in_place();
+        // so the words can be read non-atomically.
+        let capacity = self.capacity;
+        for s in 0..capacity.get() {
+            let state = self.ready[s].state_mut(s, capacity);
+            let holds_value = match state {
+                // Published and never claimed: initialized, never moved.
+                ReadyState::Published(_) => true,
+                // Claimed, but the consumer never released the slot, so
+                // the value is still in it. A release means either the
+                // consumer finished reading or a producer abandoned a
+                // reservation it had not written.
+                ReadyState::Claimed(round_pos) => {
+                    !self.done[s].was_released_after(round_pos, capacity)
                 }
-            } else if state == 2 && d != round_pos + cap {
-                // SAFETY: claimed but consumer never released
-                // done[s], so the value is still in the slot.
+                ReadyState::Free(_) => false,
+            };
+            if holds_value {
+                // SAFETY: the state above says the slot holds a value
+                // that no consumer took.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();
                 }

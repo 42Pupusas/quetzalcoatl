@@ -1,7 +1,5 @@
 //! Giving up a producer's unused batch positions.
 
-use std::sync::atomic::Ordering;
-
 use super::{Config, RingBuffer};
 
 /// Hands back the positions a departing producer reserved but never
@@ -50,7 +48,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
         let q = self.queue;
         let done = q.done_slot(pos);
         let mut backoff = crate::common::backoff::Backoff::new();
-        while done.load(Ordering::Acquire) != pos {
+        while !done.is_free_for(pos) {
             // SeqCst: the post-arm half of the close handshake, as in
             // the blocking paths.
             if q.consumer_closed.is_closed_for_parking() {
@@ -64,11 +62,8 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
             q.notify_consumers();
             backoff.spin();
         }
-        q.ready_slot(pos).store(pos + 2, Ordering::Release);
-        // SeqCst: drains the store buffer so the wake below cannot miss
-        // a producer that just parked on this slot.
-        q.done_slot(pos)
-            .store(pos + q.capacity.get(), Ordering::SeqCst);
+        q.ready_slot(pos).abandon(pos);
+        q.done_slot(pos).release(pos, q.capacity);
         // The slot is now free for its next-round producer, which may
         // be parked waiting for exactly this release.
         q.producer_park.wake_one();

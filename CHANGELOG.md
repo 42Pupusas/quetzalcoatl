@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **`ReadyWord` and `DoneWord` own the MPMC slot's two words.** A slot
+  is described by `ready[s]`, a round-tagged tri-state, and `done[s]`,
+  the handshake from one round's consumer to the next round's producer.
+  Both encodings were open-coded: the `done` release appeared at five
+  sites and its matching read at three, and the `ready` word was decoded
+  by hand in three places — the teardown path using a different formula
+  from the consumer's, agreeing only because the state fits below the
+  minimum capacity.
+
+  `ReadyState` now names the three states, so `state == 1` is
+  `is_published()` and the round arithmetic has one home. The words stay
+  in separate arrays: `ready` is packed eight to a cache line for the
+  consumer's scan, and merging them would cost that.
+
 - **`SlotSequence` owns the MPSC slot's sequence word.** The word
   encodes free (`pos * 2`), published (`pos * 2 + 1`) and abandoned
   (`TOMBSTONE`), and each writer open-coded the arithmetic: the release

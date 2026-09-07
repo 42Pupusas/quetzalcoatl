@@ -78,8 +78,7 @@ impl<T, C: Config> Producer<T, C> {
         let in_flight = claim.wrapping_sub(consumed);
         let free = if in_flight >= q.capacity.get() {
             // Watermark says full; per-slot check before giving up.
-            let next_done = q.done_slot(claim).load(Ordering::Acquire);
-            if next_done != claim {
+            if !q.done_slot(claim).is_free_for(claim) {
                 return None;
             }
             1
@@ -135,7 +134,7 @@ impl<T, C: Config> Producer<T, C> {
         // cost when the consumer is about to release.
         let mut found_ready = false;
         for _ in 0..PRIMARY_SHORT_SPIN {
-            if q.done_slot(primary_pos).load(Ordering::Acquire) == primary_pos {
+            if q.done_slot(primary_pos).is_free_for(primary_pos) {
                 found_ready = true;
                 break;
             }
@@ -176,14 +175,7 @@ impl<T, C: Config> Producer<T, C> {
         let data_ptr = q.data_slot(pos).get();
         unsafe { (*data_ptr).write(val) };
 
-        // Publish: ready[s] = pos + 1 (state = published). SeqCst
-        // (not Release) drains the store buffer so the SeqCst load of
-        // `consumer_park.wake` inside wake_one cannot miss a freshly-
-        // parked consumer's bit. Symmetric to Consumer::pop's
-        // SeqCst store on `done` — both directions need the
-        // store-buffer drain to close the Dekker race against the
-        // peer's parking sequence (fetch_or(SC) + fence(SC) + recheck).
-        q.ready_slot(pos).store(pos + 1, Ordering::SeqCst);
+        q.ready_slot(pos).publish(pos);
 
         // Wake one consumer parked in pop_block, if any.
         q.consumer_park.wake_one();
@@ -453,8 +445,7 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
     #[inline]
     pub unsafe fn commit_unchecked(self) {
         let q = &*self.producer.queue;
-        // SeqCst — see Producer::push.
-        q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
+        q.ready_slot(self.pos).publish(self.pos);
         q.consumer_park.wake_one();
         q.notify_consumers();
         // Skip SlotWriter::drop (which would restore the bit).
@@ -502,8 +493,7 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
     pub fn commit(mut self) {
         self.value.commit();
         let q = &*self.producer.queue;
-        // SeqCst — see Producer::push.
-        q.ready_slot(self.pos).store(self.pos + 1, Ordering::SeqCst);
+        q.ready_slot(self.pos).publish(self.pos);
         q.consumer_park.wake_one();
         q.notify_consumers();
     }
