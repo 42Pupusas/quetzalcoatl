@@ -125,16 +125,16 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         let mut backoff = 0u32;
         loop {
-            let head = q.head.load(Ordering::Relaxed);
+            let head = q.cursors.head().load(Ordering::Relaxed);
             let mut tail = self.cached_tail.get();
             if head >= tail {
-                tail = q.tail.load(Ordering::Acquire);
+                tail = q.cursors.tail().load(Ordering::Acquire);
                 self.cached_tail.set(tail);
                 if head >= tail {
                     if q.closed.is_closed() {
-                        let tail2 = q.tail.load(Ordering::Acquire);
+                        let tail2 = q.cursors.tail().load(Ordering::Acquire);
                         self.cached_tail.set(tail2);
-                        let head2 = q.head.load(Ordering::Relaxed);
+                        let head2 = q.cursors.head().load(Ordering::Relaxed);
                         if head2 >= tail2 {
                             return None;
                         }
@@ -147,7 +147,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let avail = tail - head;
             let take = avail.min(BATCH_SIZE);
             let new_head = head + take;
-            if q.head
+            if q.cursors
+                .head()
                 .compare_exchange_weak(head, new_head, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
@@ -165,11 +166,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             return true;
         }
         let q = self.ring();
-        let head = q.head.load(Ordering::Relaxed);
+        let head = q.cursors.head().load(Ordering::Relaxed);
         if head < self.cached_tail.get() {
             return true;
         }
-        let tail = q.tail.load(Ordering::Acquire);
+        let tail = q.cursors.tail().load(Ordering::Acquire);
         self.cached_tail.set(tail);
         head < tail
     }

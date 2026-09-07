@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The head/tail cursor pair is now owned by `Cursors`.** spsc, mpsc
+  and spmc each declared two `CachePadded<AtomicUsize>` cursors and
+  then restated the same three derived operations against them:
+  `len` as a pair of `Relaxed` loads and a wrapping subtraction,
+  `is_empty`/`is_full` on top of it, and a drop-time non-atomic read
+  of both cursors to find the positions still holding values. Those
+  now live on the type, and `occupied()` returns the drop range as a
+  `Range` behind `&mut self`, so the "every handle is gone, the
+  cursors cannot move" precondition is the borrow checker's rather
+  than a comment's.
+
+  Publication stays with the rings, because they do not share one
+  protocol: a cursor written by one thread is stored, one written by
+  several is claimed by compare-exchange, and mpsc's tail and spmc's
+  head are the multi-writer cases. The one publication that *is*
+  uniform — the single-consumer head release, `SeqCst` in both spsc
+  and mpsc for the same park-handshake reason — is
+  `Cursors::publish_head`, replacing six hand-written stores. spsc's
+  `mod.rs` no longer performs an atomic operation of its own.
 - **Single-waiter park state is now owned by `SoleParker`.** The
   single-producer and single-consumer sides each carried a loose
   `ThreadParker` plus a `parked` flag, with the park protocol restated

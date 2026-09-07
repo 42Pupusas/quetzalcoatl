@@ -83,7 +83,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 unsafe { (*data_ptr).write(val) };
                 self.write_pos.set(pos + 1);
                 self.ring()
-                    .tail
+                    .cursors
+                    .tail()
                     .store(self.write_pos.get(), Ordering::Release);
                 self.ring().consumer_park.wake_one();
                 #[cfg(feature = "async")]
@@ -145,7 +146,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
         self.try_claim().map(|(data_ptr, pos)| SlotWriter {
             slot_data: data_ptr,
-            tail: &self.ring().tail,
+            tail: self.ring().cursors.tail(),
             write_pos: &self.write_pos,
             pos,
             queue: self.ring(),

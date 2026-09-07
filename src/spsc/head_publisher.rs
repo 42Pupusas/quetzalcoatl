@@ -1,7 +1,5 @@
 //! Unwind-safe publication of the SPSC consumer head.
 
-use std::sync::atomic::Ordering;
-
 use super::RingBuffer;
 
 /// Owns the obligation to publish the consumer's `head` cursor.
@@ -55,10 +53,7 @@ impl<T> Drop for HeadPublisher<'_, T> {
         if !self.advanced {
             return;
         }
-        // SeqCst: see Consumer::pop. Pairs with the producer's SeqCst
-        // `parked.store(true)` to close the missed-wakeup race, and
-        // subsumes the Release needed to hand these slots back.
-        self.ring.head.store(self.head, Ordering::SeqCst);
+        self.ring.cursors.publish_head(self.head);
         self.ring.wake_producer();
         #[cfg(feature = "async")]
         self.ring.wake_producer_async();

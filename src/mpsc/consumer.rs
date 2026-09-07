@@ -52,7 +52,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     fn ready_for_claim(&self) -> bool {
         loop {
-            let head = self.ring().head.load(Ordering::Relaxed);
+            let head = self.ring().cursors.head().load(Ordering::Relaxed);
             match self.ring().slot(head).classify(head) {
                 SlotSnapshot::Ready(_) => return true,
                 SlotSnapshot::Tombstoned => self.release_tombstone(head),
@@ -75,7 +75,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             .store((head + ring.cap) * 2, Ordering::Release);
         // SeqCst: as in `pop`, the store buffer must drain before the
         // wake path loads the park bitmap.
-        ring.head.store(head + 1, Ordering::SeqCst);
+        ring.cursors.publish_head(head + 1);
         ring.producer_park.wake_one_published();
         ring.notify_producers();
     }
@@ -84,7 +84,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
         loop {
-            let head = self.ring().head.load(Ordering::Relaxed);
+            let head = self.ring().cursors.head().load(Ordering::Relaxed);
 
             let slot = self.ring().slot(head);
 
@@ -110,7 +110,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // That makes `wake_one`'s leading fence redundant, so we
             // pay one barrier per pop instead of two. Same idiom as
             // `mpmc::Consumer::pop`.
-            self.ring().head.store(head + 1, Ordering::SeqCst);
+            self.ring().cursors.publish_head(head + 1);
 
             self.ring().producer_park.wake_one_published();
             self.ring().notify_producers();
@@ -123,7 +123,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
         loop {
-            let head = self.ring().head.load(Ordering::Relaxed);
+            let head = self.ring().cursors.head().load(Ordering::Relaxed);
 
             let slot = self.ring().slot(head);
 
@@ -158,7 +158,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// cursor is published while unwinding.
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut batch = BatchRelease::new(ring, ring.head.load(Ordering::Relaxed));
+        let mut batch = BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed));
 
         loop {
             let head = batch.position();
@@ -196,7 +196,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut batch = BatchRelease::new(ring, ring.head.load(Ordering::Relaxed));
+        let mut batch = BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed));
 
         while batch.delivered() < limit {
             let head = batch.position();

@@ -40,11 +40,12 @@ use crate::common::close_state::CloseState;
 use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
+use crate::common::cursors::Cursors;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// A lock-free MPSC ring buffer.
@@ -53,14 +54,13 @@ use std::sync::Arc;
 /// a [`Producer`] / [`Consumer`] pair. The `Producer` is [`Clone`]; the
 /// `Consumer` is not (single-consumer).
 // repr(C) locks field order: shared immutable fields first (same cache
-// line), then head and tail each on their own cache-padded line.
+// line), then the cursor pair, which pads each cursor onto its own line.
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<SeqSlot<T>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
-    pub(crate) head: CachePadded<AtomicUsize>,
-    pub(crate) tail: CachePadded<AtomicUsize>,
+    pub(crate) cursors: Cursors,
     /// Live producer count; last-drop sets [`closed`].
     pub(crate) producer_count: CachePadded<AtomicUsize>,
     /// Set by the last [`Producer`] drop. [`Consumer::pop_block`]
@@ -115,8 +115,7 @@ impl<T> RingBuffer<T> {
 
         Self {
             buf,
-            head: CachePadded(AtomicUsize::new(0)),
-            tail: CachePadded(AtomicUsize::new(0)),
+            cursors: Cursors::new(),
             cap,
             mask: capacity.mask,
             producer_count: CachePadded(AtomicUsize::new(1)),
@@ -139,21 +138,19 @@ impl<T> RingBuffer<T> {
     /// Use this for heuristics, not for precise invariants.
     #[must_use]
     pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
-        tail.wrapping_sub(head)
+        self.cursors.len()
     }
 
     /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.cursors.is_empty()
     }
 
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.len() == self.cap
+        self.cursors.is_full(self.cap)
     }
 
     /// Externally closes the ring, causing a blocked
@@ -292,9 +289,7 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        let head = *self.head.0.get_mut();
-        let tail = *self.tail.0.get_mut();
-        for pos in head..tail {
+        for pos in self.cursors.occupied() {
             let slot = &mut self.buf[pos & self.mask];
             let seq = *slot.sequence.get_mut();
             // Skip tombstoned slots (abandoned reservations) and slots

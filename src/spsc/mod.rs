@@ -38,11 +38,11 @@ use crate::common::close_state::CloseState;
 use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::{AlignedBuf, CachePadded};
+use crate::common::cursors::Cursors;
+use crate::common::AlignedBuf;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A lock-free SPSC ring buffer.
@@ -51,14 +51,13 @@ use std::sync::Arc;
 /// a [`Producer`] / [`Consumer`] pair. Neither handle is [`Clone`],
 /// enforcing the single-producer, single-consumer invariant.
 // repr(C) locks field order: shared immutable fields first (same cache
-// line), then head and tail each on their own cache-padded line.
+// line), then the cursor pair, which pads each cursor onto its own line.
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     pub(crate) cap: usize,
     pub(crate) mask: usize,
-    pub(crate) head: CachePadded<AtomicUsize>,
-    pub(crate) tail: CachePadded<AtomicUsize>,
+    pub(crate) cursors: Cursors,
     /// Set when the [`Producer`] is dropped. [`Consumer::pop_block`]
     /// observes this and returns `None` once the queue drains.
     pub(crate) producer_closed: CloseState,
@@ -99,9 +98,7 @@ impl<T> Drop for RingBuffer<T> {
         // Handles are all gone (we hold `&mut self`), so the cursors can
         // be read non-atomically, and everything between them is an
         // initialized value nobody consumed.
-        let head = *self.head.0.get_mut();
-        let tail = *self.tail.0.get_mut();
-        for pos in head..tail {
+        for pos in self.cursors.occupied() {
             // SAFETY: the producer published `pos < tail` and the
             // consumer never advanced `head` past it, so the slot holds
             // an initialized value. `&mut self` rules out concurrency.
@@ -121,8 +118,7 @@ impl<T> RingBuffer<T> {
 
         Self {
             buf,
-            head: CachePadded(AtomicUsize::new(0)),
-            tail: CachePadded(AtomicUsize::new(0)),
+            cursors: Cursors::new(),
             cap,
             mask: capacity.mask,
             producer_closed: CloseState::new(),
@@ -177,21 +173,19 @@ impl<T> RingBuffer<T> {
     /// (e.g., "is there work?"), not for precise invariants.
     #[must_use]
     pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Relaxed);
-        tail.wrapping_sub(head)
+        self.cursors.len()
     }
 
     /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.cursors.is_empty()
     }
 
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.len() == self.cap
+        self.cursors.is_full(self.cap)
     }
 
     /// Externally closes the ring, causing a blocked

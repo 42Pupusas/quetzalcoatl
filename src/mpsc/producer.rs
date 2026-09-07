@@ -92,11 +92,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
-        let mut current_tail = self.ring().tail.load(Ordering::Relaxed);
+        let mut current_tail = self.ring().cursors.tail().load(Ordering::Relaxed);
         let mut backoff = 0u32;
         loop {
             if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
-                let head = self.ring().head.load(Ordering::Acquire);
+                let head = self.ring().cursors.head().load(Ordering::Acquire);
                 self.cached_head.set(head);
 
                 if current_tail.wrapping_sub(head) >= self.ring().cap {
@@ -104,7 +104,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 }
             }
 
-            match self.ring().tail.compare_exchange_weak(
+            match self.ring().cursors.tail().compare_exchange_weak(
                 current_tail,
                 current_tail + 1,
                 Ordering::Relaxed,

@@ -47,7 +47,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // Cached tail says empty — refresh from the real atomic.
             // Acquire: synchronizes with producer's Release on tail,
             // ensuring we see the data written before tail advanced.
-            let tail = self.ring().tail.load(Ordering::Acquire);
+            let tail = self.ring().cursors.tail().load(Ordering::Acquire);
             self.cached_tail.set(tail);
 
             head != tail
@@ -62,7 +62,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
-        let head = self.ring().head.load(Ordering::Relaxed);
+        let head = self.ring().cursors.head().load(Ordering::Relaxed);
 
         if !self.available(head) {
             return None;
@@ -75,7 +75,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         // SeqCst: pairs with the producer's SeqCst arm in `push_block`
         // to close the missed-wakeup race, and lets `wake_producer`
         // skip its fence; subsumes the Release semantics for slot reuse.
-        self.ring().head.store(head + 1, Ordering::SeqCst);
+        self.ring().cursors.publish_head(head + 1);
 
         self.ring().wake_producer();
         #[cfg(feature = "async")]
@@ -98,7 +98,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// not read those slots a second time.
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut publisher = HeadPublisher::new(ring, ring.head.load(Ordering::Relaxed));
+        let mut publisher = HeadPublisher::new(ring, ring.cursors.head().load(Ordering::Relaxed));
         let mut count = 0usize;
         loop {
             let head = publisher.position();
@@ -121,7 +121,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Panic behaviour matches [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut publisher = HeadPublisher::new(ring, ring.head.load(Ordering::Relaxed));
+        let mut publisher = HeadPublisher::new(ring, ring.cursors.head().load(Ordering::Relaxed));
         let mut count = 0usize;
         while count < limit {
             let head = publisher.position();
@@ -218,7 +218,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
-        let head = self.ring().head.load(Ordering::Relaxed);
+        let head = self.ring().cursors.head().load(Ordering::Relaxed);
 
         if !self.available(head) {
             return None;
@@ -247,7 +247,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// means a value. The claim after this gate cannot fail.
     #[inline]
     fn ready_for_claim(&self) -> bool {
-        let head = self.ring().head.load(Ordering::Relaxed);
+        let head = self.ring().cursors.head().load(Ordering::Relaxed);
         self.available(head)
     }
 

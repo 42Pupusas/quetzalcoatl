@@ -76,7 +76,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let pos = self.write_pos.get();
 
         if pos - self.cached_head.get() >= self.ring().cap {
-            let head = self.ring().head.load(Ordering::Acquire);
+            let head = self.ring().cursors.head().load(Ordering::Acquire);
             self.cached_head.set(head);
 
             if pos - head >= self.ring().cap {
@@ -97,7 +97,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         if pos - self.cached_head.get() < self.ring().cap {
             return true;
         }
-        let head = self.ring().head.load(Ordering::Acquire);
+        let head = self.ring().cursors.head().load(Ordering::Acquire);
         self.cached_head.set(head);
         pos - head < self.ring().cap
     }
@@ -126,7 +126,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         // `wake_consumer` (and unpark), or the consumer's post-arm re-check
         // observes the new `tail` (and skips parking). Being SeqCst is also
         // what lets `wake_consumer` skip the store-buffer fence.
-        self.ring().tail.store(pos + 1, Ordering::SeqCst);
+        self.ring().cursors.tail().store(pos + 1, Ordering::SeqCst);
 
         self.ring().wake_consumer();
         #[cfg(feature = "async")]
@@ -165,7 +165,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
         Some(SlotWriter {
             slot_data,
-            tail: &self.ring().tail,
+            tail: self.ring().cursors.tail(),
             write_pos: &self.write_pos,
             pos,
             queue: self.ring(),
