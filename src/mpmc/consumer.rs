@@ -6,6 +6,7 @@ use std::task::Poll;
 
 use super::consumed_watermark::ConsumedTally;
 use super::drain_wake::DrainWake;
+use super::scan_budget::ScanBudget;
 use super::slot_release::SlotRelease;
 use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
@@ -107,11 +108,10 @@ impl<T, C: Config> Consumer<T, C> {
         let cap = q.capacity.get();
 
         let start_scan = self.next_scan.get();
-        let mut scan = start_scan;
-        let max_iters = cap;
-        let mut iters = 0usize;
+        let mut budget = ScanBudget::new(start_scan, cap, C::CAS_FAIL_SKIP);
 
         loop {
+            let scan = budget.position();
             let state = q.ready_state(scan);
             let round_pos = state.round_pos();
 
@@ -125,16 +125,14 @@ impl<T, C: Config> Consumer<T, C> {
 
                     return Some((scan, round_pos));
                 }
-                // CAS lost — skip far enough that the contended
-                // line cools before our next attempt.
-                scan += C::CAS_FAIL_SKIP - 1;
-                iters += C::CAS_FAIL_SKIP - 1;
+                // CAS lost — move clear so the contended line cools
+                // before the next attempt.
+                budget.skip_contended();
             }
 
-            scan += 1;
-            iters += 1;
-            if iters >= max_iters {
-                self.next_scan.set(scan);
+            budget.step();
+            if budget.exhausted() {
+                self.next_scan.set(budget.position());
                 return None;
             }
         }
@@ -335,7 +333,7 @@ impl<T, C: Config> Consumer<T, C> {
             }
 
             // Bounded park backstop — see Producer::push_block.
-            watch.about_to_park(q.consumer_park.others_parked(slot));
+            watch.about_to_park(q.consumer_park.others_parked(slot), self.has_item());
             slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.
@@ -446,7 +444,10 @@ impl<T, C: Config> Consumer<T, C> {
             }
 
             // Bounded park backstop — see Consumer::pop_block.
-            watch.about_to_park(self.queue.consumer_park.others_parked(park_slot));
+            watch.about_to_park(
+                self.queue.consumer_park.others_parked(park_slot),
+                self.has_item(),
+            );
             park_slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.

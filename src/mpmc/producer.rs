@@ -172,6 +172,28 @@ impl<T, C: Config> Producer<T, C> {
         None
     }
 
+    /// Non-mutating check for a slot this producer could write to,
+    /// mirroring what `acquire_slot` would look for. Used as a
+    /// diagnostic at the moment of parking, so it must not disturb
+    /// the batch: with positions in hand it asks whether any is
+    /// released, and with an exhausted batch it asks whether a refill
+    /// would find room, without taking the claim cursor.
+    ///
+    /// May report a false positive under contention when a peer takes
+    /// the slot first, which is exactly the case it exists to
+    /// distinguish, so it is read as evidence in aggregate rather
+    /// than per event.
+    #[inline]
+    fn has_free_slot(&self) -> bool {
+        let q = &*self.queue;
+        let unused = self.batch_unused.get();
+        if unused != 0 {
+            return self.scan_unused(self.batch_start.get(), unused).is_some();
+        }
+        let claim = q.claim.load(Ordering::Relaxed);
+        q.consumed.free(claim, q.capacity.get()).is_some() || q.done_slot(claim).is_free_for(claim)
+    }
+
     /// Pushes a value. Returns `Err(val)` if the ring is full from
     /// this producer's perspective (approximate — based on the
     /// `consumed` watermark, which lags real consumer progress).
@@ -262,7 +284,10 @@ impl<T, C: Config> Producer<T, C> {
             }
 
             // Bounded park — see push_block.
-            watch.about_to_park(self.queue.producer_park.others_parked(park_slot));
+            watch.about_to_park(
+                self.queue.producer_park.others_parked(park_slot),
+                self.has_free_slot(),
+            );
             park_slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.
@@ -333,7 +358,7 @@ impl<T, C: Config> Producer<T, C> {
             // 5000-item runs). Exclusive slot leasing is the likelier
             // cause and is now fixed, though not proven to be the only
             // one, so the bound stays until it is.
-            watch.about_to_park(q.producer_park.others_parked(slot));
+            watch.about_to_park(q.producer_park.others_parked(slot), self.has_free_slot());
             slot.park_bounded(PARK_BACKSTOP);
             // A wake claims the handle, so one still armed means the
             // sleep ended on the timeout instead.

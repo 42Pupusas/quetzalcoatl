@@ -58,6 +58,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interchangeable, so the pin requires out-of-order consumption to
   arise — which is why the residual rate is low rather than constant.
 
+- **Fixed: a consumer could report an empty ring after one lost CAS.**
+  `claim_slot` budgeted a lap at `cap` iterations but charged a lost
+  CAS `CAS_FAIL_SKIP - 1` of them — 128 by default — so on any ring
+  smaller than the skip a **single** lost CAS ended the lap. The
+  consumer returned `None` with published items in slots it had never
+  examined, and `pop_block` then parked on a ring holding work.
+
+  Two quantities were conflated: how far to jump clear of a contended
+  cache line, and how much of a bounded search that costs. A jump only
+  means anything modulo the ring — 128 positions on a ring of 16 lands
+  back on the same slot. The new `ScanBudget` owns both and clamps the
+  skip to `cap - 1`, keeping the jump large where the ring is large
+  while never letting one contended slot end the lap.
+
+  This did *not* reduce the blind-futile-wake count under stress; it is
+  kept because a unit test pins the arithmetic error, not because the
+  stress numbers moved. Whatever produces those wakes is something
+  else, and `PARK_BACKSTOP` still cannot be removed: sole-waiter
+  rescues continue to appear at roughly one per two or three
+  200-iteration runs, uncorrelated with any change made so far.
+
   The count is now split by side, because only producers can be pinned
   to a position. That split is what settled the fix: **roughly 80% of
   futile wakes are consumers**, who scan for any published slot and are

@@ -88,6 +88,32 @@ pub struct BackstopStats {
     /// Rescues where no other waiter was parked on this side, so
     /// round-robin cannot explain the wake going elsewhere.
     pub sole_waiter_rescues: u64,
+    /// Futile wakes where work was still visible to the waiter at
+    /// the moment it gave up and re-parked.
+    ///
+    /// This is the discriminator between the two explanations for a
+    /// futile wake. If a peer claimed the item first, the ring is
+    /// genuinely barren by the time we look, and the wake was an
+    /// ordinary lost race — a cost, not a defect. If work is *still*
+    /// there and the waiter parks anyway, the waiter failed to find
+    /// what it was woken for, and that is a defect in the scan.
+    ///
+    /// Sampled after the pre-park re-check has already failed, so a
+    /// count here means the item outlived the decision to sleep.
+    ///
+    /// Not a defect count on its own. The sample is one more
+    /// unsynchronised look at a ring other threads are still working,
+    /// so an item published between the failed re-check and the sample
+    /// reads as blindness when nothing was missed. Reading it as a
+    /// *rate against a changed policy* is sound; reading a single
+    /// event as a bug is not.
+    pub blind_futile_wakes: u64,
+    /// Blind futile wakes suffered by producers specifically.
+    ///
+    /// Separates a consumer that failed to find a published item from
+    /// a producer that failed to find a free slot. The two have
+    /// different causes and only the first is a scan defect.
+    pub producer_blind_futile_wakes: u64,
     /// Futile wakes suffered by producers specifically.
     ///
     /// Only producers can be pinned to a position, so only theirs can
@@ -137,6 +163,14 @@ impl BackstopStats {
     pub const fn saw_futile_wake(self) -> bool {
         self.futile_wakes > 0
     }
+
+    /// Whether a waiter ever re-parked with work still visible to it.
+    /// Unlike a plain futile wake, contention cannot explain this:
+    /// the item was there and the waiter went to sleep anyway.
+    #[must_use]
+    pub const fn saw_blind_futile_wake(self) -> bool {
+        self.blind_futile_wakes > 0
+    }
 }
 
 /// Per-ring backstop counters.
@@ -147,6 +181,8 @@ pub struct BackstopMonitor {
     sole_waiter_rescues: AtomicU64,
     futile_wakes: AtomicU64,
     producer_futile_wakes: AtomicU64,
+    blind_futile_wakes: AtomicU64,
+    producer_blind_futile_wakes: AtomicU64,
 }
 
 /// Which side of the ring a watched waiter sits on.
@@ -170,6 +206,8 @@ impl BackstopMonitor {
             sole_waiter_rescues: AtomicU64::new(0),
             futile_wakes: AtomicU64::new(0),
             producer_futile_wakes: AtomicU64::new(0),
+            blind_futile_wakes: AtomicU64::new(0),
+            producer_blind_futile_wakes: AtomicU64::new(0),
         }
     }
 
@@ -184,10 +222,17 @@ impl BackstopMonitor {
         }
     }
 
-    fn record_futile_wake(&self, side: WaiterSide) {
+    fn record_futile_wake(&self, side: WaiterSide, work_visible: bool) {
         self.futile_wakes.fetch_add(1, Ordering::Relaxed);
         if matches!(side, WaiterSide::Producer) {
             self.producer_futile_wakes.fetch_add(1, Ordering::Relaxed);
+        }
+        if work_visible {
+            self.blind_futile_wakes.fetch_add(1, Ordering::Relaxed);
+            if matches!(side, WaiterSide::Producer) {
+                self.producer_blind_futile_wakes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -203,6 +248,10 @@ impl BackstopMonitor {
             sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
             futile_wakes: self.futile_wakes.load(Ordering::Relaxed),
             producer_futile_wakes: self.producer_futile_wakes.load(Ordering::Relaxed),
+            blind_futile_wakes: self.blind_futile_wakes.load(Ordering::Relaxed),
+            producer_blind_futile_wakes: self
+                .producer_blind_futile_wakes
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -260,9 +309,9 @@ impl BackstopWatch {
     /// [`made_progress`](Self::made_progress) means the wake that
     /// ended the last park bought nothing: the waiter looped, found
     /// no work, and is parking again.
-    pub(crate) fn about_to_park(&mut self, peers_parked: u32) {
+    pub(crate) fn about_to_park(&mut self, peers_parked: u32, work_visible: bool) {
         if std::mem::replace(&mut self.woken, false) {
-            self.monitor().record_futile_wake(self.side);
+            self.monitor().record_futile_wake(self.side, work_visible);
         }
         self.sole_waiter = peers_parked == 0;
     }
@@ -291,6 +340,134 @@ impl BackstopWatch {
     }
 }
 
+#[cfg(all(test, feature = "backstop-metrics"))]
+mod tests {
+    use super::{BackstopMonitor, BackstopWatch, WaiterSide};
+
+    /// Drives a watch through one park cycle, so the counter logic is
+    /// tested without threads, rings or timing.
+    struct Cycle {
+        monitor: BackstopMonitor,
+    }
+
+    impl Cycle {
+        const fn new() -> Self {
+            Self {
+                monitor: BackstopMonitor::new(),
+            }
+        }
+
+        const fn watch(&self, side: WaiterSide) -> BackstopWatch {
+            // SAFETY: the monitor outlives the watch, both owned here.
+            unsafe { BackstopWatch::new(std::ptr::from_ref(&self.monitor), side) }
+        }
+    }
+
+    /// A wake that ends a park and leaves the waiter with nothing is
+    /// futile; whether it was *blind* is the question of whether work
+    /// was visible when it gave up, and both answers must be
+    /// recordable.
+    #[test]
+    fn a_futile_wake_is_blind_only_when_work_was_visible() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, false);
+        watch.parked(false, 0);
+        watch.about_to_park(0, true);
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.futile_wakes, 1);
+        assert_eq!(
+            stats.blind_futile_wakes, 1,
+            "work was visible when the waiter re-parked: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_futile_wake_on_an_empty_ring_is_not_blind() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, false);
+        watch.parked(false, 0);
+        watch.about_to_park(0, false);
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.futile_wakes, 1);
+        assert_eq!(
+            stats.blind_futile_wakes, 0,
+            "nothing was there to be missed: {stats:?}"
+        );
+    }
+
+    /// Work being visible is only interesting when a wake was wasted.
+    /// A park that ends on the timeout is not a futile wake, so it
+    /// must not be counted as a blind one however much work is around.
+    #[test]
+    fn a_timeout_with_work_visible_is_not_a_blind_futile_wake() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, false);
+        watch.parked(true, 0);
+        watch.about_to_park(0, true);
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.unwoken_timeouts, 1);
+        assert_eq!(stats.futile_wakes, 0);
+        assert_eq!(
+            stats.blind_futile_wakes, 0,
+            "no wake was spent, so nothing was wasted: {stats:?}"
+        );
+    }
+
+    /// A waiter that uses its wake has not suffered a futile one, so
+    /// the visibility flag on its next park must not be attributed to
+    /// the wake it already spent.
+    #[test]
+    fn progress_clears_the_pending_wake_before_the_next_park() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Producer);
+
+        watch.about_to_park(0, false);
+        watch.parked(false, 0);
+        watch.made_progress();
+        watch.about_to_park(0, true);
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.futile_wakes, 0);
+        assert_eq!(stats.blind_futile_wakes, 0);
+    }
+
+    /// The side split and the blindness split are independent axes.
+    #[test]
+    fn a_blind_futile_wake_is_attributed_to_its_side() {
+        let cycle = Cycle::new();
+        let mut producer = cycle.watch(WaiterSide::Producer);
+        producer.about_to_park(0, false);
+        producer.parked(false, 0);
+        producer.about_to_park(0, true);
+
+        let mut consumer = cycle.watch(WaiterSide::Consumer);
+        consumer.about_to_park(0, false);
+        consumer.parked(false, 0);
+        consumer.about_to_park(0, true);
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.futile_wakes, 2);
+        assert_eq!(stats.blind_futile_wakes, 2);
+        assert_eq!(
+            stats.producer_futile_wakes, 1,
+            "only the producer's is the producer's: {stats:?}"
+        );
+        assert_eq!(
+            stats.producer_blind_futile_wakes, 1,
+            "the two splits are independent axes: {stats:?}"
+        );
+    }
+}
+
 /// No-op twin, compiled when `backstop-metrics` is off.
 #[cfg(not(feature = "backstop-metrics"))]
 pub struct BackstopWatch;
@@ -303,7 +480,7 @@ pub struct BackstopWatch;
 )]
 impl BackstopWatch {
     #[inline]
-    pub(crate) const fn about_to_park(&mut self, _peers_parked: u32) {}
+    pub(crate) const fn about_to_park(&mut self, _peers_parked: u32, _work_visible: bool) {}
 
 
     #[inline]

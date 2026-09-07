@@ -63,6 +63,7 @@ mod drain_wake;
 mod producer;
 mod ready_word;
 mod reservation_return;
+mod scan_budget;
 mod slot_release;
 
 pub use config::{Cfg, Config, DefaultConfig};
@@ -518,6 +519,11 @@ mod tests {
         assert_eq!(
             stats.futile_wakes, 1,
             "the push that ended the call delivered a wake the consumer used: {stats:?}"
+        );
+        assert!(
+            !stats.saw_blind_futile_wake(),
+            "the ring was empty when the consumer re-parked, so it was not \
+             blind to anything: {stats:?}"
         );
     }
 
@@ -2060,9 +2066,11 @@ mod tests {
         let (
             mut futile_total,
             mut producer_futile_total,
+            mut blind_futile_total,
+            mut producer_blind_total,
             mut rescue_total,
             mut timeout_total,
-        ) = (0u64, 0u64, 0u64, 0u64);
+        ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         for iter in 0..200 {
             if iter % 10 == 0 {
                 eprintln!("iter {iter}");
@@ -2138,6 +2146,8 @@ mod tests {
                 }
                 futile_total += stats.futile_wakes;
                 producer_futile_total += stats.producer_futile_wakes;
+                blind_futile_total += stats.blind_futile_wakes;
+                producer_blind_total += stats.producer_blind_futile_wakes;
                 rescue_total += stats.rescues;
                 timeout_total += stats.unwoken_timeouts;
                 assert!(
@@ -2153,7 +2163,8 @@ mod tests {
         watchdog.join().unwrap();
         #[cfg(feature = "backstop-metrics")]
         eprintln!(
-            "TOTALS futile={futile_total} (producer={producer_futile_total}) \
+            "TOTALS futile={futile_total} (producer={producer_futile_total}, \
+             blind={blind_futile_total}, producer_blind={producer_blind_total}) \
              rescues={rescue_total} unwoken_timeouts={timeout_total}"
         );
     }

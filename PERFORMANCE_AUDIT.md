@@ -246,6 +246,21 @@ What is proven: the pin is real, and a wake can be spent on a producer
 that cannot use it. What is *not* proven: that this is what strands a
 producer in the wild. The stress rescues remain too few to attribute.
 
+### Sole-waiter rescues are intermittent and predate the recent changes
+
+A `sole_waiter_rescue` — a waiter released by the timeout with no peer
+parked to have taken its wake, the strongest available evidence of a
+genuinely lost wake — appeared for the first time during the
+position-targeted-wake experiment, which made that change the obvious
+suspect. It is not: sole-waiter rescues have since occurred repeatedly
+with the targeting reverted, roughly once every two or three
+200-iteration runs, and did not reproduce on immediate re-runs of the
+same build.
+
+They are rare, they do not correlate with any change made so far, and
+they are what `PARK_BACKSTOP` is currently catching. The backstop
+cannot be removed while they occur.
+
 ### Position-targeted wakes: built, measured, rejected
 
 The obvious fix follows from the pin: have a waiter publish the
@@ -288,6 +303,59 @@ that finds nothing has usually lost the slot to a peer that claimed it
 first, which is ordinary contention rather than a lost wake, but that
 is a hypothesis and not yet a measurement.
 
+### The scan budget a single lost CAS could exhaust
+
+Asking what the consumer futile wakes are led to a real defect, found
+by reading `claim_slot` rather than by the counter that prompted the
+reading.
+
+A lap of the ring was budgeted at `cap` iterations, but a lost CAS was
+charged `CAS_FAIL_SKIP - 1` of them — 128 by default. On any ring
+smaller than the skip, **one lost CAS ended the lap**, so the consumer
+reported the ring empty while published items sat in slots it had never
+examined, and `pop_block` parked on a ring with work in it. The stress
+ring is `cap = 16`, so this was the governing case there, not an edge
+one.
+
+The two quantities were conflated: how far to jump clear of a contended
+cache line, and how much of a bounded search that costs. A jump is only
+meaningful modulo the ring — 128 positions on a ring of 16 lands back
+on the same slot. [`ScanBudget`](src/mpmc/scan_budget.rs) now owns
+both, clamping the skip to `cap - 1` so a jump stays large in position
+where the ring is large, and can never end the lap on its own. The
+defect is pinned by a unit test that fails against the old arithmetic
+and passes against the new one.
+
+**It did not reduce blind futile wakes.** Baseline 4, fixed 6 and 9 —
+noise, in a metric with a known false-positive mode (below). The fix is
+kept because the unit test proves the arithmetic was wrong, not because
+the stress numbers improved. Whatever produces the blind wakes is
+something else.
+
+### What the blind-futile counter can and cannot say
+
+`blind_futile_wakes` counts a futile wake where work was still visible
+when the waiter re-parked, to separate "nothing was there" from
+"something was there and I missed it". Split by side, blind wakes are
+**almost entirely consumer-side**: `producer_blind_futile_wakes` was 0
+across three consecutive runs before a fourth produced exactly one.
+
+Its limit was found by a test that failed. The sample is one more
+unsynchronised look at a ring other threads are still working, so an
+item published between the failed re-check and the sample reads as
+blindness when nothing was missed — which is exactly what the staged
+test hit. The counter is sound as a *rate compared across a policy
+change* and unsound as a per-event defect count. The staged test was
+deleted rather than weakened; the calibration that survives is in
+`backstop_monitor`'s own tests, which drive the counter logic directly
+with no ring and no threads.
+
+The side split is lopsided rather than absolute. Blind wakes are
+overwhelmingly consumer-side — three consecutive 200-iteration runs
+gave `producer_blind` of 0, 0 and 0 — but a fourth produced a single
+one, so "only consumers can be blind" is false and the mechanism is not
+exclusive to the scan.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -309,6 +377,8 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
-7. **Find out what the consumer futile wakes are.** Splitting the counter by side showed roughly 80% of futile wakes fall on consumers (see "Position-targeted wakes"), which position routing cannot touch. The likely explanation is an ordinary lost race — a woken consumer whose slot was claimed by a peer first — which would make them a cost rather than a defect. Confirm or refute that before treating the total as a defect count. Position-targeted wakes were built for the producer side and measured as no better than baseline; the code was reverted rather than kept on the strength of the mechanism alone.
+7. **Find out what the consumer *blind* futile wakes are.** Asking this question found and fixed one real defect — a lost CAS could exhaust the whole lap budget (see "The scan budget a single lost CAS could exhaust") — but fixing it did not move the count, so the cause is elsewhere. What is now known: blind futile wakes are almost entirely consumer-side, and the counter has a false-positive mode where an item published between the failed re-check and the sample looks like blindness. Before chasing it further, tighten the sample so the two are distinguishable — recording *which* position was visible and whether that position was still unclaimed when the waiter next ran would separate a genuine scan miss from a publish that simply arrived late. Position-targeted wakes were built for the producer side and measured as no better than baseline; the code was reverted rather than kept on the strength of the mechanism alone.
+
+8. **Explain the sole-waiter rescues before removing `PARK_BACKSTOP`.** They recur at roughly one per two or three 200-iteration runs, do not reproduce on an immediate re-run, and are uncorrelated with every change made so far (they were initially blamed on position-targeted wakes and then observed with that code reverted). Each is a waiter the timeout released with no peer parked to have absorbed its wake. This is the remaining reason the backstop cannot go.
 8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
