@@ -1491,19 +1491,16 @@ mod tests {
         // M producers + N consumers, each on its own thread with a
         // current_thread runtime + LocalSet. Watchdog aborts within 5s
         // if anything deadlocks.
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-
-        let done = Arc::new(AtomicBool::new(false));
 
         let n_producers: u64 = 2;
         let n_consumers: u64 = 2;
         let per_producer: u64 = 2_500;
         let total = n_producers * per_producer;
         let received = Arc::new(AtomicU64::new(0));
-        let watchdog = crate::common::spawn_progress_watchdog(
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
             received.clone(),
-            done.clone(),
             "mpmc async_push_pop_cross_thread",
         );
 
@@ -1555,8 +1552,7 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.load(Ordering::Relaxed), total);
-        done.store(true, Ordering::Release);
-        watchdog.join().unwrap();
+
     }
 
     #[test]
@@ -1758,16 +1754,14 @@ mod tests {
 
     #[cfg(feature = "async")]
     fn async_mpmc_stress_iters(iters: usize, cap: usize, per_producer: u64) {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
 
-        let done = Arc::new(AtomicBool::new(false));
         // Monotonic across all iterations so the watchdog sees continuous
         // progress; `received` below is per-iteration (for the assert).
         let progress = Arc::new(AtomicU64::new(0));
-        let watchdog = crate::common::spawn_progress_watchdog(
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
             progress.clone(),
-            done.clone(),
             "mpmc async stress",
         );
 
@@ -1827,7 +1821,6 @@ mod tests {
             }
             assert_eq!(received.load(Ordering::Relaxed), total);
         }
-        done.store(true, Ordering::Release);
-        watchdog.join().unwrap();
+
     }
 }

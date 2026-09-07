@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`common` is split into one module per responsibility.** The module
+  root held six unrelated things behind a single `mod.rs`: the slot
+  sequence encoding, the ring's backing allocation, the cache-line
+  padding, three blocking-loop traits, two test payload types, and a
+  watchdog thread. They shared a file, not a subject.
+
+  Now `seq_slot`, `aligned_buf`, `cache_padded`, `single_parker`,
+  `drop_counter` and `progress_watchdog` each own one, and `mod.rs` is
+  the module list plus the re-exports that keep every existing path
+  working. Nothing moved in the public API.
+
+  The pieces arrived with tests of their own: 24 for behaviour that
+  was previously only exercised through the rings that used it, among
+  them the first direct coverage of the slot encoding's central
+  guarantee — that no two positions share a sequence value.
+
 ### Removed
 - **Dead `consumer_count` field in the mpmc and spmc rings.** Both
   incremented it on every consumer clone and never read it: no load,

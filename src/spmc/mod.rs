@@ -1422,17 +1422,14 @@ mod tests {
         // One producer + N consumers, each on its own thread with a
         // current_thread runtime + LocalSet. Watchdog aborts within 5s
         // if anything deadlocks.
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-
-        let done = Arc::new(AtomicBool::new(false));
 
         let n_consumers: u64 = 4;
         let total: u64 = 10_000;
         let received = Arc::new(AtomicU64::new(0));
-        let watchdog = crate::common::spawn_progress_watchdog(
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
             received.clone(),
-            done.clone(),
             "spmc async_push_pop_cross_thread",
         );
 
@@ -1477,8 +1474,7 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.load(Ordering::Relaxed), total);
-        done.store(true, Ordering::Release);
-        watchdog.join().unwrap();
+
     }
 
     #[test]

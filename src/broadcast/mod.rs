@@ -1375,14 +1375,12 @@ mod tests {
 
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread_run(iters: usize, total: u64, cap: usize, _deadline_secs: u64) {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
 
-        let done = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
-        let watchdog = crate::common::spawn_progress_watchdog(
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
             progress.clone(),
-            done.clone(),
             "broadcast async_push_pop_cross_thread",
         );
 
@@ -1430,8 +1428,7 @@ mod tests {
                 h.join().unwrap();
             }
         }
-        done.store(true, Ordering::Release);
-        watchdog.join().unwrap();
+
     }
 
     /// A `Waker` is user code and may panic. `commit` publishes the

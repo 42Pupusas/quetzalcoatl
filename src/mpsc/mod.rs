@@ -1793,14 +1793,12 @@ mod tests {
         // Multiple producers and one consumer on separate threads. Watchdog
         // aborts the process if anything deadlocks within 5s so the test
         // fails fast.
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
 
-        let done = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
-        let watchdog = crate::common::spawn_progress_watchdog(
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
             progress.clone(),
-            done.clone(),
             "mpsc async_push_pop_cross_thread",
         );
 
@@ -1854,8 +1852,7 @@ mod tests {
             h.join().unwrap();
         }
         ch.join().unwrap();
-        done.store(true, Ordering::Release);
-        watchdog.join().unwrap();
+
     }
 
     /// A `Waker` is user code and may panic. `commit` publishes the
