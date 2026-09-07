@@ -49,6 +49,7 @@ mod consumer;
 mod done_word;
 mod drain_wake;
 mod producer;
+mod slot_release;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
@@ -1267,6 +1268,45 @@ mod tests {
     fn drain_empty_returns_zero() {
         let (_p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
         assert_eq!(c.drain(|_| {}), 0);
+    }
+
+    /// The double-drop twin covers teardown; this covers the producer.
+    /// `SlotReader::drop` runs `T::drop` before storing `done`, so an
+    /// unwind in between never releases the slot — the producer can
+    /// never reuse that position, and one blocked on it never wakes.
+    #[test]
+    fn a_panicking_slot_reader_drop_still_releases_its_slot() {
+        // Only the first value panics: a second unwinding destructor
+        // during cleanup would abort the process rather than fail.
+        #[derive(Debug)]
+        struct PanicOnDrop {
+            panics: bool,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                assert!(!self.panics, "destructor failure");
+            }
+        }
+
+        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(2)).split();
+        producer.push(PanicOnDrop { panics: true }).unwrap();
+        producer.push(PanicOnDrop { panics: false }).unwrap();
+        assert!(
+            producer.push(PanicOnDrop { panics: false }).is_err(),
+            "the ring must start full"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(consumer.pop_ref().unwrap());
+        }));
+        assert!(result.is_err(), "the destructor panic must propagate");
+
+        // The slot the reader held must be back with the producer.
+        assert!(
+            producer.push(PanicOnDrop { panics: false }).is_ok(),
+            "the freed slot must be reusable after the unwind"
+        );
     }
 
     /// A `T` whose destructor panics must still release its slot. The

@@ -43,6 +43,7 @@ mod consumer;
 mod consumer_floor;
 mod consumer_registry;
 mod floor_cache;
+mod head_advance;
 mod producer;
 mod reservation_abandon;
 mod slot_reuse;
@@ -648,6 +649,41 @@ mod tests {
     /// whose value panics on drop must still publish its abandonment
     /// marker, or a consumer parked at that position waits for a
     /// publication that never comes.
+    /// `pop` clones the value and only then advances the head. `Clone`
+    /// is user code and may panic, and unwinding past the advance
+    /// strands this consumer at the position forever: it never sees a
+    /// later value, and the producer never gets the capacity back.
+    #[test]
+    fn a_panicking_clone_during_pop_still_advances_the_consumer() {
+        #[derive(Debug)]
+        struct PanicOnClone {
+            panics: bool,
+        }
+
+        impl Clone for PanicOnClone {
+            fn clone(&self) -> Self {
+                assert!(!self.panics, "clone failure");
+                Self { panics: false }
+            }
+        }
+
+        let ring = RingBuffer::<PanicOnClone>::new(Capacity::exact(4), 1);
+        let (producer, mut consumer) = ring.split();
+
+        producer.push(PanicOnClone { panics: true }).unwrap();
+        producer.push(PanicOnClone { panics: false }).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = consumer.pop();
+        }));
+        assert!(result.is_err(), "the clone panic must propagate");
+
+        assert!(
+            consumer.pop().is_some(),
+            "the consumer must advance past the position whose clone panicked"
+        );
+    }
+
     #[test]
     fn a_panicking_payload_still_abandons_its_uncommitted_reservation() {
         struct PanicOnDropGuard {

@@ -8,6 +8,7 @@ use std::task::Poll;
 
 use super::done_word::DoneWord;
 use super::drain_wake::DrainWake;
+use super::slot_release::SlotRelease;
 use super::RingBuffer;
 use crate::capacity::Capacity;
 use crate::common::backoff::Backoff;
@@ -502,14 +503,18 @@ impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, 
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
     fn drop(&mut self) {
+        // Armed before the destructor runs: a panicking `T::drop` would
+        // otherwise unwind past the release and lose the position for
+        // the life of the ring.
+        // SAFETY: `done_ptr` names the slot at `head`, in a ring the
+        // consumer's borrow keeps alive.
+        let _release = unsafe {
+            SlotRelease::new(self.consumer.ring(), self.done_ptr, self.head, self.capacity)
+        };
+        // SAFETY: the consumer claimed this published position, so the
+        // value is initialized and owned by this reader.
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());
         }
-        unsafe {
-            (*self.done_ptr).release(self.head, self.capacity);
-        }
-        self.consumer.ring().wake_producer();
-        #[cfg(feature = "async")]
-        self.consumer.ring().wake_producer_async();
     }
 }

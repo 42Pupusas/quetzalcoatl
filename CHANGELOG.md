@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A panicking `T::drop` under an spmc `SlotReader` lost the slot.**
+  `SlotReader::drop` ran the value's destructor and only then stored
+  `done`, so an unwind in between never handed the position back. The
+  producer could not reuse it for the life of the ring, and one blocked
+  on it never woke, since `push_block` parks untimed. The release now
+  runs from an `spmc::SlotRelease` guard armed before the destructor,
+  matching mpsc and mpmc, which already had one. spsc was already
+  correct through `HeadPublisher`.
+
+  The neighbouring double-drop test passed throughout: `head` has
+  already advanced by then, so teardown skips the slot and the value is
+  not dropped twice. Only the producer's view was broken.
+
+- **A panicking `T::clone` in `broadcast::Consumer::pop` stranded the
+  consumer.** `pop` clones the value out of the slot and then advances
+  the head. `Clone` is user code; unwinding past the advance left the
+  head on the position just read, so the next `pop` re-read the same
+  value and panicked again — forever. The consumer never reached a
+  later value, and its stale head held `min_head` down so the producer
+  could not reclaim the capacity either.
+
+  The advance now runs from a `HeadAdvance` guard armed before the
+  clone. This matches what `pop_ref` already did, whose `SlotReader`
+  advances whether or not the borrower panicked, and it costs nothing:
+  a broadcast consumer never owns the value, so there is no destructor
+  to order against. broadcast is the only ring whose `pop` clones; the
+  others move the value out.
+
 - **A panicking drain callback left producers waiting on space it had
   already freed.** `drain` and `drain_up_to` release each slot inside
   their loop but wake the producers once at the end, which is what makes

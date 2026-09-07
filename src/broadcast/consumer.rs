@@ -4,9 +4,8 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::head_advance::HeadAdvance;
 use super::RingBuffer;
-#[cfg(feature = "async")]
-#[cfg(feature = "async")]
 #[cfg(feature = "async")]
 use crate::common::park_registration::{ParkSite, ParkedFuture};
 #[cfg(feature = "async")]
@@ -114,13 +113,16 @@ impl<T> Consumer<T> {
                 SlotSnapshot::Ready(data_ptr) => data_ptr,
             };
 
+            // Armed before the clone: `T::clone` is user code, and
+            // unwinding past the advance would leave this consumer
+            // rereading the position forever.
+            let _advance = HeadAdvance::new(&self.queue, self.slot_index, head);
+
             // SAFETY: classify() returned Ready, which synchronizes with the
             // producer's Release, ensuring the data write is visible. The
             // data won't be overwritten because this consumer's head hasn't
             // advanced (min_head blocks the producer).
             let val = unsafe { (*data_ptr).assume_init_ref().clone() };
-
-            self.advance_head(head);
 
             return Some(val);
         }
