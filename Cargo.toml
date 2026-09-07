@@ -9,25 +9,23 @@ repository = "https://github.com/42Pupusas/quetzalcoatl"
 keywords = ["lock-free", "mpmc", "spmc", "ring-buffer", "broadcast"]
 categories = ["concurrency", "data-structures"]
 readme = "README.md"
-# Tight allowlist — keeps benches/ and examples/ out of the published
-# crate (they reference dev-dependencies and bloat the download).
-# `include` wins over `exclude` outright, so the loom models are kept
-# out by naming the directories rather than by excluding the file:
-# it is test-only scaffolding naming a crate the package never depends
-# on.
+# Allowlist — keeps benches/ and examples/ out of the published crate
+# (they reference dev-dependencies and bloat the download).
+#
+# Every source directory is matched by glob. Listing `src/common`
+# file-by-file is what shipped 0.14.0 broken: nine modules declared in
+# `common/mod.rs` were missing from the tarball, so the published crate
+# did not compile at all. The list was kept manual to hold back
+# `loom_models.rs`; that file is `#[cfg(all(test, loom, ...))]`, so
+# shipping it costs a few KB and compiles for nobody — a far better
+# trade than a list that silently drifts every time a module is added.
+#
+# `cargo package` is the check that catches this: it builds the tarball
+# it produces. Run it before publishing.
 include = [
     "src/*.rs",
     "src/broadcast/**/*.rs",
-    "src/common/atomics.rs",
-    "src/common/mod.rs",
-    "src/common/park.rs",
-    "src/common/park_probe.rs",
-    "src/common/park_registration.rs",
-    "src/common/park_registry.rs",
-    "src/common/thread_parker.rs",
-    "src/common/uncommitted_slot.rs",
-    "src/common/wake_async.rs",
-    "src/common/waker_overflow.rs",
+    "src/common/**/*.rs",
     "src/mpmc/**/*.rs",
     "src/mpsc/**/*.rs",
     "src/spmc/**/*.rs",
