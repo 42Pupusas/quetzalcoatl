@@ -4,6 +4,7 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::consumed_watermark::ConsumedTally;
 use super::slot_release::SlotRelease;
 use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
@@ -23,7 +24,7 @@ pub struct Consumer<T, C: Config = DefaultConfig> {
     /// Private scan cursor (logical position).
     next_scan: Cell<usize>,
     /// Pops since the last `consumed` flush.
-    local_consumed: Cell<usize>,
+    consumed: ConsumedTally,
     /// Park slot leased for this consumer's lifetime, returned on drop.
     park_slot: ParkSlot,
 }
@@ -45,7 +46,7 @@ impl<T, C: Config> Clone for Consumer<T, C> {
         Self {
             queue: Arc::clone(&self.queue),
             next_scan: Cell::new(stagger),
-            local_consumed: Cell::new(0),
+            consumed: ConsumedTally::new(),
             park_slot: self.queue.consumer_slots.lease(),
         }
     }
@@ -61,7 +62,7 @@ impl<T, C: Config> Consumer<T, C> {
         Self {
             queue,
             next_scan: Cell::new(0),
-            local_consumed: Cell::new(0),
+            consumed: ConsumedTally::new(),
             park_slot,
         }
     }
@@ -119,13 +120,7 @@ impl<T, C: Config> Consumer<T, C> {
                     // it monotonic in case we claimed a future slot.
                     self.next_scan.set((round_pos + 1).max(start_scan + 1));
 
-                    let lc = self.local_consumed.get() + 1;
-                    if lc >= C::CONSUMED_FLUSH {
-                        q.consumed.fetch_add(lc, Ordering::Relaxed);
-                        self.local_consumed.set(0);
-                    } else {
-                        self.local_consumed.set(lc);
-                    }
+                    self.consumed.record(&q.consumed, C::CONSUMED_FLUSH);
 
                     return Some((scan, round_pos));
                 }
@@ -468,12 +463,7 @@ impl<T, C: Config> Consumer<T, C> {
 
 impl<T, C: Config> Drop for Consumer<T, C> {
     fn drop(&mut self) {
-        // Flush the per-consumer count so producers' free-space
-        // estimate doesn't permanently lag this consumer's work.
-        let lc = self.local_consumed.get();
-        if lc > 0 {
-            self.queue.consumed.fetch_add(lc, Ordering::Relaxed);
-        }
+        self.consumed.flush(&self.queue.consumed);
 
         self.queue.consumer_slots.release(self.park_slot);
 

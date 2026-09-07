@@ -71,19 +71,13 @@ impl<T, C: Config> Producer<T, C> {
     /// if the watermark says full and a per-slot check confirms it.
     #[inline]
     fn refill_batch(&self, q: &RingBuffer<T, C>) -> Option<(usize, u32)> {
-        // Bound the batch by free space estimated from the
-        // (lagging) `consumed` watermark — safe to underestimate.
         let claim = q.claim.load(Ordering::Relaxed);
-        let consumed = q.consumed.load(Ordering::Acquire);
-        let in_flight = claim.wrapping_sub(consumed);
-        let free = if in_flight >= q.capacity.get() {
-            // Watermark says full; per-slot check before giving up.
-            if !q.done_slot(claim).is_free_for(claim) {
-                return None;
-            }
-            1
-        } else {
-            q.capacity.get() - in_flight
+        // No estimate means the watermark accounts for the whole ring;
+        // it lags, so check the slot itself before giving up.
+        let free = match q.consumed.free(claim, q.capacity.get()) {
+            Some(free) => free,
+            None if q.done_slot(claim).is_free_for(claim) => 1,
+            None => return None,
         };
         let batch = C::PRODUCER_BATCH.min(free);
 

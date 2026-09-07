@@ -55,6 +55,7 @@
 
 mod batch_abandon;
 mod config;
+mod consumed_watermark;
 mod consumer;
 mod done_word;
 mod producer;
@@ -66,6 +67,7 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use config::ConfigBounds;
+use consumed_watermark::ConsumedWatermark;
 use done_word::DoneWord;
 use ready_word::{ReadyState, ReadyWord};
 
@@ -108,7 +110,7 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// Coarse "items consumed" watermark — a lower bound, flushed
     /// from per-consumer locals every `CONSUMED_FLUSH` pops.
     /// Producers use it to bound their per-batch FAA on `claim`.
-    pub(crate) consumed: CachePadded<AtomicUsize>,
+    consumed: ConsumedWatermark,
     /// Live producer count; last-drop sets `producer_closed`.
     pub(crate) producer_count: EndpointCount,
     /// Live consumer count; last-drop sets `consumer_closed`.
@@ -191,7 +193,7 @@ impl<T, C: Config> RingBuffer<T, C> {
             ready,
             done,
             claim: CachePadded(AtomicUsize::new(0)),
-            consumed: CachePadded(AtomicUsize::new(0)),
+            consumed: ConsumedWatermark::new(),
             producer_count: EndpointCount::new(),
             consumer_count_live: EndpointCount::new(),
             clone_counter: CachePadded(AtomicUsize::new(0)),

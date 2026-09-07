@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **mpmc's consumed watermark has an owner.**
+  Consumers count their pops privately and publish the batch every
+  `CONSUMED_FLUSH`; producers subtract the published total from the
+  claim cursor to size their next reservation. The two halves sat in
+  three files with the wrapping subtraction spelled out at the use
+  site. `ConsumedWatermark` and `ConsumedTally` in
+  `mpmc/consumed_watermark.rs` now own them, and the subtraction
+  becomes `free()`, returning `None` for "the watermark accounts for
+  the whole ring" — an estimate the producer rechecks per slot, since
+  the watermark only ever understates progress. 15 tests, and the
+  shared atomic becomes private.
+
 - **The broadcast consumer-floor cache has an owner.**
   A producer answers "may I write this position?" from a private
   `Cell`, then a shared atomic, then a full registry scan. The three
