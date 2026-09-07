@@ -253,3 +253,169 @@ impl Default for WakeSet {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ParkSlot, WakeSet, PARK_SLOTS};
+    use std::sync::atomic::Ordering;
+
+    impl WakeSet {
+        fn parked_bits(&self) -> u64 {
+            self.wake.load(Ordering::Relaxed)
+        }
+
+        fn arm_all(&self, slots: &[u32]) {
+            for &bit in slots {
+                self.arm(ParkSlot::Leased(bit));
+            }
+        }
+
+        fn parked_slots(&self) -> Vec<u32> {
+            (0..u32::try_from(PARK_SLOTS).unwrap())
+                .filter(|bit| self.parked_bits() & (1u64 << bit) != 0)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_fresh_set_has_nobody_parked() {
+        let set = WakeSet::new();
+        assert_eq!(set.parked_bits(), 0);
+        assert!(!set.is_armed(ParkSlot::Leased(0)));
+    }
+
+    #[test]
+    fn arming_publishes_the_slots_bit_and_its_handle() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Leased(7));
+        assert_eq!(set.parked_bits(), 1 << 7);
+        assert!(set.is_armed(ParkSlot::Leased(7)));
+    }
+
+    #[test]
+    fn disarming_clears_only_its_own_bit() {
+        let set = WakeSet::new();
+        set.arm_all(&[3, 9]);
+        set.disarm(ParkSlot::Leased(3));
+        assert_eq!(set.parked_slots(), vec![9]);
+    }
+
+    #[test]
+    fn a_slotless_waiter_publishes_no_bit_and_arms_no_handle() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Shared);
+        assert_eq!(set.parked_bits(), 0);
+        assert!(!set.is_armed(ParkSlot::Shared));
+    }
+
+    #[test]
+    fn waking_an_empty_set_is_a_no_op() {
+        let set = WakeSet::new();
+        set.wake_one();
+        set.wake_n(8);
+        set.flush();
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    #[test]
+    fn a_wake_releases_exactly_one_slot() {
+        let set = WakeSet::new();
+        set.arm_all(&[1, 2, 3]);
+        set.wake_one();
+        assert_eq!(set.parked_slots().len(), 2);
+    }
+
+    #[test]
+    fn waking_a_slot_claims_the_handle_it_armed() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Leased(0));
+        set.wake_one();
+        assert!(!set.is_armed(ParkSlot::Leased(0)));
+    }
+
+    #[test]
+    fn successive_wakes_walk_the_parked_slots() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        set.wake_one();
+        set.wake_one();
+        assert_eq!(set.parked_bits(), 0, "both parked slots must be woken");
+    }
+
+    /// The saturated-mpmc deadlock the round-robin cursor exists to
+    /// fix: the waiter at the lower slot cannot make progress and
+    /// re-parks immediately, while the higher one holds the position
+    /// everybody needs. Picking the lowest set bit every time feeds
+    /// each wake to the stuck waiter and the higher slot parks forever.
+    #[test]
+    fn a_reparking_low_slot_does_not_starve_a_higher_one() {
+        let set = WakeSet::new();
+        set.arm_all(&[2, 3]);
+
+        set.wake_one();
+        assert_eq!(set.parked_slots(), vec![3], "the lower slot wakes first");
+
+        set.arm(ParkSlot::Leased(2));
+        set.wake_one();
+
+        assert_eq!(
+            set.parked_slots(),
+            vec![2],
+            "the second wake must reach slot 3, not the slot that just re-parked"
+        );
+    }
+
+    #[test]
+    fn a_batch_wake_releases_the_count_it_was_given() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1, 2, 3, 4]);
+        set.wake_n(3);
+        assert_eq!(set.parked_slots().len(), 2);
+    }
+
+    #[test]
+    fn a_batch_wake_stops_at_the_number_parked() {
+        let set = WakeSet::new();
+        set.arm_all(&[5, 6]);
+        set.wake_n(32);
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    #[test]
+    fn a_flush_releases_every_parked_slot() {
+        let set = WakeSet::new();
+        let every: Vec<u32> = (0..u32::try_from(PARK_SLOTS).unwrap()).collect();
+        set.arm_all(&every);
+        assert_eq!(set.parked_bits(), u64::MAX);
+        set.flush();
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    /// A shift or mask that truncated would leave the highest slot
+    /// parked with its bit still set.
+    #[test]
+    fn the_last_slot_is_reachable() {
+        let set = WakeSet::new();
+        let last = u32::try_from(PARK_SLOTS).unwrap() - 1;
+        set.arm(ParkSlot::Leased(last));
+        set.wake_one();
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    #[test]
+    fn a_wake_reaches_a_waiter_that_parked_on_another_thread() {
+        let set = std::sync::Arc::new(WakeSet::new());
+        let peer = std::sync::Arc::clone(&set);
+
+        let waiter = std::thread::spawn(move || {
+            peer.arm(ParkSlot::Leased(1));
+            std::thread::park();
+            peer.disarm(ParkSlot::Leased(1));
+        });
+
+        crate::common::park_probe::ParkProbe::new()
+            .expect_until("the waiter to park", || set.parked_bits() & (1 << 1) != 0);
+        set.wake_one();
+        waiter.join().unwrap();
+    }
+}

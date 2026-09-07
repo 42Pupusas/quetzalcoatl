@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **The wake bitmap is tested directly.**
+  `WakeSet` is the park/unpark bitmap every topology waits on, and it
+  had no test module — it was covered only through the blocking tests
+  of the four rings, which exercise it incidentally and cannot isolate
+  a wake-routing fault from a ring bug. Fourteen tests now pin it,
+  including the starvation case its round-robin cursor exists to fix:
+  a waiter at a low slot that re-parks immediately must not consume
+  every wake and leave a higher slot parked forever. That test was
+  confirmed to fail (and only it) with the cursor pinned to zero.
+
 - **The Arc broadcast facade is tested where it lives.**
   `broadcast/arc.rs` had no test module; seven tests for it sat in
   `broadcast/mod.rs` and covered `push`, `pop`, `pop_ref` and
