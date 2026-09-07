@@ -58,6 +58,7 @@ mod config;
 mod consumed_watermark;
 mod consumer;
 mod done_word;
+mod drain_wake;
 mod producer;
 mod ready_word;
 mod reservation_return;
@@ -1368,6 +1369,39 @@ mod tests {
         assert_eq!(got, vec![0, 1, 2, 100, 101, 102]);
     }
 
+    /// `drain` releases each slot inside its loop but wakes producers
+    /// after it. A panicking callback unwinds past `wake_n`, leaving
+    /// producers parked on a ring that now has space — a permanent
+    /// hang, since `push_block` parks untimed.
+    #[test]
+    fn a_panicking_drain_callback_still_wakes_the_blocked_producers() {
+        const CAP: u32 = 4;
+
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(CAP as usize)).split();
+        for i in 0..CAP {
+            p.push(i).unwrap();
+        }
+
+        let pusher = {
+            let p = p.clone();
+            std::thread::spawn(move || p.push_block(99).expect("consumers dropped"))
+        };
+        drop(p);
+        ParkProbe::new().expect_until("push_block to set its wake bit", || {
+            c.queue.producer_park.wake.load(Ordering::SeqCst) != 0
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.drain(|v| assert!(v != 2, "callback panic"));
+        }));
+        assert!(result.is_err(), "the callback panic must propagate");
+
+        // Slots were released before the unwind, so a producer has
+        // space. Without the wake it sleeps forever and this join never
+        // returns.
+        pusher.join().unwrap();
+    }
+
     /// mpmc analog of `mpsc::drain_wakes_all_parked_producers` — same
     /// regression class. With `wake_n(count)` all parked producers
     /// wake after a drain; with the old `wake_one` only one would,
@@ -1520,6 +1554,55 @@ mod tests {
             assert_eq!(consumer.pop_async().await, None);
         }));
         h.join().unwrap();
+    }
+
+    /// The blocking twin survives this only because `push_block` parks
+    /// with `PARK_BACKSTOP`; the async path has no such timeout, so a
+    /// waker skipped by an unwinding drain callback strands the task
+    /// permanently.
+    #[test]
+    #[cfg(feature = "async")]
+    fn a_panicking_drain_callback_still_wakes_the_pending_async_producer() {
+        // Asserting on the wake itself, not on a re-poll: awaiting the
+        // future would poll it again and find the space regardless,
+        // passing whether or not the drain ever woke anyone.
+        struct CountingWaker {
+            count: std::sync::atomic::AtomicUsize,
+        }
+
+        impl std::task::Wake for CountingWaker {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        for i in 0..4u64 {
+            producer.push(i).unwrap();
+        }
+
+        let counter = std::sync::Arc::new(CountingWaker {
+            count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let mut pending = std::pin::pin!(producer.push_async(99));
+        assert!(
+            std::future::Future::poll(pending.as_mut(), &mut cx).is_pending(),
+            "the ring is full, so the push must register and park"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain(|v| assert!(v != 2, "callback panic"));
+        }));
+        assert!(result.is_err(), "the callback panic must propagate");
+
+        assert_eq!(
+            counter.count.load(Ordering::Relaxed),
+            1,
+            "the freed space must wake the registered task, even on the unwind path"
+        );
     }
 
     #[test]

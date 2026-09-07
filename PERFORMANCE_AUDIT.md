@@ -2,9 +2,9 @@
 
 ## Status
 
-Performance work is screening only, and is not a sign-off. Two
-unwind-safety bugs were found by reading the reservation paths,
-reproduced with failing tests, and fixed; see the changelog. The
+Performance work is screening only, and is not a sign-off. Three
+unwind-safety bugs were found by reading the reservation and drain
+paths, reproduced with failing tests, and fixed; see the changelog. The
 remaining correctness gaps below are still open.
 
 Baseline: Git tag v0.14.0 (1b21acf), not the published tarball. The changelog reports missing source files in that tarball; the Git checkout builds. Baseline worktree: `/tmp/quetzalcoatl-audit-v014`. Separate target directories: `/tmp/quetzalcoatl-audit-target-v014` and `/tmp/quetzalcoatl-audit-target-head`.
@@ -69,6 +69,19 @@ test confirmed to fail before the fix.
    after the destructor had run.
 2. **A panicking waker in `commit_unchecked`** ran the writer's rollback
    over an already-published position, losing the committed value.
+3. **A panicking drain callback** skipped the batched producer wake in
+   spmc and mpmc while leaving the slots freed — a permanent hang for
+   spmc's untimed `push_block` and for mpmc's `push_async`, which has no
+   backstop timeout.
+
+Searching for the shape rather than the instance is what found the
+third: a release or wake gated behind code that may unwind. spsc and
+mpsc already held that invariant in `HeadPublisher` and `BatchRelease`,
+which is why only two rings needed the new `DrainWake` guard.
+
+Two first-draft tests passed while the bug was present — the mpmc async
+one because `await` re-polls and finds the space regardless of any wake.
+A test that cannot fail proves nothing; each was made to fail first.
 
 The benchmark tables above predate these fixes. Re-running `matched`
 afterwards stayed within the run-to-run variation already documented,
@@ -94,6 +107,7 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 2. Reproduce MPSC spin/8–16 and broadcast regressions with that harness. Bisect fixes versus subsequent owner-extraction refactors; inspect cross-crate generated code and cache-line placement before changing synchronization.
 3. Cover all five topologies: push/pop, reserve/commit/pop_ref, drain, saturation, empty-to-nonempty wake latency, endpoint churn, and cancellation. Include async on/off and >64 live waiters for overflow paths.
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
-5. Audit the remaining unwind paths the two fixes did not cover: panicking drain callbacks, panicking wakers on the consumer release paths, and endpoint destructors. The pattern found here — a release gated behind code that may unwind — is worth searching for directly.
-6. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers.
-7. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
+5. Audit the unwind paths still uncovered: panicking wakers on the consumer release paths, panicking `T::drop` inside `pop_ref`/`SlotReader` destructors, and the endpoint destructors (`Producer::drop`, `Consumer::drop`, `BatchAbandon`).
+6. Decide whether mpmc's `PARK_BACKSTOP` should stay. It converted this bug from a hang into a stall and so hid it from the blocking tests; the comment already records that it is a backstop against an unproven residual race.
+7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers.
+8. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

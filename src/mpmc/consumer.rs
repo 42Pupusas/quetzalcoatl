@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::consumed_watermark::ConsumedTally;
+use super::drain_wake::DrainWake;
 use super::slot_release::SlotRelease;
 use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
@@ -208,7 +209,14 @@ impl<T, C: Config> Consumer<T, C> {
     /// "Currently-claimable" means: slots with `state == 1` at or
     /// after `next_scan`, up to one full lap. May terminate early
     /// if other consumers race in and claim items first.
+    ///
+    /// The wake is batched into a single `wake_n`: with many parked
+    /// producers (one per next-round slot released) it frees up to
+    /// `count` of them, where a `wake_one` per item would strand the
+    /// rest until the next pop/drain. It is owned by a guard so that a
+    /// panicking `f` still delivers it; see [`DrainWake`].
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
+        let mut wake = DrainWake::new(&*self.queue);
         let mut count = 0usize;
         while let Some((pos, round_pos)) = self.claim_slot() {
             let q = &*self.queue;
@@ -216,16 +224,9 @@ impl<T, C: Config> Consumer<T, C> {
             // (pos, round_pos). Producer committed before publishing.
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
+            wake.released();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            // Single batched wake. With many parked producers (one
-            // per next-round slot we just released), `wake_n(count)`
-            // releases up to `count` of them — each `wake_one` would
-            // strand the rest until the next pop/drain.
-            self.queue.producer_park.wake_n(count);
-            self.queue.notify_producers_n(count);
         }
         count
     }
@@ -233,7 +234,10 @@ impl<T, C: Config> Consumer<T, C> {
     /// Drains up to `limit` items, calling `f` for each. Returns
     /// the number drained. Useful for fairness in multi-source
     /// consumer loops.
+    ///
+    /// Panic behaviour matches [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut wake = DrainWake::new(&*self.queue);
         let mut count = 0usize;
         while count < limit {
             let Some((pos, round_pos)) = self.claim_slot() else {
@@ -242,12 +246,9 @@ impl<T, C: Config> Consumer<T, C> {
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
+            wake.released();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            self.queue.producer_park.wake_n(count);
-            self.queue.notify_producers_n(count);
         }
         count
     }

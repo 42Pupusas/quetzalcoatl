@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::done_word::DoneWord;
+use super::drain_wake::DrainWake;
 use super::RingBuffer;
 use crate::capacity::Capacity;
 use crate::common::backoff::Backoff;
@@ -179,24 +180,28 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     }
 
     /// Drains all currently available items, calling `f` for each.
+    ///
+    /// If `f` panics, the slots already freed are still announced to the
+    /// producer while unwinding, so a producer blocked on a full ring
+    /// does not sleep through the space this drain made.
     pub fn drain(&self, mut f: impl FnMut(T)) -> usize {
+        let mut wake = DrainWake::new(self.ring());
         let mut count = 0usize;
         while let Some((data_ptr, slot_done, head)) = self.claim_slot() {
             let val = unsafe { data_ptr.cast::<T>().read() };
             slot_done.release(head, self.ring().capacity);
+            wake.released();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            self.ring().wake_producer();
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async();
         }
         count
     }
 
     /// Drains up to `limit` available items, calling `f` for each.
+    ///
+    /// Panic behaviour matches [`drain`](Self::drain).
     pub fn drain_up_to(&self, limit: usize, mut f: impl FnMut(T)) -> usize {
+        let mut wake = DrainWake::new(self.ring());
         let mut count = 0usize;
         while count < limit {
             let Some((data_ptr, slot_done, head)) = self.claim_slot() else {
@@ -204,13 +209,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             };
             let val = unsafe { data_ptr.cast::<T>().read() };
             slot_done.release(head, self.ring().capacity);
+            wake.released();
             count += 1;
             f(val);
-        }
-        if count > 0 {
-            self.ring().wake_producer();
-            #[cfg(feature = "async")]
-            self.ring().wake_producer_async();
         }
         count
     }

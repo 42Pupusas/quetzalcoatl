@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A panicking drain callback left producers waiting on space it had
+  already freed.** `drain` and `drain_up_to` release each slot inside
+  their loop but wake the producers once at the end, which is what makes
+  the batched `wake_n` worth having. Unwinding out of the user callback
+  skipped that wake while leaving the slots freed, so a producer blocked
+  on a full ring was never told the ring had space.
+
+  In spmc the consequence was a permanent hang: `push_block` parks
+  untimed, so nothing rescued the producer. In mpmc the blocking path
+  was saved by the `PARK_BACKSTOP` timeout and merely stalled, but
+  `push_async` has no backstop — its waker was never invoked and the
+  task was never rescheduled. Both now own the wake in a `DrainWake`
+  guard that fires from its destructor.
+
+  spsc and mpsc were already correct here, through `HeadPublisher` and
+  `BatchRelease`; they have tests now to keep them that way. The mpmc
+  test asserts on the wake count rather than on a later `await`, which
+  would re-poll, find the space, and pass either way.
+
 - **A panicking payload destructor stranded its reservation.**
   `WrittenSlot::drop` asked `UncommittedSlot::drop_if_uncommitted()`
   whether it still owed the slot release — but that call runs `T::drop`

@@ -1175,6 +1175,29 @@ mod tests {
         assert_eq!(c.pop(), Some(99));
     }
 
+    /// The `HeadPublisher` guard covers this: it publishes the cursor
+    /// and wakes the producer from its destructor, so a panicking drain
+    /// callback cannot leave a producer parked on freed space.
+    #[test]
+    fn a_panicking_drain_callback_still_wakes_the_blocked_producer() {
+        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        for i in 0..4u32 {
+            p.push(i).unwrap();
+        }
+
+        let pusher = std::thread::spawn(move || p.push_block(99));
+        ParkProbe::new().expect_until("push_block to arm its park", || {
+            c.queue.producer_park.is_parked()
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.drain(|v| assert!(v != 2, "callback panic"));
+        }));
+        assert!(result.is_err(), "the callback panic must propagate");
+
+        assert_eq!(pusher.join().unwrap(), Ok(()));
+    }
+
     #[test]
     fn push_block_returns_err_on_consumer_close() {
         let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();

@@ -47,6 +47,7 @@
 
 mod consumer;
 mod done_word;
+mod drain_wake;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
@@ -1317,6 +1318,33 @@ mod tests {
             2,
             "each item must be dropped exactly once"
         );
+    }
+
+    /// `drain` frees each slot inside its loop but wakes the producer
+    /// after it. A panicking callback unwinds past the wake, leaving a
+    /// producer parked on a ring that now has space — a permanent hang,
+    /// since `push_block` parks untimed.
+    #[test]
+    fn a_panicking_drain_callback_still_wakes_the_blocked_producer() {
+        let (producer, consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+
+        for i in 0..4u32 {
+            producer.push(i).unwrap();
+        }
+
+        let pusher = std::thread::spawn(move || producer.push_block(99));
+        crate::common::park_probe::ParkProbe::new().expect_until("push_block to arm its park", || {
+            consumer.queue.producer_park.is_parked()
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            consumer.drain(|v| assert!(v != 2, "callback panic"));
+        }));
+        assert!(result.is_err(), "the callback panic must propagate");
+
+        // Slots were freed before the unwind, so the producer has space.
+        // Without the wake it sleeps forever and this join never returns.
+        assert_eq!(pusher.join().unwrap(), Ok(()));
     }
 
     #[test]
