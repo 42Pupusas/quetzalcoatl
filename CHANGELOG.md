@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **The Arc broadcast facade is tested where it lives.**
+  `broadcast/arc.rs` had no test module; seven tests for it sat in
+  `broadcast/mod.rs` and covered `push`, `pop`, `pop_ref` and
+  `reserve`. The blocking and async methods, `slot_mut` /
+  `commit_unchecked`, every `len` / `is_empty` / `is_full`,
+  `ArcProducer::clone`, and the `Arc::try_unwrap` that recovers the
+  value from a rejected push were all unreached. The seven move into
+  the file they test and 24 now cover the facade, all of them passing
+  under Miri.
+
 - **mpmc's consumed watermark has an owner.**
   Consumers count their pops privately and publish the batch every
   `CONSUMED_FLUSH`; producers subtract the published total from the
