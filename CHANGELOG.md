@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **mpmc's compile-time tuning moved out of `mpmc/mod.rs`.**
+  `Config`, `DefaultConfig`, `Cfg` and `ConfigBounds` now live in
+  `mpmc/config.rs`; the public paths are unchanged (`mpmc::Config`
+  etc. are re-exported). `RingBuffer::scan_unused` — a producer's walk
+  over its own batch bitmap, with the ring as the only thing it did
+  not own — became a `Producer` method beside its single caller.
+  `mpmc/mod.rs` loses ~120 lines and is left holding the ring: its
+  fields, the slot accessors its four sibling modules share, and
+  teardown.
+
 - **`ConsumerRegistry` owns the broadcast consumer table.**
   `ConsumerSlot` was declared inline in `broadcast/mod.rs` with both
   fields `pub(crate)`, and its protocol was spread across three files:

@@ -144,7 +144,7 @@ impl<T, C: Config> Producer<T, C> {
         // Primary blocked? Scan other unused bits for any slot
         // already released — out-of-order publishing within batch.
         if !found_ready {
-            if let Some((b, p)) = q.scan_unused(start, unused & !(1u32 << primary_bit)) {
+            if let Some((b, p)) = self.scan_unused(start, unused & !(1u32 << primary_bit)) {
                 bit = b;
                 pos = p;
                 found_ready = true;
@@ -157,6 +157,24 @@ impl<T, C: Config> Producer<T, C> {
 
         self.batch_unused.set(unused & !(1u32 << bit));
         Some((bit, pos))
+    }
+
+    /// Scans the producer's unused batch bits for a position whose
+    /// slot has been released for the current round. Returns
+    /// `(bit, pos)` of the first free slot, or `None` if none are
+    /// ready.
+    #[inline]
+    fn scan_unused(&self, start: usize, unused: u32) -> Option<(u32, usize)> {
+        let mut bits = unused;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            let p = start + b as usize;
+            if self.queue.done_slot(p).is_free_for(p) {
+                return Some((b, p));
+            }
+            bits &= bits - 1;
+        }
+        None
     }
 
     /// Pushes a value. Returns `Err(val)` if the ring is full from

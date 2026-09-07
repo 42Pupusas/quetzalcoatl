@@ -54,15 +54,18 @@
 //! slack.
 
 mod batch_abandon;
+mod config;
 mod consumer;
 mod done_word;
 mod producer;
 mod ready_word;
 mod slot_release;
 
+pub use config::{Cfg, Config, DefaultConfig};
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
+use config::ConfigBounds;
 use done_word::DoneWord;
 use ready_word::{ReadyState, ReadyWord};
 
@@ -88,76 +91,6 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
-/// Tunable parameters baked into a [`RingBuffer`]'s type. Implement
-/// this on a zero-sized type to customize batching / scan behavior
-/// at compile time; the default values live in [`DefaultConfig`].
-///
-/// All values must satisfy:
-/// - `PRODUCER_BATCH` in `1..=32` (bounded by the producer's
-///   `u32` per-batch bitmap).
-/// - `CAS_FAIL_SKIP > 0` and `CONSUMED_FLUSH > 0`.
-///
-/// Bounds are checked at monomorphization via `const _ = assert!`.
-pub trait Config: 'static {
-    /// Positions reserved per FAA on `claim`. Caps the per-batch
-    /// `u32` bitmap; must be in `1..=32`. Larger values reduce
-    /// `claim`-line traffic at the cost of producer-progress
-    /// imbalance (a slow producer holds more positions out of
-    /// reach of others).
-    const PRODUCER_BATCH: usize;
-
-    /// On CAS-failure during `pop`, advance the scan cursor by
-    /// this many slots before retrying. A larger skip dramatically
-    /// reduces CAS re-collisions because the contended slot's
-    /// cacheline stays hot for hundreds of cycles. Empirical
-    /// peaks land near 64–128 at `cap=1024`.
-    const CAS_FAIL_SKIP: usize;
-
-    /// Pops between flushes of each consumer's local count to the
-    /// shared `consumed` watermark. Producers use the watermark
-    /// to bound their batch FAA, so a stale flush only forces
-    /// smaller producer batches (safe direction). Larger values
-    /// reduce hot-line traffic on `consumed` at the cost of more
-    /// pessimistic producer batching.
-    const CONSUMED_FLUSH: usize;
-}
-
-/// Default tuning for [`RingBuffer`].
-///
-/// `PRODUCER_BATCH = 32`, `CAS_FAIL_SKIP = 128`,
-/// `CONSUMED_FLUSH = 64`. These were chosen by sweeping at
-/// `cap = 1024` across `(P, Q)` shapes from `(2, 2)` through
-/// `(8, 8)`; see the empirical table in [`Config::CAS_FAIL_SKIP`]
-/// docs.
-#[derive(Debug, Clone, Copy)]
-pub struct DefaultConfig;
-
-impl Config for DefaultConfig {
-    const PRODUCER_BATCH: usize = 32;
-    const CAS_FAIL_SKIP: usize = 128;
-    const CONSUMED_FLUSH: usize = 64;
-}
-
-/// Inline-customization helper. Lets callers tune a ring without
-/// declaring a named config type:
-///
-/// ```
-/// use quetzalcoatl::mpmc::{Cfg, RingBuffer};
-/// use quetzalcoatl::capacity::Capacity;
-///
-/// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
-/// ```
-///
-/// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH>`.
-#[derive(Debug, Clone, Copy)]
-pub struct Cfg<const B: usize, const S: usize, const F: usize>;
-
-impl<const B: usize, const S: usize, const F: usize> Config for Cfg<B, S, F> {
-    const PRODUCER_BATCH: usize = B;
-    const CAS_FAIL_SKIP: usize = S;
-    const CONSUMED_FLUSH: usize = F;
-}
 
 #[repr(C)]
 pub struct RingBuffer<T, C: Config = DefaultConfig> {
@@ -221,28 +154,6 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
 // `C` is a ZST type marker — its Send/Sync are irrelevant.
 unsafe impl<T: Send, C: Config> Send for RingBuffer<T, C> {}
 unsafe impl<T: Send, C: Config> Sync for RingBuffer<T, C> {}
-
-/// Compile-time-validated bounds for a [`Config`]. Forces a
-/// monomorphization-time error when `C` violates one of:
-/// - `PRODUCER_BATCH` in `1..=32` (capped by the producer's `u32`
-///   per-batch bitmap),
-/// - `CAS_FAIL_SKIP > 0`,
-/// - `CONSUMED_FLUSH > 0`.
-struct ConfigBounds<C: Config>(std::marker::PhantomData<C>);
-
-impl<C: Config> ConfigBounds<C> {
-    const VALIDATE: () = {
-        assert!(
-            C::PRODUCER_BATCH >= 1 && C::PRODUCER_BATCH <= 32,
-            "Config::PRODUCER_BATCH must be in 1..=32 (bounded by the u32 per-batch bitmap)",
-        );
-        assert!(C::CAS_FAIL_SKIP >= 1, "Config::CAS_FAIL_SKIP must be >= 1");
-        assert!(
-            C::CONSUMED_FLUSH >= 1,
-            "Config::CONSUMED_FLUSH must be >= 1",
-        );
-    };
-}
 
 impl<T, C: Config> RingBuffer<T, C> {
     /// Creates a new MPMC ring buffer.
@@ -387,24 +298,6 @@ impl<T, C: Config> RingBuffer<T, C> {
             self.producer_park.wake.load(Ordering::Acquire),
             self.consumer_park.wake.load(Ordering::Acquire),
         )
-    }
-
-    /// Scans the bits in `unused` for a slot whose `done[s]`
-    /// indicates it is free for the current round. Returns
-    /// `(bit, pos)` of the first free slot, or `None` if none are
-    /// ready.
-    #[inline]
-    pub(crate) fn scan_unused(&self, start: usize, unused: u32) -> Option<(u32, usize)> {
-        let mut bits = unused;
-        while bits != 0 {
-            let b = bits.trailing_zeros();
-            let p = start + b as usize;
-            if self.done_slot(p).is_free_for(p) {
-                return Some((b, p));
-            }
-            bits &= bits - 1;
-        }
-        None
     }
 
     /// Splits the ring into a [`Producer`] and a [`Consumer`].
