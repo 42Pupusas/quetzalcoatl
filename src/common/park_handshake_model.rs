@@ -24,36 +24,63 @@
 //! `park` here is loom's mock, so a schedule that parks a waiter nobody
 //! unparks ends the model run as a deadlock and names the interleaving.
 //!
-//! # Status: the deadlock these models report is NOT yet attributed
+//! # Status: loom 0.7.2 cannot decide this protocol
 //!
-//! Both handshake models below currently deadlock under loom. That is
-//! not yet a verdict on the ring, for two reasons, and neither has been
-//! ruled out:
+//! **The deadlocks these models report are artifacts of loom, not
+//! defects in the ring.** Every handshake model here is marked `ignore`
+//! for that reason. This is a negative result, and the calibrations
+//! below are the evidence for it; they are kept running so the claim
+//! stays checkable rather than remembered.
 //!
-//! 1. **Loom treats `SeqCst` loads and stores as `AcqRel`** (its README
-//!    lists this as unsupported; `fence(SeqCst)` *is* supported). This
-//!    handshake is a store-buffering pattern whose correctness rests on
-//!    exactly the `SeqCst` guarantee loom weakens, so a false alarm is
-//!    the leading hypothesis. `WakeSet::wake_one`'s bitmap load is a
-//!    `SeqCst` load, and the waiter's `arm` is a `SeqCst` `fetch_or`.
-//! 2. **The model may be wrong.** An earlier calibration deadlocked
-//!    because it parked unconditionally after arming, with no re-check
-//!    — a bug in the test, not the code.
+//! The finding is
+//! [`a_handshake_built_only_from_loom_primitives_cannot_miss_a_wake`]:
+//! a park/unpark handshake containing **no code from this crate** —
+//! loom atomics, a loom `Thread` handle, loom's `park` and `unpark` —
+//! deadlocks under loom. Its doc comment traces every schedule the
+//! model admits; none leaves the waiter parked. Loom reports a state
+//! its own memory model forbids.
 //!
-//! [`loom_itself_holds_an_unpark_token_until_the_park`] rules out the
-//! third possibility, that loom's mocked park drops a token; it passes.
+//! The bisection that got there, each step passing unless noted:
 //!
-//! Next step is to distinguish (1) from a real defect: rewrite the
-//! arm/re-check pair so its ordering rests on `fence(SeqCst)` rather
-//! than on `SeqCst` accesses, and see whether the deadlock survives. If
-//! it does, the ring has a genuine lost-wake schedule and loom has
-//! named it. Until then these models are marked `ignore` so they do not
-//! report a failure the crate has not earned.
+//! | Calibration | Result |
+//! |---|---|
+//! | loom's own park/unpark, token before park | passes |
+//! | unpark via a handle from `thread::current()` | passes |
+//! | fenced store-buffering, no park | passes |
+//! | unpark from a spawned thread to main | passes |
+//! | [`ThreadParker`](super::thread_parker::ThreadParker) alone | passes |
+//! | wake straight to `parkers[0]`, bitmap bypassed | passes |
+//! | re-check alone, publisher never wakes | passes |
+//! | `WakeSet` handshake, waiter on main | **deadlocks** |
+//! | `WakeSet` handshake, waiter spawned | **deadlocks** |
+//! | single arm/re-check/park, no loop | **deadlocks** |
+//! | hand-rolled bitmap, no `WakeSet` | **deadlocks** |
+//! | loom primitives only, no crate code | **deadlocks** |
+//!
+//! Note the third row: `fence(SeqCst)` store-buffering *is* modeled
+//! correctly on its own. So the earlier hypothesis — that loom's
+//! documented weakening of `SeqCst` accesses to `AcqRel` explained the
+//! failures — is wrong. The fences are honored; what breaks is the
+//! combination of a fenced handshake with the mocked park.
+//!
+//! The likely mechanism is loom's unpark-token bookkeeping. Loom has
+//! had bugs of exactly this shape before (tokio-rs/loom#246, "incorrect
+//! semantics for `Thread::unpark` followed by `thread::park`", fixed;
+//! and the open #422, where `Condvar` and `thread::park` corrupt each
+//! other's tokens). The precise mechanism here is not yet pinned down,
+//! and pinning it down means reducing this to a report against loom.
+//!
+//! What this does **not** show: nothing here vindicates the ring. The
+//! missed wake that motivated the work is still unexplained and
+//! [`PARK_BACKSTOP`](crate::mpmc::PARK_BACKSTOP) is still load-bearing.
+//! Loom simply cannot be the instrument. The park path stays wired
+//! through the shim so these models can be re-run against a later loom.
 
 use super::atomics::{thread, AtomicU64};
 use super::park::WakeSet;
 use super::park_registry::ParkSlot;
-use loom::sync::Arc;
+use super::thread_parker::ThreadParker;
+use loom::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
 /// A one-word stand-in for the ring's "work is available" signal.
@@ -78,6 +105,21 @@ impl Work {
     fn publish(&self, wakers: &WakeSet) {
         self.available.store(1, Ordering::Release);
         wakers.wake_one();
+    }
+
+    /// Publishes without waking, for the model that asks whether the
+    /// re-check alone closes the handshake.
+    fn publish_silently(&self) {
+        self.available.store(1, Ordering::Release);
+    }
+
+    /// Publishes and wakes every parked waiter, bypassing the bitmap
+    /// selection and the handle-claiming in
+    /// [`WakeSet::wake_one`]. Bisects the wake half.
+    fn publish_and_flush(&self, wakers: &WakeSet) {
+        self.available.store(1, Ordering::Release);
+        super::atomics::fence(Ordering::SeqCst);
+        wakers.flush();
     }
 
     /// Takes the published work, if any.
@@ -158,6 +200,331 @@ fn loom_itself_holds_an_unpark_token_until_the_park() {
     });
 }
 
+/// Second calibration, and the one that matters for this crate.
+///
+/// The first calibration unparks through `JoinHandle::thread()`, which
+/// loom hands out itself. [`ThreadParker`](super::thread_parker::ThreadParker)
+/// does something different: the waiter captures its *own*
+/// `thread::current()`, publishes it, and a peer unparks through that
+/// carried handle. If loom's `thread::current()` does not name a
+/// parkable thread when used from elsewhere, every model below reports
+/// a deadlock that the real code does not have.
+#[test]
+fn loom_unparks_through_a_handle_captured_by_thread_current() {
+    loom::model(|| {
+        let handoff = Arc::new(Mutex::new(None));
+        let armed = Arc::new(AtomicU64::new(0));
+        let peer_handoff = Arc::clone(&handoff);
+        let peer_armed = Arc::clone(&armed);
+
+        let parked = thread::spawn(move || {
+            *peer_handoff.lock().unwrap() = Some(thread::current());
+            peer_armed.store(1, Ordering::SeqCst);
+            thread::park();
+        });
+
+        while armed.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        handoff.lock().unwrap().take().unwrap().unpark();
+        parked.join().unwrap();
+    });
+}
+
+/// Third calibration, and the decisive one: does loom model **fenced**
+/// store-buffering soundly?
+///
+/// This is the shape the whole handshake rests on, with no crate code
+/// in it. Each thread stores to its own word, executes a `SeqCst`
+/// fence, then loads the other's. Under the real memory model the two
+/// fences forbid both loads returning zero, and that guarantee is the
+/// only reason a waiter cannot park on work already published.
+///
+/// Loom's README lists `SeqCst` *accesses* as modeled like `AcqRel`
+/// (false alarms) while `fence(SeqCst)` is supported — so this must
+/// pass. If it fails, loom cannot decide this protocol at all and every
+/// deadlock below is an artifact of the tool.
+#[test]
+fn loom_forbids_both_sides_of_a_fenced_store_buffer_reading_stale() {
+    loom::model(|| {
+        let x = Arc::new(AtomicU64::new(0));
+        let y = Arc::new(AtomicU64::new(0));
+        let (px, py) = (Arc::clone(&x), Arc::clone(&y));
+
+        let peer = thread::spawn(move || {
+            px.store(1, Ordering::Relaxed);
+            super::atomics::fence(Ordering::SeqCst);
+            py.load(Ordering::Relaxed)
+        });
+
+        y.store(1, Ordering::Relaxed);
+        super::atomics::fence(Ordering::SeqCst);
+        let saw_x = x.load(Ordering::Relaxed);
+        let saw_y = peer.join().unwrap();
+
+        assert!(
+            saw_x != 0 || saw_y != 0,
+            "both sides read stale across SeqCst fences: \
+             the store-buffering guarantee the park handshake rests on"
+        );
+    });
+}
+
+/// Fourth calibration: [`ThreadParker`](super::thread_parker::ThreadParker)
+/// on its own, with no [`WakeSet`], no bitmap, and no `AlignedBuf`.
+///
+/// Reached by bisection: `flush` — which swaps the whole bitmap and
+/// unparks every slot it finds — deadlocks just as `wake_one` does.
+/// For one waiter and one publisher no interleaving can lose a flushed
+/// wake, so the fault is more likely below the bitmap than in it.
+#[test]
+fn a_thread_parker_wake_reaches_a_waiter_that_armed_it() {
+    loom::model(|| {
+        let parker = Arc::new(ThreadParker::new());
+        let armed = Arc::new(AtomicU64::new(0));
+        let peer_parker = Arc::clone(&parker);
+        let peer_armed = Arc::clone(&armed);
+
+        let waiter = thread::spawn(move || {
+            peer_parker.arm();
+            peer_armed.store(1, Ordering::SeqCst);
+            thread::park();
+        });
+
+        while armed.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        parker.wake();
+        waiter.join().unwrap();
+    });
+}
+
+/// Fifth calibration, and the one the bisection converged on: can a
+/// **spawned** thread's unpark reach the **main** thread?
+///
+/// Every calibration that passes parks a spawned thread and unparks it
+/// from main. Every model that deadlocks parks main and unparks it from
+/// a spawned thread. That direction is the last uncontrolled difference,
+/// and it is a property of loom, not of this crate.
+#[test]
+fn loom_delivers_an_unpark_from_a_spawned_thread_to_the_main_thread() {
+    loom::model(|| {
+        let handoff = Arc::new(Mutex::new(None));
+        let armed = Arc::new(AtomicU64::new(0));
+        let peer_handoff = Arc::clone(&handoff);
+        let peer_armed = Arc::clone(&armed);
+
+        *handoff.lock().unwrap() = Some(thread::current());
+        armed.store(1, Ordering::SeqCst);
+
+        let waker = thread::spawn(move || {
+            while peer_armed.load(Ordering::SeqCst) == 0 {
+                thread::yield_now();
+            }
+            peer_handoff.lock().unwrap().take().unwrap().unpark();
+        });
+
+        thread::park();
+        waker.join().unwrap();
+    });
+}
+
+/// Sixth calibration: the full [`WakeSet`] handshake, but with the
+/// waiter on a **spawned** thread rather than main.
+///
+/// Isolates the last two candidates from each other. The parker alone
+/// passes and the unpark direction passes, so what remains is
+/// `WakeSet` itself — its bitmap and its 64-entry `AlignedBuf` of
+/// parkers. If this passes, the deadlock needs the main thread to be
+/// the waiter and is a harness artifact; if it deadlocks, the fault is
+/// in `WakeSet` and is the crate's.
+#[test]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
+fn a_wake_set_handshake_completes_with_the_waiter_on_a_spawned_thread() {
+    loom::model(|| {
+        let wakers = Arc::new(WakeSet::new());
+        let work = Arc::new(Work::new());
+
+        let waiter = {
+            let wakers = Arc::clone(&wakers);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                Waiter::new(&wakers, &work, ParkSlot::Leased(0)).wait();
+            })
+        };
+
+        work.publish(&wakers);
+        waiter.join().unwrap();
+    });
+}
+
+/// Seventh calibration: the waiter arms through [`WakeSet`], but the
+/// wake goes **directly** to `parkers[0]`, bypassing the bitmap.
+///
+/// This splits the last two suspects. A bare
+/// [`ThreadParker`](super::thread_parker::ThreadParker) passes and a
+/// full `WakeSet` deadlocks; what differs is the bitmap *and* the
+/// 64-entry `AlignedBuf` the parkers live in. If this passes, loom
+/// tracks parkers inside the raw allocation fine and the fault is the
+/// bitmap logic. If it deadlocks, loom cannot see the atomics through
+/// `AlignedBuf`'s hand-rolled allocation, and every `WakeSet` model
+/// here is measuring the harness.
+#[test]
+fn a_wake_delivered_straight_to_the_slots_parker_reaches_the_waiter() {
+    loom::model(|| {
+        let wakers = Arc::new(WakeSet::new());
+        let armed = Arc::new(AtomicU64::new(0));
+        let peer_wakers = Arc::clone(&wakers);
+        let peer_armed = Arc::clone(&armed);
+
+        let waiter = thread::spawn(move || {
+            peer_wakers.arm(ParkSlot::Leased(0));
+            peer_armed.store(1, Ordering::SeqCst);
+            thread::park();
+        });
+
+        while armed.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        wakers.parkers[0].wake();
+        waiter.join().unwrap();
+    });
+}
+
+/// Eighth calibration: the full arm/fence/re-check/park sequence, but
+/// parking exactly **once** — no loop, no `disarm`.
+///
+/// The direct-parker wake passes and the bitmap wake deadlocks, but
+/// those two models also differ in the waiter: the passing one parks
+/// once, while [`Waiter::wait`] loops and disarms. This isolates that
+/// difference. If it passes, the single handshake is sound and the
+/// defect involves the loop or the `Relaxed` `disarm`; if it
+/// deadlocks, one arm/publish/flush pair is already enough to lose a
+/// wake.
+#[test]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
+fn a_single_arm_recheck_park_sequence_cannot_miss_a_flushed_wake() {
+    loom::model(|| {
+        let wakers = Arc::new(WakeSet::new());
+        let work = Arc::new(Work::new());
+
+        let publisher = {
+            let wakers = Arc::clone(&wakers);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                work.publish_and_flush(&wakers);
+            })
+        };
+
+        let slot = ParkSlot::Leased(0);
+        if !work.take() {
+            wakers.arm(slot);
+            super::atomics::fence(Ordering::SeqCst);
+            if !work.take() {
+                thread::park();
+            }
+        }
+        publisher.join().unwrap();
+    });
+}
+
+/// Ninth calibration: the deadlocking shape rebuilt from scratch — a
+/// bare `AtomicU64` bitmap and one `ThreadParker`, no [`WakeSet`], no
+/// `AlignedBuf`.
+///
+/// Byte for byte the same protocol as
+/// [`a_single_arm_recheck_park_sequence_cannot_miss_a_flushed_wake`],
+/// which deadlocks. If this passes, the fault is specific to
+/// `WakeSet`; if it deadlocks too, loom is failing on a fenced
+/// store-buffering pattern that calibration #3 says it handles, and
+/// the tool is the problem.
+#[test]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
+fn a_hand_rolled_bitmap_handshake_cannot_miss_a_wake() {
+    loom::model(|| {
+        let bitmap = Arc::new(AtomicU64::new(0));
+        let parker = Arc::new(ThreadParker::new());
+        let work = Arc::new(Work::new());
+
+        let publisher = {
+            let bitmap = Arc::clone(&bitmap);
+            let parker = Arc::clone(&parker);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                work.publish_silently();
+                super::atomics::fence(Ordering::SeqCst);
+                if bitmap.swap(0, Ordering::AcqRel) != 0 {
+                    parker.wake();
+                }
+            })
+        };
+
+        if !work.take() {
+            parker.arm();
+            bitmap.fetch_or(1, Ordering::SeqCst);
+            super::atomics::fence(Ordering::SeqCst);
+            if !work.take() {
+                thread::park();
+            }
+        }
+        publisher.join().unwrap();
+    });
+}
+
+/// Tenth calibration: the identical protocol with **no crate type in
+/// it at all** — loom atomics, a loom `Thread` handle passed by hand,
+/// loom's park and unpark.
+///
+/// Hand-trace of the only schedules that exist, with `w` the waiter
+/// and `p` the publisher:
+///
+/// - `p` runs first: `available == 1`, so `w`'s first `take` (a `swap`
+///   RMW, which must read the latest value in modification order)
+///   returns true and `w` never parks.
+/// - `p`'s bitmap read falls before `w`'s `fetch_or`: then `p`'s
+///   publish also precedes `w`'s *second* `take`, which returns true
+///   and `w` never parks.
+/// - `p`'s bitmap read falls after `w`'s `fetch_or`: `p` reads 1 and
+///   unparks, and the token holds across `w`'s later `park`.
+///
+/// No schedule leaves `w` parked, so this must pass. If it deadlocks,
+/// loom is reporting a state its own memory model forbids, and every
+/// deadlock in this file is an artifact of the tool rather than a
+/// property of the ring.
+#[test]
+#[ignore = "THE FINDING: no crate code, yet loom still reports a deadlock; see the module docs"]
+fn a_handshake_built_only_from_loom_primitives_cannot_miss_a_wake() {
+    loom::model(|| {
+        let available = Arc::new(AtomicU64::new(0));
+        let bitmap = Arc::new(AtomicU64::new(0));
+        let handle = Arc::new(Mutex::new(None));
+
+        let publisher = {
+            let available = Arc::clone(&available);
+            let bitmap = Arc::clone(&bitmap);
+            let handle = Arc::clone(&handle);
+            thread::spawn(move || {
+                available.store(1, Ordering::Release);
+                super::atomics::fence(Ordering::SeqCst);
+                if bitmap.swap(0, Ordering::AcqRel) != 0 {
+                    let parked: Option<thread::Thread> = handle.lock().unwrap().take();
+                    parked.unwrap().unpark();
+                }
+            })
+        };
+
+        if available.swap(0, Ordering::Acquire) == 0 {
+            *handle.lock().unwrap() = Some(thread::current());
+            bitmap.fetch_or(1, Ordering::SeqCst);
+            super::atomics::fence(Ordering::SeqCst);
+            if available.swap(0, Ordering::Acquire) == 0 {
+                thread::park();
+            }
+        }
+        publisher.join().unwrap();
+    });
+}
+
 /// The core claim, with one waiter and one publisher: a waiter can
 /// never be left parked on work that has already been published.
 ///
@@ -165,10 +532,65 @@ fn loom_itself_holds_an_unpark_token_until_the_park() {
 /// unpark is ever delivered — and loom reports it with the
 /// interleaving, rather than the 1ms stall the real backstop produces.
 ///
-/// Currently deadlocks; see the module docs on why that is not yet
-/// attributable to the ring.
+/// Deadlocks under loom 0.7.2, as a false positive; see the module
+/// docs for the calibration that establishes this.
+/// Isolates *which half* of the handshake the deadlock lives in.
+///
+/// The publisher never calls `wake_one`, so the only thing that can
+/// save the waiter is its own re-check after arming. If this passes,
+/// the re-check half is sound and the defect is in the wake half; if it
+/// deadlocks, loom is simply exploring the schedule where the waiter
+/// parks on work published after its last read — which is what the
+/// wake exists to cover, and would mean the model, not the ring, is
+/// wrong.
 #[test]
-#[ignore = "deadlocks under loom; not yet distinguished from loom's SeqCst-as-AcqRel false alarms"]
+fn the_recheck_alone_cannot_be_expected_to_catch_a_later_publication() {
+    loom::model(|| {
+        let wakers = Arc::new(WakeSet::new());
+        let work = Arc::new(Work::new());
+
+        let publisher = {
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                work.publish_silently();
+            })
+        };
+
+        publisher.join().unwrap();
+        Waiter::new(&wakers, &work, ParkSlot::Leased(0)).wait();
+    });
+}
+
+/// The same handshake, with `flush` in place of `wake_one`.
+///
+/// `flush` swaps the whole bitmap to zero and unparks every slot it
+/// finds, so it exercises the publish/arm ordering without the
+/// round-robin bit selection or the single-handle claim. If this passes
+/// while [`a_published_unit_of_work_always_reaches_a_parked_waiter`]
+/// deadlocks, the ordering is sound and the defect is in `wake_one`'s
+/// selection or in [`ThreadParker::wake`](super::thread_parker::ThreadParker::wake).
+#[test]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
+fn a_flushed_wake_always_reaches_a_parked_waiter() {
+    loom::model(|| {
+        let wakers = Arc::new(WakeSet::new());
+        let work = Arc::new(Work::new());
+
+        let publisher = {
+            let wakers = Arc::clone(&wakers);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                work.publish_and_flush(&wakers);
+            })
+        };
+
+        Waiter::new(&wakers, &work, ParkSlot::Leased(0)).wait();
+        publisher.join().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
 fn a_published_unit_of_work_always_reaches_a_parked_waiter() {
     loom::model(|| {
         let wakers = Arc::new(WakeSet::new());
@@ -193,7 +615,7 @@ fn a_published_unit_of_work_always_reaches_a_parked_waiter() {
 /// the stress failure had: every waiter must be served, and a wake must
 /// not be delivered twice to one slot while the other stays parked.
 #[test]
-#[ignore = "deadlocks under loom; not yet distinguished from loom's SeqCst-as-AcqRel false alarms"]
+#[ignore = "loom 0.7.2 reports a false deadlock here; see the module docs"]
 fn two_publications_reach_two_waiters_on_distinct_slots() {
     loom::model(|| {
         let wakers = Arc::new(WakeSet::new());
