@@ -232,7 +232,7 @@ impl<T> Consumer<T> {
     /// Returns `true` if this consumer's backlog has reached capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.len() >= self.queue.cap
+        self.len() >= self.queue.capacity.get()
     }
 }
 

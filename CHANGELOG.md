@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`Capacity` now owns ring indexing.** It already held `cap` and its
+  `mask`, and enforced the power-of-two invariant that makes
+  `pos & mask` a valid index. Every ring then unpacked it into two
+  loose `usize` fields on construction and re-derived the indexing by
+  hand, restating the bounds argument in a SAFETY comment at six
+  sites.
+
+  The rings now store the `Capacity` and call `index_of(pos)`. Both
+  its fields are private, so the mask is no longer reachable outside
+  the type that guarantees it.
+
+  mpmc used the same mask for a second purpose — reducing a position
+  *delta* modulo the capacity to decode a slot's tri-state — which is
+  the same arithmetic carrying no bounds contract. That is now
+  `wrap(delta)`, named apart from `index_of` so the two uses no longer
+  read alike.
+
+  Found on the way: spmc threaded a `mask` argument through three
+  consumer functions that never used it (`bind_pos` took it as
+  `_mask`). Removed.
+
 - **`common` is split into one module per responsibility.** The module
   root held six unrelated things behind a single `mod.rs`: the slot
   sequence encoding, the ring's backing allocation, the cache-line

@@ -48,7 +48,10 @@ impl<T, C: Config> Drop for SlotRelease<'_, T, C> {
         // parked producer's bit.
         self.queue
             .done_slot(self.pos)
-            .store(self.round_pos + self.queue.cap, Ordering::SeqCst);
+            .store(
+                self.round_pos + self.queue.capacity.get(),
+                Ordering::SeqCst,
+            );
         self.queue.producer_park.wake_one();
         self.queue.notify_producers();
     }

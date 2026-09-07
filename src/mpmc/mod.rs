@@ -165,8 +165,7 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// `pos` waits on `done[s] == pos`; consumer for `pos` stores
     /// `done[s] = pos + cap`.
     pub(crate) done: AlignedBuf<AtomicUsize>,
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    pub(crate) capacity: Capacity,
     /// Producer claim cursor. FAA'd to reserve batches of positions.
     pub(crate) claim: CachePadded<AtomicUsize>,
     /// Coarse "items consumed" watermark — a lower bound, flushed
@@ -286,8 +285,7 @@ impl<T, C: Config> RingBuffer<T, C> {
             clone_counter: CachePadded(AtomicUsize::new(0)),
             closed: CloseState::new(),
             consumer_closed: CloseState::new(),
-            cap,
-            mask: capacity.mask,
+            capacity,
             producer_park: WakeSet::new(),
             producer_slots: ParkRegistry::new(),
             consumer_slots: ParkRegistry::new(),
@@ -341,22 +339,22 @@ impl<T, C: Config> RingBuffer<T, C> {
 
     #[inline]
     pub(crate) fn data_slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1.
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == data.len().
         unsafe { std::hint::assert_unchecked(idx < self.data.len()) };
         &self.data[idx]
     }
 
     #[inline]
     pub(crate) fn ready_slot(&self, pos: usize) -> &AtomicUsize {
-        let idx = pos & self.mask;
+        let idx = self.capacity.index_of(pos);
         unsafe { std::hint::assert_unchecked(idx < self.ready.len()) };
         &self.ready[idx]
     }
 
     #[inline]
     pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
-        let idx = pos & self.mask;
+        let idx = self.capacity.index_of(pos);
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
         &self.done[idx]
     }
@@ -365,10 +363,10 @@ impl<T, C: Config> RingBuffer<T, C> {
     #[doc(hidden)]
     pub fn debug_snapshot(&self) -> (usize, Vec<usize>, Vec<usize>) {
         let claim = self.claim.load(Ordering::Acquire);
-        let r: Vec<usize> = (0..self.cap)
+        let r: Vec<usize> = (0..self.capacity.get())
             .map(|s| self.ready[s].load(Ordering::Acquire))
             .collect();
-        let d: Vec<usize> = (0..self.cap)
+        let d: Vec<usize> = (0..self.capacity.get())
             .map(|s| self.done[s].load(Ordering::Acquire))
             .collect();
         (claim, r, d)
@@ -419,12 +417,12 @@ impl<T, C: Config> Drop for RingBuffer<T, C> {
         // so we can read state non-atomically. A slot holds live
         // data when ready[s] is `published` (state 1) or `claimed
         // but not released` (state 2 with done[s] != round_pos+cap).
-        let cap = self.cap;
+        let cap = self.capacity.get();
         for s in 0..cap {
             let r = *self.ready[s].get_mut();
             let d = *self.done[s].get_mut();
             let delta = r.wrapping_sub(s);
-            let state = delta & self.mask;
+            let state = self.capacity.wrap(delta);
             let round = delta / cap;
             let round_pos = s + round * cap;
             if state == 1 {

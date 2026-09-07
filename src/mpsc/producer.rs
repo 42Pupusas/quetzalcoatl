@@ -95,11 +95,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let mut current_tail = self.ring().cursors.tail().load(Ordering::Relaxed);
         let mut backoff = Backoff::new();
         loop {
-            if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().cap {
+            if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().capacity.get() {
                 let head = self.ring().cursors.head().load(Ordering::Acquire);
                 self.cached_head.set(head);
 
-                if current_tail.wrapping_sub(head) >= self.ring().cap {
+                if current_tail.wrapping_sub(head) >= self.ring().capacity.get() {
                     return None;
                 }
             }

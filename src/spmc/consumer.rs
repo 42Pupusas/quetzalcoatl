@@ -101,22 +101,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     #[inline]
     fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
-        let q = self.ring();
-        let mask = q.mask;
-
         let next = self.batch_next.get();
         let end = self.batch_end.get();
         if next < end {
             self.batch_next.set(next + 1);
-            return Some(self.bind_pos(next, mask));
+            return Some(self.bind_pos(next));
         }
 
-        self.claim_batch(mask)
+        self.claim_batch()
     }
 
     #[cold]
     #[inline(never)]
-    fn claim_batch(&self, mask: usize) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
+    fn claim_batch(&self) -> Option<(*const MaybeUninit<T>, &AtomicUsize, usize)> {
         let q = self.ring();
 
         let mut backoff = Backoff::new();
@@ -150,7 +147,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             {
                 self.batch_next.set(head + 1);
                 self.batch_end.set(new_head);
-                return Some(self.bind_pos(head, mask));
+                return Some(self.bind_pos(head));
             }
             backoff.spin();
         }
@@ -172,7 +169,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     }
 
     #[inline]
-    fn bind_pos(&self, h: usize, _mask: usize) -> (*const MaybeUninit<T>, &AtomicUsize, usize) {
+    fn bind_pos(&self, h: usize) -> (*const MaybeUninit<T>, &AtomicUsize, usize) {
         let q = self.ring();
         let data_ptr = q.data_slot(h).get().cast_const();
         let slot_done = q.done_slot(h);
@@ -184,7 +181,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let mut count = 0usize;
         while let Some((data_ptr, slot_done, head)) = self.claim_slot() {
             let val = unsafe { data_ptr.cast::<T>().read() };
-            slot_done.store(head + self.ring().cap, Ordering::Release);
+            slot_done.store(head + self.ring().capacity.get(), Ordering::Release);
             count += 1;
             f(val);
         }
@@ -204,7 +201,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 break;
             };
             let val = unsafe { data_ptr.cast::<T>().read() };
-            slot_done.store(head + self.ring().cap, Ordering::Release);
+            slot_done.store(head + self.ring().capacity.get(), Ordering::Release);
             count += 1;
             f(val);
         }
@@ -239,7 +236,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         let val = unsafe { data_ptr.cast::<T>().read() };
 
-        slot_done.store(head + self.ring().cap, Ordering::Release);
+        slot_done.store(head + self.ring().capacity.get(), Ordering::Release);
 
         self.ring().wake_producer();
         #[cfg(feature = "async")]
@@ -340,7 +337,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Wraps an already-claimed position in its reader.
     #[inline]
     fn reader_for(&mut self, claimed: ClaimedSlot<T>) -> SlotReader<'_, T, R> {
-        let cap = self.ring().cap;
+        let cap = self.ring().capacity.get();
         claimed.into_reader(self, cap)
     }
 
@@ -431,7 +428,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     fn drop(&mut self) {
         let q = self.ring();
-        let cap = q.cap;
+        let cap = q.capacity.get();
         let next = self.batch_next.get();
         let end = self.batch_end.get();
         for pos in next..end {

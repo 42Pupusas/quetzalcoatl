@@ -41,7 +41,7 @@ impl<'a, T> SlotRelease<'a, T> {
 impl<T> Drop for SlotRelease<'_, T> {
     fn drop(&mut self) {
         self.seq
-            .store((self.head + self.ring.cap) * 2, Ordering::Release);
+            .store((self.head + self.ring.capacity.get()) * 2, Ordering::Release);
         // SeqCst: see Consumer::pop. The `xchg` drains the store buffer,
         // publishing the sequence store above before the bitmap load
         // inside `wake_one_published`.

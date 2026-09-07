@@ -103,8 +103,7 @@ pub(super) struct ConsumerSlot {
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<BroadcastSlot<T>>,
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    pub(crate) capacity: Capacity,
     pub(crate) consumer_slots: Box<[ConsumerSlot]>,
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Shared L2 cache of the consumer floor's position. Updated by any
@@ -133,7 +132,8 @@ pub struct RingBuffer<T> {
     #[cfg(feature = "async")]
     pub(crate) closed: CloseState,
     /// Wakers registered by parked `push_async` futures. Slot index =
-    /// pos & mask — producers waiting on slot `s` register there, and
+    /// the position's slot index — producers waiting on slot `s`
+    /// register there, and
     /// consumers wake the matching slot's waker after advancing head.
     #[cfg(feature = "async")]
     pub(crate) producer_waker: WakerSet,
@@ -164,7 +164,7 @@ impl<T> RingBuffer<T> {
     #[must_use]
     pub fn new(capacity: Capacity, max_consumers: usize) -> Self {
         assert!(max_consumers > 0, "max_consumers must be > 0");
-        let cap = capacity.cap;
+        let cap = capacity.get();
         let buf = AlignedBuf::new_with(cap, || BroadcastSlot {
             data: UnsafeCell::new(MaybeUninit::uninit()),
             sequence: AtomicUsize::new(SlotState::VACANT),
@@ -177,8 +177,7 @@ impl<T> RingBuffer<T> {
             .collect();
         Self {
             buf,
-            cap,
-            mask: capacity.mask,
+            capacity,
             tail: CachePadded(AtomicUsize::new(0)),
             min_head_cache: CachePadded(AtomicUsize::new(0)),
             producer_park: WakeSet::new(),
@@ -242,11 +241,11 @@ impl<T> RingBuffer<T> {
 
     /// Returns a reference to the slot at logical position `pos`.
     ///
-    /// Single point of unsafety: `pos & mask < cap == buf.len()`.
+    /// Single point of unsafety.
     #[inline]
     pub(crate) fn slot(&self, pos: usize) -> &BroadcastSlot<T> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = buf.len(), so idx < buf.len().
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == buf.len().
         unsafe { std::hint::assert_unchecked(idx < self.buf.len()) };
         &self.buf[idx]
     }
@@ -313,7 +312,7 @@ impl<T> RingBuffer<T> {
     /// Returns `true` if the slowest consumer's backlog has reached capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.len() >= self.cap
+        self.len() >= self.capacity.get()
     }
 
     /// Claims an inactive consumer slot. Returns the slot index.
@@ -352,9 +351,9 @@ impl<T> Drop for RingBuffer<T> {
         // scanning the entire buffer, and the wrapping_sub handles the
         // (astronomically unlikely) usize wraparound case.
         let tail = *self.tail.0.get_mut();
-        let start = tail.wrapping_sub(tail.min(self.cap));
+        let start = tail.wrapping_sub(tail.min(self.capacity.get()));
         for pos in start..tail {
-            let slot = &mut self.buf[pos & self.mask];
+            let slot = &mut self.buf[self.capacity.index_of(pos)];
             let seq = *slot.sequence.get_mut();
             if SlotState::decode(seq).holds_value() {
                 // SAFETY: a published marker means data was initialized

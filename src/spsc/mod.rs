@@ -55,8 +55,7 @@ use std::sync::Arc;
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    pub(crate) capacity: Capacity,
     pub(crate) cursors: Cursors,
     /// Set when the [`Producer`] is dropped. [`Consumer::pop_block`]
     /// observes this and returns `None` once the queue drains.
@@ -103,7 +102,10 @@ impl<T> Drop for RingBuffer<T> {
             // consumer never advanced `head` past it, so the slot holds
             // an initialized value. `&mut self` rules out concurrency.
             unsafe {
-                self.buf[pos & self.mask].get().cast::<T>().drop_in_place();
+                self.buf[self.capacity.index_of(pos)]
+                    .get()
+                    .cast::<T>()
+                    .drop_in_place();
             }
         }
     }
@@ -119,8 +121,7 @@ impl<T> RingBuffer<T> {
         Self {
             buf,
             cursors: Cursors::new(),
-            cap,
-            mask: capacity.mask,
+            capacity,
             producer_closed: CloseState::new(),
             consumer_closed: CloseState::new(),
             producer_park: SoleParker::new(),
@@ -185,7 +186,7 @@ impl<T> RingBuffer<T> {
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.cursors.is_full(self.cap)
+        self.cursors.is_full(self.capacity.get())
     }
 
     /// Externally closes the ring, causing a blocked
@@ -207,14 +208,13 @@ impl<T> RingBuffer<T> {
 
     /// Returns a reference to the slot at logical position `pos`.
     ///
-    /// Single point of unsafety: `pos & mask` is always `< cap == buf.len()`
-    /// because `mask = cap - 1` and `cap` is a power of two. Hinting this
-    /// to the optimizer lets safe indexing compile to the same code as
+    /// Single point of unsafety. Hinting `index_of`'s bound to the
+    /// optimizer lets safe indexing compile to the same code as
     /// `get_unchecked`, while keeping every call site in safe Rust.
     #[inline]
     pub(crate) fn slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = buf.len(), so idx < buf.len().
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == buf.len().
         unsafe { std::hint::assert_unchecked(idx < self.buf.len()) };
         &self.buf[idx]
     }

@@ -37,7 +37,10 @@ impl<T, C: Config> Clone for Consumer<T, C> {
             .clone_counter
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let stagger = (n * (self.queue.cap / 8).max(1)) & self.queue.mask;
+        let stagger = self
+            .queue
+            .capacity
+            .index_of(n * (self.queue.capacity.get() / 8).max(1));
         self.queue.consumer_count_live.register();
         Self {
             queue: Arc::clone(&self.queue),
@@ -77,14 +80,13 @@ impl<T, C: Config> Consumer<T, C> {
     #[inline]
     fn has_item(&self) -> bool {
         let q = &*self.queue;
-        let mask = q.mask;
         let start = self.next_scan.get();
-        for offset in 0..q.cap {
+        for offset in 0..q.capacity.get() {
             let scan = start + offset;
-            let s = scan & mask;
+            let s = q.capacity.index_of(scan);
             let r = q.ready_slot(scan).load(Ordering::Acquire);
             let delta = r.wrapping_sub(s);
-            let state = delta & mask;
+            let state = q.capacity.wrap(delta);
             if state == 1 {
                 return true;
             }
@@ -106,8 +108,7 @@ impl<T, C: Config> Consumer<T, C> {
     #[inline]
     fn claim_slot(&self) -> Option<(usize, usize)> {
         let q = &*self.queue;
-        let cap = q.cap;
-        let mask = q.mask;
+        let cap = q.capacity.get();
 
         let start_scan = self.next_scan.get();
         let mut scan = start_scan;
@@ -116,11 +117,10 @@ impl<T, C: Config> Consumer<T, C> {
 
         loop {
             // Decode `ready[s] = s + R*cap + state`, state ∈ {0,1,2}.
-            let s = scan & mask;
+            let s = q.capacity.index_of(scan);
             let r = q.ready_slot(scan).load(Ordering::Acquire);
             let delta = r.wrapping_sub(s);
-            // delta % cap == delta & mask, since cap is a power of two.
-            let state = delta & mask;
+            let state = q.capacity.wrap(delta);
             let round_pos = r.wrapping_sub(state);
 
             if state == 1 {
@@ -179,7 +179,7 @@ impl<T, C: Config> Consumer<T, C> {
         // visibility. wake_one's leading SeqCst fence is theoretically
         // equivalent, but writing the SeqCst on the store keeps the
         // pairing local to the call site.
-        q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
+        q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
         // Wake one parked producer if any.
         q.producer_park.wake_one();
         q.notify_producers();
@@ -243,7 +243,7 @@ impl<T, C: Config> Consumer<T, C> {
             // SeqCst (see Consumer::pop): drains the store buffer so
             // the upcoming wake_n's wake.load cannot miss a parked
             // producer bit set just after our store landed.
-            q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
+            q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
             count += 1;
             f(val);
         }
@@ -270,7 +270,7 @@ impl<T, C: Config> Consumer<T, C> {
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             // SeqCst — see Consumer::pop.
-            q.done_slot(pos).store(round_pos + q.cap, Ordering::SeqCst);
+            q.done_slot(pos).store(round_pos + q.capacity.get(), Ordering::SeqCst);
             count += 1;
             f(val);
         }
@@ -472,7 +472,7 @@ impl<T, C: Config> Consumer<T, C> {
     pub fn approx_len(&self) -> usize {
         let claim = self.queue.claim.load(Ordering::Relaxed);
         let scan = self.next_scan.get();
-        claim.wrapping_sub(scan).min(self.queue.cap)
+        claim.wrapping_sub(scan).min(self.queue.capacity.get())
     }
 
     /// Returns `true` once the last [`Producer`](super::Producer)

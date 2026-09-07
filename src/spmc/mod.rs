@@ -88,8 +88,7 @@ pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     /// Consumer-write, producer-read free-for-reuse marker.
     pub(crate) done: AlignedBuf<AtomicUsize>,
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    pub(crate) capacity: Capacity,
     /// Consumer positions are claimed by compare-exchange on `head`,
     /// so the pair's single-consumer publish helper does not apply
     /// here; `tail` is published Release by the lone producer, and
@@ -165,8 +164,7 @@ impl<T> RingBuffer<T> {
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]
             consumer_waker: WakerSet::new(),
-            cap,
-            mask: capacity.mask,
+            capacity,
         }
     }
 
@@ -217,17 +215,17 @@ impl<T> RingBuffer<T> {
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.cursors.is_full(self.cap)
+        self.cursors.is_full(self.capacity.get())
     }
 
     /// Returns a reference to the data slot at logical position `pos`.
     ///
-    /// Single point of unsafety for indexing: `pos & mask < cap == buf.len()`
-    /// because `mask = cap - 1`. Both per-slot arrays have length `cap`.
+    /// Single point of unsafety for indexing. Both per-slot arrays
+    /// have length `cap`.
     #[inline]
     pub(crate) fn data_slot(&self, pos: usize) -> &UnsafeCell<MaybeUninit<T>> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = data.len(), so idx < data.len().
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == data.len().
         unsafe { std::hint::assert_unchecked(idx < self.data.len()) };
         &self.data[idx]
     }
@@ -235,8 +233,8 @@ impl<T> RingBuffer<T> {
     /// Returns a reference to the done marker at logical position `pos`.
     #[inline]
     pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = done.len(), so idx < done.len().
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == done.len().
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
         &self.done[idx]
     }
@@ -301,9 +299,9 @@ impl<T> RingBuffer<T> {
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         for pos in self.cursors.occupied() {
-            let s = pos & self.mask;
+            let s = self.capacity.index_of(pos);
             let d = *self.done[s].get_mut();
-            if d != pos + self.cap {
+            if d != pos + self.capacity.get() {
                 // SAFETY: data is initialized and unconsumed.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();

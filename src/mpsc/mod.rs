@@ -59,8 +59,7 @@ use std::sync::Arc;
 #[repr(C)]
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<SeqSlot<T>>,
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    pub(crate) capacity: Capacity,
     pub(crate) cursors: Cursors,
     /// Live producer count; last-drop sets [`closed`].
     pub(crate) producer_count: EndpointCount,
@@ -117,8 +116,7 @@ impl<T> RingBuffer<T> {
         Self {
             buf,
             cursors: Cursors::new(),
-            cap,
-            mask: capacity.mask,
+            capacity,
             producer_count: EndpointCount::new(),
             closed: CloseState::new(),
             consumer_closed: CloseState::new(),
@@ -151,7 +149,7 @@ impl<T> RingBuffer<T> {
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.cursors.is_full(self.cap)
+        self.cursors.is_full(self.capacity.get())
     }
 
     /// Externally closes the ring, causing a blocked
@@ -172,12 +170,11 @@ impl<T> RingBuffer<T> {
 
     /// Returns a reference to the slot at logical position `pos`.
     ///
-    /// Single point of unsafety: `pos & mask` is always `< cap == buf.len()`
-    /// because `mask = cap - 1` and `cap` is a power of two.
+    /// Single point of unsafety.
     #[inline]
     pub(crate) fn slot(&self, pos: usize) -> &SeqSlot<T> {
-        let idx = pos & self.mask;
-        // SAFETY: mask = cap - 1, cap = buf.len(), so idx < buf.len().
+        let idx = self.capacity.index_of(pos);
+        // SAFETY: index_of < cap == buf.len().
         unsafe { std::hint::assert_unchecked(idx < self.buf.len()) };
         &self.buf[idx]
     }
@@ -291,7 +288,7 @@ impl<T> RingBuffer<T> {
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         for pos in self.cursors.occupied() {
-            let slot = &mut self.buf[pos & self.mask];
+            let slot = &mut self.buf[self.capacity.index_of(pos)];
             let seq = *slot.sequence.get_mut();
             // Skip tombstoned slots (abandoned reservations) and slots
             // that were claimed but never had their sequence published.

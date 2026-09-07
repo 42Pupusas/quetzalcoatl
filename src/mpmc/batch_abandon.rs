@@ -67,7 +67,8 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
         q.ready_slot(pos).store(pos + 2, Ordering::Release);
         // SeqCst: drains the store buffer so the wake below cannot miss
         // a producer that just parked on this slot.
-        q.done_slot(pos).store(pos + q.cap, Ordering::SeqCst);
+        q.done_slot(pos)
+            .store(pos + q.capacity.get(), Ordering::SeqCst);
         // The slot is now free for its next-round producer, which may
         // be parked waiting for exactly this release.
         q.producer_park.wake_one();

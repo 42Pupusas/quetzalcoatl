@@ -75,7 +75,7 @@ impl<T, C: Config> Producer<T, C> {
         let claim = q.claim.load(Ordering::Relaxed);
         let consumed = q.consumed.load(Ordering::Acquire);
         let in_flight = claim.wrapping_sub(consumed);
-        let free = if in_flight >= q.cap {
+        let free = if in_flight >= q.capacity.get() {
             // Watermark says full; per-slot check before giving up.
             let next_done = q.done_slot(claim).load(Ordering::Acquire);
             if next_done != claim {
@@ -83,7 +83,7 @@ impl<T, C: Config> Producer<T, C> {
             }
             1
         } else {
-            q.cap - in_flight
+            q.capacity.get() - in_flight
         };
         let batch = C::PRODUCER_BATCH.min(free);
 

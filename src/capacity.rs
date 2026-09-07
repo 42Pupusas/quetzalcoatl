@@ -4,8 +4,8 @@
 /// fast bitwise-AND indexing instead of expensive modulo operations.
 #[derive(Debug, Clone, Copy)]
 pub struct Capacity {
-    pub(crate) cap: usize,
-    pub(crate) mask: usize,
+    cap: usize,
+    mask: usize,
 }
 
 impl Capacity {
@@ -40,6 +40,29 @@ impl Capacity {
     #[must_use]
     pub const fn get(self) -> usize {
         self.cap
+    }
+
+    /// Maps a logical position to its slot index.
+    ///
+    /// The result is always `< self.get()`, which is what makes
+    /// unchecked indexing into a `cap`-length buffer sound: `mask`
+    /// is `cap - 1` and `cap` is a power of two, both enforced by
+    /// the constructors.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn index_of(self, pos: usize) -> usize {
+        pos & self.mask
+    }
+
+    /// Reduces a position *delta* modulo the capacity.
+    ///
+    /// Same arithmetic as [`index_of`](Self::index_of), different
+    /// meaning: the result is a distance within one lap, not a slot
+    /// index, and carries no bounds contract.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn wrap(self, delta: usize) -> usize {
+        delta & self.mask
     }
 }
 
@@ -82,5 +105,42 @@ mod tests {
     #[should_panic(expected = "capacity must be non-zero")]
     fn capacity_at_least_rejects_zero() {
         let _ = Capacity::at_least(0);
+    }
+
+    #[test]
+    fn an_index_never_reaches_the_capacity() {
+        let c = Capacity::exact(8);
+        for pos in 0..64usize {
+            assert!(c.index_of(pos) < c.get());
+        }
+    }
+
+    #[test]
+    fn positions_within_one_lap_map_to_distinct_slots() {
+        let c = Capacity::exact(16);
+        let seen: Vec<usize> = (0..16).map(|p| c.index_of(p)).collect();
+        assert_eq!(seen, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_position_and_its_next_lap_share_a_slot() {
+        let c = Capacity::exact(8);
+        assert_eq!(c.index_of(3), c.index_of(3 + 8));
+        assert_eq!(c.index_of(3), c.index_of(3 + 800 * 8));
+    }
+
+    #[test]
+    fn indexing_survives_a_position_that_wrapped_around_usize() {
+        let c = Capacity::exact(16);
+        assert!(c.index_of(usize::MAX) < c.get());
+        assert_eq!(c.index_of(usize::MAX.wrapping_add(1)), 0);
+    }
+
+    #[test]
+    fn wrapping_a_delta_agrees_with_the_remainder() {
+        let c = Capacity::exact(32);
+        for delta in 0..200usize {
+            assert_eq!(c.wrap(delta), delta % c.get());
+        }
     }
 }

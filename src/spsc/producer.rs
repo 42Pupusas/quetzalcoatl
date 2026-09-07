@@ -75,11 +75,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     fn try_claim(&self) -> Option<usize> {
         let pos = self.write_pos.get();
 
-        if pos - self.cached_head.get() >= self.ring().cap {
+        if pos - self.cached_head.get() >= self.ring().capacity.get() {
             let head = self.ring().cursors.head().load(Ordering::Acquire);
             self.cached_head.set(head);
 
-            if pos - head >= self.ring().cap {
+            if pos - head >= self.ring().capacity.get() {
                 return None;
             }
         }
@@ -94,12 +94,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn has_space(&self) -> bool {
         let pos = self.write_pos.get();
-        if pos - self.cached_head.get() < self.ring().cap {
+        if pos - self.cached_head.get() < self.ring().capacity.get() {
             return true;
         }
         let head = self.ring().cursors.head().load(Ordering::Acquire);
         self.cached_head.set(head);
-        pos - head < self.ring().cap
+        pos - head < self.ring().capacity.get()
     }
 
     /// Pushes a value into the ring buffer.

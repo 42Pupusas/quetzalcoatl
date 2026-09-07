@@ -72,7 +72,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let ring = self.ring();
         ring.slot(head)
             .sequence
-            .store((head + ring.cap) * 2, Ordering::Release);
+            .store((head + ring.capacity.get()) * 2, Ordering::Release);
         // SeqCst: as in `pop`, the store buffer must drain before the
         // wake path loads the park bitmap.
         ring.cursors.publish_head(head + 1);
@@ -102,7 +102,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
-                .store((head + self.ring().cap) * 2, Ordering::Release);
+                .store((head + self.ring().capacity.get()) * 2, Ordering::Release);
 
             // SeqCst (not Release): `xchg` drains the store buffer,
             // publishing this store and the `sequence` store above
@@ -167,7 +167,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
                     slot.sequence
-                        .store((head + ring.cap) * 2, Ordering::Release);
+                        .store((head + ring.capacity.get()) * 2, Ordering::Release);
                     batch.skip();
                     continue;
                 }
@@ -179,7 +179,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
-                .store((head + ring.cap) * 2, Ordering::Release);
+                .store((head + ring.capacity.get()) * 2, Ordering::Release);
 
             batch.take();
             f(val);
@@ -205,7 +205,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
                     slot.sequence
-                        .store((head + ring.cap) * 2, Ordering::Release);
+                        .store((head + ring.capacity.get()) * 2, Ordering::Release);
                     batch.skip();
                     continue;
                 }
@@ -217,7 +217,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             let val = unsafe { (*data_ptr).assume_init_read() };
 
             slot.sequence
-                .store((head + ring.cap) * 2, Ordering::Release);
+                .store((head + ring.capacity.get()) * 2, Ordering::Release);
 
             batch.take();
             f(val);

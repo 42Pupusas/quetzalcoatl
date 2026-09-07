@@ -92,7 +92,7 @@ impl<T> Producer<T> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
         let mut backoff = Backoff::new();
-        let reuse = SlotReuse::new(self.queue.cap);
+        let reuse = SlotReuse::new(self.queue.capacity.get());
         let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
         let pos = loop {
             if !self.permits_with_refresh(current_tail) {
@@ -181,16 +181,16 @@ impl<T> Producer<T> {
     #[inline]
     fn permits_with_refresh(&self, pos: usize) -> bool {
         if any_consumer_active(&self.queue) {
-            if self.cached_floor().permits(pos, self.queue.cap) {
+            if self.cached_floor().permits(pos, self.queue.capacity.get()) {
                 return true;
             }
             let shared = self.queue.min_head_cache.load(Ordering::Acquire);
             self.cached_min_head.set(shared);
-            if ConsumerFloor::At(shared).permits(pos, self.queue.cap) {
+            if ConsumerFloor::At(shared).permits(pos, self.queue.capacity.get()) {
                 return true;
             }
         }
-        self.refresh_floor().permits(pos, self.queue.cap)
+        self.refresh_floor().permits(pos, self.queue.capacity.get())
     }
 
     /// The last floor this producer observed, as a constraint.
