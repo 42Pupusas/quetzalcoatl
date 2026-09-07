@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the fix, since it builds the tarball it produces.
 
 ### Changed
+- **`DoneWord` owns the SPMC slot's release word.** The consumer's
+  `done[s] = pos + cap` was written out at five sites and the
+  producer's matching `load(Acquire) == pos` at two, with the teardown
+  check spelling the same comparison a third way. `SlotReader` no
+  longer carries a loose `cap: usize` beside its raw pointer; it holds
+  the `Capacity` and asks the word.
+
+  This is the SPMC twin of the MPMC type, deliberately kept separate:
+  MPMC stores `SeqCst` and SPMC stores `Release`, because each pairs
+  with a different wake path. Merging them would mean picking one
+  ordering for both.
+
 - **`ReadyWord` and `DoneWord` own the MPMC slot's two words.** A slot
   is described by `ready[s]`, a round-tagged tri-state, and `done[s]`,
   the handshake from one round's consumer to the next round's producer.

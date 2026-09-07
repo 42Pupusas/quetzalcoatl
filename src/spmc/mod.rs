@@ -46,6 +46,7 @@
 //! ```
 
 mod consumer;
+mod done_word;
 mod producer;
 
 pub use consumer::{Consumer, SlotReader};
@@ -61,10 +62,10 @@ use crate::common::wake_async::WakerSet;
 use crate::common::cursors::Cursors;
 use crate::common::endpoint_count::EndpointCount;
 use crate::common::AlignedBuf;
+use done_word::DoneWord;
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// A lock-free SPMC ring buffer.
@@ -87,7 +88,7 @@ use std::sync::Arc;
 pub struct RingBuffer<T> {
     pub(crate) data: AlignedBuf<UnsafeCell<MaybeUninit<T>>>,
     /// Consumer-write, producer-read free-for-reuse marker.
-    pub(crate) done: AlignedBuf<AtomicUsize>,
+    done: AlignedBuf<DoneWord>,
     pub(crate) capacity: Capacity,
     /// Consumer positions are claimed by compare-exchange on `head`,
     /// so the pair's single-consumer publish helper does not apply
@@ -139,13 +140,9 @@ impl<T> RingBuffer<T> {
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
-        // done[s] = s — slot s is "free for producer at logical position
-        // s" on the first lap. After a consumer at position p reads slot
-        // s, it stores done[s] = p + cap, marking it free for the next
-        // lap (logical position p + cap == s + cap == s + cap).
         let mut idx = 0usize;
         let done = AlignedBuf::new_with(cap, || {
-            let d = AtomicUsize::new(idx);
+            let d = DoneWord::released_for(idx);
             idx += 1;
             d
         });
@@ -232,7 +229,7 @@ impl<T> RingBuffer<T> {
 
     /// Returns a reference to the done marker at logical position `pos`.
     #[inline]
-    pub(crate) fn done_slot(&self, pos: usize) -> &AtomicUsize {
+    fn done_slot(&self, pos: usize) -> &DoneWord {
         let idx = self.capacity.index_of(pos);
         // SAFETY: index_of < cap == done.len().
         unsafe { std::hint::assert_unchecked(idx < self.done.len()) };
@@ -300,8 +297,7 @@ impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         for pos in self.cursors.occupied() {
             let s = self.capacity.index_of(pos);
-            let d = *self.done[s].get_mut();
-            if d != pos + self.capacity.get() {
+            if self.done[s].holds_unconsumed_value_at(pos, self.capacity) {
                 // SAFETY: data is initialized and unconsumed.
                 unsafe {
                     self.data[s].get().cast::<T>().drop_in_place();

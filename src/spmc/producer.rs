@@ -57,8 +57,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     fn try_claim(&self) -> Option<(*mut MaybeUninit<T>, usize)> {
         let pos = self.write_pos.get();
 
-        let done = self.ring().done_slot(pos);
-        if done.load(Ordering::Acquire) != pos {
+        if !self.ring().done_slot(pos).is_free_for(pos) {
             return None;
         }
 
@@ -70,7 +69,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn has_space(&self) -> bool {
         let pos = self.write_pos.get();
-        self.ring().done_slot(pos).load(Ordering::Acquire) == pos
+        self.ring().done_slot(pos).is_free_for(pos)
     }
 
     /// Pushes a value into the ring buffer.
