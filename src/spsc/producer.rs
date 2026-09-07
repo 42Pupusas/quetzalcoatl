@@ -121,10 +121,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         // SeqCst: stronger than Release on two grounds. (1) Release alone
         // ensures the data write above is visible to the consumer through
         // the Acquire load on `tail`. (2) SeqCst additionally orders this
-        // store with the consumer's SeqCst store of `consumer_parked = true`
-        // in `pop_block`, closing the missed-wakeup race: either we observe
-        // `parked == true` in `wake_consumer` (and unpark), or the consumer's
-        // post-flag re-check observes the new `tail` (and skips parking).
+        // store with the consumer's SeqCst arm in `pop_block`, closing the
+        // missed-wakeup race: either we observe `parked == true` in
+        // `wake_consumer` (and unpark), or the consumer's post-arm re-check
+        // observes the new `tail` (and skips parking). Being SeqCst is also
+        // what lets `wake_consumer` skip the store-buffer fence.
         self.ring().tail.store(pos + 1, Ordering::SeqCst);
 
         self.ring().wake_consumer();
@@ -200,38 +201,21 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 continue;
             }
 
-            self.ring().producer_parker.arm();
-            // SeqCst pairs with the consumer's `producer_parked.load`
-            // after `head.store(Release)`.
-            self.ring().producer_parked.0.store(true, Ordering::SeqCst);
-            // The has_space() re-check below loads `head` with Acquire,
-            // which the SeqCst store above does not order. Without this
-            // fence the consumer can read parked == false while we read
-            // a stale full ring, and both sides sleep.
-            std::sync::atomic::fence(Ordering::SeqCst);
+            self.ring().producer_park.arm();
 
             // SeqCst: the post-arm re-check is the second half of the
             // close handshake with Consumer::drop.
             if self.ring().consumer_closed.is_closed_for_parking() {
-                self.ring()
-                    .producer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
+                self.ring().producer_park.disarm();
                 return None;
             }
             if self.has_space() {
-                self.ring()
-                    .producer_parked
-                    .0
-                    .store(false, Ordering::Relaxed);
+                self.ring().producer_park.disarm();
                 return self.reserve();
             }
 
             std::thread::park();
-            self.ring()
-                .producer_parked
-                .0
-                .store(false, Ordering::Relaxed);
+            self.ring().producer_park.disarm();
         }
     }
 
@@ -300,31 +284,26 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerProducer<T>
         self.push(val)
     }
     fn consumer_gone(&self) -> bool {
-        self.ring().consumer_closed.is_closed()
+        // SeqCst: post-arm half of the close handshake, as the trait
+        // requires. `push_block` calls this again after `arm_park`.
+        self.ring().consumer_closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
-        // Publish this thread's handle, then publish "parked". SeqCst
-        // pairs with the consumer's `producer_parked.load` after
-        // `head.store(Release)`: either our re-check sees freed space, or
-        // the consumer sees our flag and unparks us.
-        self.ring().producer_parker.arm();
-        self.ring().producer_parked.0.store(true, Ordering::SeqCst);
+        self.ring().producer_park.arm();
     }
     fn disarm_park(&self) {
-        self.ring()
-            .producer_parked
-            .0
-            .store(false, Ordering::Relaxed);
+        self.ring().producer_park.disarm();
     }
 }
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
     fn drop(&mut self) {
-        // SeqCst store + the SeqCst load inside wake_consumer are both
-        // halves of the close handshake. A bare unpark here reads the
-        // parker OnceLock without ever loading consumer_parked, so the
-        // store and the consumer's re-check stay unordered and the
-        // consumer can park after we decide not to wake it.
+        // Close then wake, in that order: the SeqCst store inside
+        // `close` and the SeqCst load inside `wake_consumer` are the two
+        // halves of the handshake. A bare unpark here would claim the
+        // park handle without ever loading the parked flag, leaving the
+        // store and the consumer's re-check unordered, so the consumer
+        // could park after we decided not to wake it.
         self.ring().producer_closed.close();
         self.ring().wake_consumer();
         #[cfg(feature = "async")]

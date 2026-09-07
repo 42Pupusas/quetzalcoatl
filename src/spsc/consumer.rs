@@ -72,9 +72,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         // synchronized with our Acquire in `available`.
         let val = unsafe { (*self.ring().slot(head).get()).assume_init_read() };
 
-        // SeqCst: pairs with the producer's SeqCst store of
-        // `producer_parked = true` in `push_block` to close the missed-
-        // wakeup race; subsumes the Release semantics for slot reuse.
+        // SeqCst: pairs with the producer's SeqCst arm in `push_block`
+        // to close the missed-wakeup race, and lets `wake_producer`
+        // skip its fence; subsumes the Release semantics for slot reuse.
         self.ring().head.store(head + 1, Ordering::SeqCst);
 
         self.ring().wake_producer();
@@ -295,17 +295,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumer<T>
         self.ring().producer_closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
-        // SeqCst pairs with the producer's `consumer_parked.load` after
-        // `tail.store(Release)`: either our re-check sees the published
-        // slot, or the producer sees our flag and unparks us.
-        self.ring().consumer_parker.arm();
-        self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
+        self.ring().consumer_park.arm();
     }
     fn disarm_park(&self) {
-        self.ring()
-            .consumer_parked
-            .0
-            .store(false, Ordering::Relaxed);
+        self.ring().consumer_park.disarm();
     }
 }
 
@@ -326,14 +319,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
         self.ring().producer_closed.is_closed_for_parking()
     }
     fn arm_park(&self) {
-        self.ring().consumer_parker.arm();
-        self.ring().consumer_parked.0.store(true, Ordering::SeqCst);
+        self.ring().consumer_park.arm();
     }
     fn disarm_park(&self) {
-        self.ring()
-            .consumer_parked
-            .0
-            .store(false, Ordering::Relaxed);
+        self.ring().consumer_park.disarm();
     }
 }
 

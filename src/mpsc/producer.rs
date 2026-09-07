@@ -330,7 +330,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
         self.ring().producer_slots.release(self.park_slot);
         if self.ring().producer_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // SeqCst: pairs with the consumer's post-arm SeqCst load
-            // and with wake_consumer's SeqCst load of consumer_parked.
+            // and with wake_consumer's SeqCst load of the parked flag.
             self.ring().closed.close();
             self.ring().wake_consumer();
             #[cfg(feature = "async")]

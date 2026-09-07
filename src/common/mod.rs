@@ -8,6 +8,7 @@ pub mod park_probe;
 #[cfg(feature = "async")]
 pub mod park_registration;
 pub mod park_registry;
+pub mod sole_parker;
 pub mod thread_parker;
 #[cfg(feature = "async")]
 pub mod wake_async;
@@ -57,7 +58,7 @@ pub fn spawn_progress_watchdog(
 
 /// Shared blocking-push loop for the single-producer topologies (spsc,
 /// spmc). Both park the producer thread with the identical mechanism
-/// (`producer_parker: ThreadParker` + `producer_parked` flag), so
+/// (a `producer_park: SoleParker`), so
 /// their `push_block` bodies were byte-for-byte the same. The loop lives
 /// here once; each implementor supplies the four primitives that differ
 /// only in which ring fields they touch.
@@ -117,7 +118,7 @@ pub trait SingleParkerProducer<T> {
 
 /// Shared blocking-pop loop for the single-consumer topologies (spsc,
 /// mpsc). Both park the consumer thread with the identical mechanism
-/// (`consumer_parker` + `consumer_parked`), so their `pop_block` bodies
+/// (a `consumer_park: SoleParker`), so their `pop_block` bodies
 /// were identical. The loop lives here once; implementors supply the
 /// primitives that differ only in which ring fields they touch.
 pub trait SingleParkerConsumer<T> {

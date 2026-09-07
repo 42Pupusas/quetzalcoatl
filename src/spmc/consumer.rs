@@ -447,11 +447,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
         }
         q.consumer_slots.release(self.park_slot);
         if q.consumer_count_live.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // SeqCst store + wake_producer's SeqCst load of
-            // producer_parked are the two halves of the close
-            // handshake. Reading the parker handle directly skips the
-            // load and lets the producer park after we decide not to
-            // wake it.
+            // SeqCst store + wake_producer's SeqCst load of the parked
+            // flag are the two halves of the close handshake. Reading
+            // the parker handle directly skips the load and lets the
+            // producer park after we decide not to wake it.
             q.consumer_closed.close();
             q.wake_producer();
             #[cfg(feature = "async")]

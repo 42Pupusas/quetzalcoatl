@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Single-waiter park state is now owned by `SoleParker`.** The
+  single-producer and single-consumer sides each carried a loose
+  `ThreadParker` plus a `parked` flag, with the park protocol restated
+  at every site that touched them, and a `SeqCst` fence that every
+  caller had to remember to issue after arming. Arming now carries its
+  own fence, so a site cannot forget it. The type takes the same
+  `_park` field name as its multi-waiter twin `WakeSet`, so every side
+  of every ring reads `producer_park` / `consumer_park` and the type
+  says how many waiters the side admits. It also draws the same
+  distinction `WakeSet` does between `wake` (fenced, for a caller that
+  published with `Release` — MPSC, SPMC) and `wake_published`
+  (fence-free, for a caller whose publish store is already `SeqCst` —
+  SPSC), which was previously implicit in whether a given ring's
+  hand-written `wake_*` happened to start with a fence.
+
 - **BREAKING: `split_borrowed` now takes `&mut self`** on SPSC, MPSC and
   SPMC. It previously took `&self`, so safe code could call it twice on
   one ring and mint a second copy of a *single* endpoint — two SPSC
@@ -49,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented contract was never the implemented one.
 
 ### Fixed
+- **`spsc`'s blocking producer checked for a closed consumer with
+  `Acquire` where the shared `push_block` loop requires `SeqCst`.**
+  `SingleParkerProducer::consumer_gone` is called once before parking
+  and again immediately after arming; the second call is the waiter's
+  half of the same Dekker handshake described below, so an `Acquire`
+  load leaves it unordered against the arming store. SPMC's identical
+  impl already used `SeqCst`. A producer blocked in `push_block` on a
+  full ring could therefore miss a concurrent consumer close and park
+  until the ring was dropped.
 - **`spsc::RingBuffer::close` published the close with `Release`,**
   where every other close in the crate — including MPSC's otherwise
   identical `close` — uses `SeqCst`. Closing and parking is a Dekker

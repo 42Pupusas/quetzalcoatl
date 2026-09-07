@@ -35,14 +35,14 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::close_state::CloseState;
-use crate::common::thread_parker::ThreadParker;
+use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A lock-free SPSC ring buffer.
@@ -65,18 +65,12 @@ pub struct RingBuffer<T> {
     /// Set when the [`Consumer`] is dropped. [`Producer::push_block`]
     /// observes this and returns `Err(val)` instead of hanging.
     pub(crate) consumer_closed: CloseState,
-    /// Single-producer park handle. Re-armed each time the producer
-    /// parks, so a producer that moves between threads is woken on
-    /// whichever thread is parked now; the consumer claims it to issue
-    /// the unpark.
-    pub(crate) producer_parker: ThreadParker,
-    /// `true` ↔ producer is currently parked. Consumers gate their
-    /// unpark on this `Relaxed` load to keep the no-park hot path free.
-    pub(crate) producer_parked: CachePadded<AtomicBool>,
-    /// Single-consumer park handle. Symmetric to `producer_parker`.
-    pub(crate) consumer_parker: ThreadParker,
-    /// `true` ↔ consumer is currently parked.
-    pub(crate) consumer_parked: CachePadded<AtomicBool>,
+    /// Producer-side park state. One producer, so a single flag
+    /// answers "is anyone parked?"; the consumer gates its unpark on
+    /// it to keep the no-park hot path free.
+    pub(crate) producer_park: SoleParker,
+    /// Consumer-side park state. Symmetric to `producer_park`.
+    pub(crate) consumer_park: SoleParker,
     /// Async waker for the single producer. Registered before returning
     /// `Poll::Pending` from `push_async`; woken by the consumer after
     /// each `pop` or `drain`.
@@ -133,10 +127,8 @@ impl<T> RingBuffer<T> {
             mask: capacity.mask,
             producer_closed: CloseState::new(),
             consumer_closed: CloseState::new(),
-            producer_parker: ThreadParker::new(),
-            producer_parked: CachePadded(AtomicBool::new(false)),
-            consumer_parker: ThreadParker::new(),
-            consumer_parked: CachePadded(AtomicBool::new(false)),
+            producer_park: SoleParker::new(),
+            consumer_park: SoleParker::new(),
             #[cfg(feature = "async")]
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]
@@ -144,38 +136,25 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Wakes the parked producer, if any. The `SeqCst` load of
-    /// `producer_parked` pairs with the producer's `SeqCst` store of
-    /// `producer_parked = true` in `push_block`/`reserve_block` to
-    /// form a Dekker handshake on the parked atom: in any execution
-    /// where this load reads `false`, the SC total order forces the
-    /// producer's post-store re-check to observe the consumer's
-    /// `SeqCst` publication on `head` (in pop/drain) and skip parking.
+    /// Wakes the parked producer, if any. Call after publishing the
+    /// progress being announced — the freed slot in pop/drain, or the
+    /// close in `Consumer::drop`.
     ///
-    /// On x86 the SC load is the same code as Acquire; on weak
-    /// architectures it adds a fence. Either is the correct cost
-    /// for the wake-once-on-state-change semantics this needs to
-    /// guarantee, and it is paid only on the cold path where a
-    /// blocking peer might have parked.
+    /// Fence-free: every caller publishes with a `SeqCst` store
+    /// (`head`, or the close flag), which drains the store buffer
+    /// itself. A caller that switched to `Release` would have to move
+    /// to [`SoleParker::wake`].
     #[inline]
     pub(crate) fn wake_producer(&self) {
-        if !self.producer_parked.0.load(Ordering::SeqCst) {
-            return;
-        }
-        self.producer_parked.0.store(false, Ordering::Relaxed);
-        self.producer_parker.wake();
+        self.producer_park.wake_published();
     }
 
-    /// Wakes the parked consumer, if any. Symmetric to `wake_producer`:
-    /// the `SeqCst` load pairs with the consumer's `SeqCst` store of
-    /// `consumer_parked = true` in `pop_block`/`pop_ref_block`.
+    /// Wakes the parked consumer, if any. Symmetric to
+    /// [`wake_producer`](Self::wake_producer), and fence-free for the
+    /// same reason: the callers publish `tail` with `SeqCst`.
     #[inline]
     pub(crate) fn wake_consumer(&self) {
-        if !self.consumer_parked.0.load(Ordering::SeqCst) {
-            return;
-        }
-        self.consumer_parked.0.store(false, Ordering::Relaxed);
-        self.consumer_parker.wake();
+        self.consumer_park.wake_published();
     }
 
     #[cfg(feature = "async")]
@@ -1211,7 +1190,7 @@ mod tests {
         assert!(p.push(99).is_err());
         let h = std::thread::spawn(move || p.push_block(99));
         ParkProbe::new().expect_until("push_block to arm its park", || {
-            c.queue.producer_parked.0.load(Ordering::SeqCst)
+            c.queue.producer_park.is_parked()
         });
         // Close without freeing a slot. Consumer::drop drains first, and
         // a parked producer that gets real space legitimately pushes into
@@ -1258,7 +1237,7 @@ mod tests {
         p.push(2).unwrap();
         let h = std::thread::spawn(move || p.reserve_block().is_some());
         ParkProbe::new().expect_until("reserve_block to arm its park", || {
-            c.queue.producer_parked.0.load(Ordering::SeqCst)
+            c.queue.producer_park.is_parked()
         });
         // Close without freeing a slot, as in
         // push_block_returns_err_on_consumer_close.

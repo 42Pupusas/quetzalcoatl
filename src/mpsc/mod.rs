@@ -37,14 +37,14 @@ use crate::capacity::Capacity;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
 use crate::common::close_state::CloseState;
-use crate::common::thread_parker::ThreadParker;
+use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, CachePadded, SeqSlot};
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A lock-free MPSC ring buffer.
@@ -77,20 +77,16 @@ pub struct RingBuffer<T> {
     /// Leases park-slot indices to `Producer` handles, reclaiming each
     /// on drop so a slot is never shared by two live producers.
     pub(crate) producer_slots: ParkRegistry,
-    /// Single-consumer park handle. Re-armed by the consumer each time
-    /// it parks, so a consumer that moves between threads is woken on
-    /// whichever thread is parked now; producers claim it to unpark.
-    pub(crate) consumer_parker: ThreadParker,
-    /// `true` ↔ the consumer is currently parked on `consumer_parker`.
-    /// Producers gate their unpark on this `Relaxed` load to keep the
-    /// no-park hot path free.
-    pub(crate) consumer_parked: CachePadded<AtomicBool>,
+    /// Consumer-side park state. One consumer, so a single flag
+    /// answers "is anyone parked?"; producers gate their unpark on it
+    /// to keep the no-park hot path free.
+    pub(crate) consumer_park: SoleParker,
     /// Async equivalent of `producer_park`: per-producer-slot wakers
     /// registered by `Poll::Pending` from `push_async`. Woken by the
     /// consumer after every pop / drain.
     #[cfg(feature = "async")]
     pub(crate) producer_waker: WakerSet,
-    /// Async equivalent of `consumer_parker`: single waker registered by
+    /// Async equivalent of `consumer_park`: single waker registered by
     /// `Poll::Pending` from `pop_async`. Woken by any producer after a
     /// successful push or commit.
     #[cfg(feature = "async")]
@@ -128,8 +124,7 @@ impl<T> RingBuffer<T> {
             consumer_closed: CloseState::new(),
             producer_park: WakeSet::new(),
             producer_slots: ParkRegistry::new(),
-            consumer_parker: ThreadParker::new(),
-            consumer_parked: CachePadded(AtomicBool::new(false)),
+            consumer_park: SoleParker::new(),
             #[cfg(feature = "async")]
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]
@@ -241,9 +236,11 @@ impl<T> RingBuffer<T> {
 }
 
 impl<T> RingBuffer<T> {
-    /// Wakes the single parked consumer, if any. Gated on a `Relaxed`
-    /// load of `consumer_parked` so the no-park hot path stays
-    /// branch-free in the common case.
+    /// Wakes the single parked consumer, if any.
+    ///
+    /// Fenced: `Producer::push` publishes the slot sequence with
+    /// `Release`, so the store buffer must be drained before sampling
+    /// the parked flag. See [`SoleParker::wake`].
     ///
     /// Idempotent: clearing the flag means any racing producer that
     /// observes it already cleared simply skips the unpark. The
@@ -253,12 +250,7 @@ impl<T> RingBuffer<T> {
     /// consumer re-checks the queue after every wake).
     #[inline]
     pub(crate) fn wake_consumer(&self) {
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.consumer_parked.0.load(Ordering::SeqCst) {
-            return;
-        }
-        self.consumer_parked.0.store(false, Ordering::Relaxed);
-        self.consumer_parker.wake();
+        self.consumer_park.wake();
     }
 
     /// Wakes the async consumer task, if any. Self-gates on `pending`.

@@ -12,13 +12,16 @@
 //! # Choosing the observable
 //!
 //! The observable must latch for long enough that a polling probe
-//! cannot miss it. `producer_parked` is set before the waiter's final
-//! re-checks and stays set while it is parked, so a probe polling it
-//! observes a waiter that has committed to parking.
+//! cannot miss it. [`SoleParker::is_parked`] is set before the waiter's
+//! final re-checks and stays set while it is parked, so a probe polling
+//! it observes a waiter that has committed to parking.
+//!
+//! [`SoleParker::is_parked`]: super::sole_parker::SoleParker::is_parked
 //!
 //! An armed park handle is *not* a safe substitute: a wake claims the
 //! handle out of its slot, so the observable disappears the moment the
-//! peer acts on it. Probe the `parked` flag or the wake bitmap instead.
+//! peer acts on it. Probe [`SoleParker::is_parked`] or the wake bitmap
+//! instead.
 //!
 //! The budget counts attempts, not time, and is deliberately small: a
 //! blown budget must fail the test quickly rather than burn CPU.
