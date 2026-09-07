@@ -231,6 +231,7 @@ impl<T, C: Config> Producer<T, C> {
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T, C>> {
         let park_slot = self.park_slot;
         let mut backoff = Backoff::new();
+        let mut watch = self.queue.watch_backstop();
         loop {
             if self.queue.consumer_closed.is_closed() {
                 return None;
@@ -239,6 +240,7 @@ impl<T, C: Config> Producer<T, C> {
             // bit on drop, so the second reserve() reuses the same
             // slot. Self-cancelling — no destructive mutation.
             if self.reserve().is_some() {
+                watch.made_progress();
                 return self.reserve();
             }
             if backoff.spin_unless_exhausted() {
@@ -261,6 +263,9 @@ impl<T, C: Config> Producer<T, C> {
 
             // Bounded park — see push_block.
             park_slot.park_bounded(PARK_BACKSTOP);
+            // A wake claims the handle, so one still armed means the
+            // sleep ended on the timeout instead.
+            watch.parked(self.queue.producer_park.is_armed(park_slot));
             self.queue.producer_park.disarm(park_slot);
         }
     }
@@ -278,9 +283,13 @@ impl<T, C: Config> Producer<T, C> {
         let q = &*self.queue;
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
+        let mut watch = q.watch_backstop();
         loop {
             match self.push(val) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    watch.made_progress();
+                    return Ok(());
+                }
                 Err(returned) => val = returned,
             }
             if q.consumer_closed.is_closed() {
@@ -302,6 +311,7 @@ impl<T, C: Config> Producer<T, C> {
 
             match self.push(val) {
                 Ok(()) => {
+                    watch.made_progress();
                     q.producer_park.disarm(slot);
                     return Ok(());
                 }
@@ -320,6 +330,9 @@ impl<T, C: Config> Producer<T, C> {
             // cause and is now fixed, though not proven to be the only
             // one, so the bound stays until it is.
             slot.park_bounded(PARK_BACKSTOP);
+            // A wake claims the handle, so one still armed means the
+            // sleep ended on the timeout instead.
+            watch.parked(q.producer_park.is_armed(slot));
             q.producer_park.disarm(slot);
         }
     }

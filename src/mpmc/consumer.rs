@@ -293,8 +293,10 @@ impl<T, C: Config> Consumer<T, C> {
         let q = &*self.queue;
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
+        let mut watch = q.watch_backstop();
         loop {
             if let Some(v) = self.pop() {
+                watch.made_progress();
                 return Some(v);
             }
             // Empty AND closed AND really nothing left → done.
@@ -323,6 +325,7 @@ impl<T, C: Config> Consumer<T, C> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if let Some(v) = self.pop() {
+                watch.made_progress();
                 q.consumer_park.disarm(slot);
                 return Some(v);
             }
@@ -333,6 +336,9 @@ impl<T, C: Config> Consumer<T, C> {
 
             // Bounded park backstop — see Producer::push_block.
             slot.park_bounded(PARK_BACKSTOP);
+            // A wake claims the handle, so one still armed means the
+            // sleep ended on the timeout instead.
+            watch.parked(q.consumer_park.is_armed(slot));
             q.consumer_park.disarm(slot);
         }
     }
@@ -387,11 +393,13 @@ impl<T, C: Config> Consumer<T, C> {
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, C>> {
         let park_slot = self.park_slot;
         let mut backoff = Backoff::new();
+        let mut watch = self.queue.watch_backstop();
         loop {
             // Non-mutating gate: avoid CAS-claiming a slot that the
             // discarded SlotReader would then have to release.
             if self.has_item() {
                 if let Some(claimed) = self.claim_slot() {
+                    watch.made_progress();
                     return Some(self.reader_for(claimed));
                 }
                 backoff.reset();
@@ -417,6 +425,7 @@ impl<T, C: Config> Consumer<T, C> {
             if self.has_item() {
                 self.queue.consumer_park.disarm(park_slot);
                 if let Some(claimed) = self.claim_slot() {
+                    watch.made_progress();
                     return Some(self.reader_for(claimed));
                 }
                 backoff.reset();
@@ -434,6 +443,9 @@ impl<T, C: Config> Consumer<T, C> {
 
             // Bounded park backstop — see Consumer::pop_block.
             park_slot.park_bounded(PARK_BACKSTOP);
+            // A wake claims the handle, so one still armed means the
+            // sleep ended on the timeout instead.
+            watch.parked(self.queue.consumer_park.is_armed(park_slot));
             self.queue.consumer_park.disarm(park_slot);
         }
     }

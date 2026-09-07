@@ -47,6 +47,12 @@ include = [
 # enabled — production builds are unaffected.
 async = []
 dhat-heap = ["dep:dhat"]
+# Counts mpmc parks that ended on the PARK_BACKSTOP timeout, and how
+# many of those found work immediately after — the signature of a wake
+# that went missing. Diagnostic only: the counters exist to decide
+# whether the backstop can be removed. Off by default; the ring carries
+# no counters and the call sites compile to nothing.
+backstop-metrics = []
 
 [lints.rust]
 # `loom` is a compiler cfg cargo sets from the [target.'cfg(loom)']

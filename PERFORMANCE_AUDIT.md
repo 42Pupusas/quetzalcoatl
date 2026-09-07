@@ -116,6 +116,25 @@ afterwards stayed within the run-to-run variation already documented,
 which is expected: both fixes reorder reservation-drop paths and leave
 push/pop untouched.
 
+## The backstop measurement
+
+Disabling `PARK_BACKSTOP` (raising it to 30s) and running
+`block_stress_diagnostic` for 400 iterations produced no hang, which
+looked like evidence the bound was unnecessary. It was not: the same
+workload instrumented reported two backstop rescues in one iteration of
+400, so wakes were still going missing — the runs simply did not lose
+one while the bound was off.
+
+That is the argument for measuring rather than sampling. A rare race
+absent from 400 runs is not an absent race, and the cost of being wrong
+here is a permanently hung process.
+
+Rescues are an upper bound on lost wakes rather than an exact count:
+work can legitimately arrive during the timeout window, and `wake_one`
+serves one slot per event in round-robin order, so a waiter can be
+passed over rather than lost. A zero count across the matrix would be
+strong evidence the bound can go; a non-zero one is a starting point.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -136,6 +155,6 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 3. Cover all five topologies: push/pop, reserve/commit/pop_ref, drain, saturation, empty-to-nonempty wake latency, endpoint churn, and cancellation. Include async on/off and >64 live waiters for overflow paths.
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
-6. Decide whether mpmc's `PARK_BACKSTOP` should stay. It converted this bug from a hang into a stall and so hid it from the blocking tests; the comment already records that it is a backstop against an unproven residual race.
+6. **Find the cause of the mpmc missed wake.** The `backstop-metrics` feature now measures it: it counts parks that ended on the `PARK_BACKSTOP` timeout rather than a peer's wake, and among those, the ones whose next re-check found work already available. That second count is a *rescue* — the waiter was waiting for something already there. `block_stress_diagnostic` reported two rescues in one iteration of 400, so the bug is still live, roughly a thousand times rarer than the original 3% but not gone. `PARK_BACKSTOP` therefore stays: removing it turns each rescue into a permanent hang. Instrument the rescue path to capture ring state at the timeout, as `block_stress_diagnostic` already does for the deadlock.
 7. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers.
 8. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

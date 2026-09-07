@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`backstop-metrics`, a diagnostic feature that measures whether
+  mpmc's `PARK_BACKSTOP` is still needed.** The 1ms bound on a parked
+  mpmc waiter's sleep exists because a missed wake was seen under
+  saturated stress and never explained; silently, it converts any such
+  bug into a millisecond of latency, which is indistinguishable from
+  scheduling noise.
+
+  The feature counts parks that ended on the timeout rather than a
+  peer's wake (a waiter's park handle is claimed by whoever wakes it, so
+  one still armed proves nobody did), and among those, the ones whose
+  next re-check found work already waiting. That second count is a
+  *rescue*: the waiter was waiting for something already there, and only
+  the clock released it.
+
+  **The result: the bug is still live.** `block_stress_diagnostic`
+  reported two rescues in one iteration out of 400 (2 producers x 5000
+  items through a 16-slot ring). Exclusive park-slot leasing, which was
+  the likeliest explanation, did not eliminate it — only made it roughly
+  a thousand times rarer than the original 3%. Removing the backstop
+  would turn each of those into a permanent hang, so it stays.
+
+  Off by default: the ring carries no counters and the call sites
+  compile to nothing.
+
 ### Fixed
 - **A panicking `T::drop` during consumer teardown left the ring
   looking open.** spsc's `Consumer::drop` drains the backlog before it

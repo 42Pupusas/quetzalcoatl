@@ -53,6 +53,7 @@
 //! ones at the same total thread count because there's scheduling
 //! slack.
 
+mod backstop_monitor;
 mod batch_abandon;
 mod config;
 mod consumed_watermark;
@@ -82,9 +83,18 @@ use crate::common::park_registry::ParkRegistry;
 ///
 /// A backstop, not the wake path: a residual missed wake was observed
 /// under saturated stress (cap=16, ~3% of 5000-item runs) and its cause
-/// was never isolated. Exclusive park-slot leasing removes the aliasing
-/// that is the likeliest explanation, but until that is demonstrated the
-/// bound stays so any survivor costs latency rather than a hang.
+/// was never isolated. Exclusive park-slot leasing removed the aliasing
+/// that was the likeliest explanation, but the bug survived it.
+///
+/// The `backstop-metrics` feature counts the timeouts that rescue a
+/// waiter with work already available — what a lost wake looks like
+/// from outside. Instrumented, `block_stress_diagnostic` reported two
+/// rescues in one iteration of 400 (2 producers x 5000 items, cap=16),
+/// so wakes are still going missing at roughly 1 iteration in 400,
+/// three orders of magnitude rarer than the original 3%.
+///
+/// Removing this bound would turn each of those into a permanent hang.
+/// It stays until the cause is found; see [`backstop_monitor`].
 pub(crate) const PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
@@ -150,6 +160,10 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// producer after a successful push / commit.
     #[cfg(feature = "async")]
     pub(crate) consumer_waker: WakerSet,
+    /// Backstop timeout counters. Present only under the diagnostic
+    /// feature; see [`backstop_monitor`].
+    #[cfg(feature = "backstop-metrics")]
+    pub(crate) backstop: backstop_monitor::BackstopMonitor,
     pub(crate) _config: std::marker::PhantomData<fn() -> C>,
 }
 
@@ -210,8 +224,41 @@ impl<T, C: Config> RingBuffer<T, C> {
             producer_waker: WakerSet::new(),
             #[cfg(feature = "async")]
             consumer_waker: WakerSet::new(),
+            #[cfg(feature = "backstop-metrics")]
+            backstop: backstop_monitor::BackstopMonitor::new(),
             _config: std::marker::PhantomData,
         }
+    }
+
+    /// Starts watching one waiter's park loop for backstop rescues.
+    ///
+    /// Call sites are unconditional; this pair is where the
+    /// `backstop-metrics` feature enters the park path.
+    #[cfg(feature = "backstop-metrics")]
+    pub(crate) const fn watch_backstop(&self) -> backstop_monitor::BackstopWatch {
+        // SAFETY: the monitor lives in this ring, which every caller
+        // holds through an `Arc` for the whole of its park loop.
+        unsafe { backstop_monitor::BackstopWatch::new(std::ptr::from_ref(&self.backstop)) }
+    }
+
+    #[cfg(not(feature = "backstop-metrics"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "signature mirrors the instrumented twin so call sites need no cfg"
+    )]
+    pub(crate) const fn watch_backstop(&self) -> backstop_monitor::BackstopWatch {
+        backstop_monitor::BackstopWatch
+    }
+
+    /// Reads this ring's backstop counters.
+    ///
+    /// A non-zero rescue count means the timeout released a waiter that
+    /// had work available, which is what a lost wake looks like from
+    /// the outside.
+    #[cfg(feature = "backstop-metrics")]
+    #[must_use]
+    pub fn backstop_stats(&self) -> backstop_monitor::BackstopStats {
+        self.backstop.stats()
     }
 
     /// Wakes the async producer tasks waiting for space.
@@ -357,6 +404,44 @@ mod tests {
     #[should_panic(expected = "mpmc requires capacity >= 4")]
     fn rejects_small_capacity() {
         let _ = RingBuffer::<u8>::new(Capacity::exact(2));
+    }
+
+    /// A counter that never fires proves nothing unless it *can* fire.
+    /// This stages the failure the backstop exists to survive: a
+    /// consumer parks, a producer publishes but its wake is stolen
+    /// before it reaches the parked thread, and only the timeout
+    /// releases the consumer. That is a rescue, and the monitor must
+    /// say so.
+    #[test]
+    #[cfg(feature = "backstop-metrics")]
+    fn the_monitor_counts_a_wake_that_never_arrived() {
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let ring = std::sync::Arc::clone(&producer.queue);
+
+        let reader = std::thread::spawn(move || consumer.pop_block());
+
+        // Wait for the consumer to commit to parking, then clear its
+        // wake bit. `wake_one` reads the bitmap to decide who to
+        // unpark, so the publish below finds nobody and the parked
+        // thread's handle is left armed — a wake that goes missing.
+        // Only PARK_BACKSTOP can end that sleep.
+        //
+        // Clearing the bit is the one way to stage this without
+        // unparking: claiming the handle directly would deliver the
+        // very unpark token whose absence is the point.
+        ParkProbe::new().expect_until("the consumer to park", || {
+            ring.consumer_park.wake.load(Ordering::Relaxed) != 0
+        });
+        ring.consumer_park.wake.store(0, Ordering::SeqCst);
+        producer.push(7).unwrap();
+
+        assert_eq!(reader.join().unwrap(), Some(7));
+
+        let stats = ring.backstop_stats();
+        assert!(
+            stats.saw_rescue(),
+            "the backstop released a waiter whose wake went missing, so it must be counted: {stats:?}"
+        );
     }
 
     #[test]
@@ -1700,6 +1785,7 @@ mod tests {
                 eprintln!("iter {iter}");
             }
             let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+            let stats_q = producer.queue.clone();
             // Stash a snapshot of the queue's state every 100ms so the
             // watchdog has something to dump when it fires.
             let snap_q = producer.queue.clone();
@@ -1759,6 +1845,16 @@ mod tests {
             snap_done.store(true, Ordering::Release);
             snap_thread.join().unwrap();
             assert_eq!(sum, 10000);
+            // Quiesced: every waiter has finished, so the two counters
+            // are a consistent pair.
+            #[cfg(feature = "backstop-metrics")]
+            {
+                let stats = stats_q.backstop_stats();
+                if stats.saw_rescue() {
+                    eprintln!("iter {iter}: backstop rescue — {stats:?}");
+                }
+            }
+            drop(stats_q);
             progress.fetch_add(1, Ordering::Release);
         }
         test_done.store(true, Ordering::Release);
