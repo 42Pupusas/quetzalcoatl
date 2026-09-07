@@ -26,6 +26,7 @@ pub mod park_registry;
 pub mod progress_watchdog;
 pub mod seq_slot;
 pub mod single_parker;
+pub mod slot_sequence;
 pub mod sole_parker;
 pub mod thread_parker;
 pub mod uncommitted_slot;
@@ -38,6 +39,7 @@ pub use aligned_buf::AlignedBuf;
 pub use cache_padded::CachePadded;
 #[cfg(test)]
 pub use drop_counter::{BorrowedDropCounter, DropCounter};
-pub use seq_slot::{SeqSlot, SlotSnapshot, TOMBSTONE};
+pub use seq_slot::{SeqSlot, SlotSnapshot};
+pub use slot_sequence::SlotSequence;
 pub use uncommitted_slot::UncommittedSlot;
 pub use single_parker::{SingleParkerConsumer, SingleParkerConsumerRef, SingleParkerProducer};

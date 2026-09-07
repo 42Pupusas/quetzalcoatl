@@ -1,6 +1,6 @@
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
@@ -10,7 +10,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
-use crate::common::{UncommittedSlot, TOMBSTONE};
+use crate::common::{SlotSequence, UncommittedSlot};
 
 /// The producer side of an MPSC ring buffer.
 ///
@@ -91,7 +91,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     }
 
     #[inline]
-    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
+    fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &SlotSequence, usize)> {
         let mut current_tail = self.ring().cursors.tail().load(Ordering::Relaxed);
         let mut backoff = Backoff::new();
         loop {
@@ -130,7 +130,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         match self.claim_slot() {
             Some((data_ptr, slot_seq, pos)) => {
                 unsafe { (*data_ptr).write(val) };
-                slot_seq.store(pos * 2 + 1, Ordering::Release);
+                slot_seq.publish(pos);
                 self.ring().wake_consumer();
                 #[cfg(feature = "async")]
                 self.ring().wake_consumer_async();
@@ -272,7 +272,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             })
     }
 
-    fn claim_slot_block(&self) -> Option<(*mut MaybeUninit<T>, &AtomicUsize, usize)> {
+    fn claim_slot_block(&self) -> Option<(*mut MaybeUninit<T>, &SlotSequence, usize)> {
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
@@ -346,7 +346,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Producer<T, R> {
 /// Dropped without writing → slot is tombstoned (consumer skips it).
 pub struct SlotWriter<'a, T> {
     slot_data: *mut MaybeUninit<T>,
-    slot_seq: &'a AtomicUsize,
+    slot_seq: &'a SlotSequence,
     pos: usize,
     queue: &'a RingBuffer<T>,
 }
@@ -390,7 +390,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
+        self.slot_seq.publish(self.pos);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -400,7 +400,7 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        self.slot_seq.store(TOMBSTONE, Ordering::Release);
+        self.slot_seq.tombstone();
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -413,7 +413,7 @@ impl<T> Drop for SlotWriter<'_, T> {
 /// committing → value is dropped and slot is tombstoned.
 pub struct WrittenSlot<'a, T> {
     value: UncommittedSlot<T>,
-    slot_seq: &'a AtomicUsize,
+    slot_seq: &'a SlotSequence,
     pos: usize,
     queue: &'a RingBuffer<T>,
 }
@@ -432,7 +432,7 @@ impl<T> WrittenSlot<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.value.commit();
-        self.slot_seq.store(self.pos * 2 + 1, Ordering::Release);
+        self.slot_seq.publish(self.pos);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -442,7 +442,7 @@ impl<T> WrittenSlot<'_, T> {
 impl<T> Drop for WrittenSlot<'_, T> {
     fn drop(&mut self) {
         if self.value.drop_if_uncommitted() {
-            self.slot_seq.store(TOMBSTONE, Ordering::Release);
+            self.slot_seq.tombstone();
             self.queue.wake_consumer();
             #[cfg(feature = "async")]
             self.queue.wake_consumer_async();

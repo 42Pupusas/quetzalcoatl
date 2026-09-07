@@ -1,6 +1,6 @@
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
@@ -16,7 +16,7 @@ use crate::common::park_registration::{ParkSite, ParkedFuture};
 use crate::common::park_registry::ParkSlot;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::SlotSnapshot;
+use crate::common::{SlotSequence, SlotSnapshot};
 
 /// The consumer side of an MPSC ring buffer.
 ///
@@ -70,9 +70,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     fn release_tombstone(&self, head: usize) {
         let ring = self.ring();
-        ring.slot(head)
-            .sequence
-            .store((head + ring.capacity.get()) * 2, Ordering::Release);
+        ring.slot(head).sequence.release(head, ring.capacity);
         // SeqCst: as in `pop`, the store buffer must drain before the
         // wake path loads the park bitmap.
         ring.cursors.publish_head(head + 1);
@@ -101,8 +99,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // initialized and synchronized via the Acquire load inside it.
             let val = unsafe { (*data_ptr).assume_init_read() };
 
-            slot.sequence
-                .store((head + self.ring().capacity.get()) * 2, Ordering::Release);
+            slot.sequence.release(head, self.ring().capacity);
 
             // SeqCst (not Release): `xchg` drains the store buffer,
             // publishing this store and the `sequence` store above
@@ -166,8 +163,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    slot.sequence
-                        .store((head + ring.capacity.get()) * 2, Ordering::Release);
+                    slot.sequence.release(head, ring.capacity);
                     batch.skip();
                     continue;
                 }
@@ -178,8 +174,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // SAFETY: classify() returned Ready.
             let val = unsafe { (*data_ptr).assume_init_read() };
 
-            slot.sequence
-                .store((head + ring.capacity.get()) * 2, Ordering::Release);
+            slot.sequence.release(head, ring.capacity);
 
             batch.take();
             f(val);
@@ -204,8 +199,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
             let data_ptr = match slot.classify(head) {
                 SlotSnapshot::Tombstoned => {
-                    slot.sequence
-                        .store((head + ring.capacity.get()) * 2, Ordering::Release);
+                    slot.sequence.release(head, ring.capacity);
                     batch.skip();
                     continue;
                 }
@@ -216,8 +210,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // SAFETY: classify() returned Ready.
             let val = unsafe { (*data_ptr).assume_init_read() };
 
-            slot.sequence
-                .store((head + ring.capacity.get()) * 2, Ordering::Release);
+            slot.sequence.release(head, ring.capacity);
 
             batch.take();
             f(val);
@@ -368,7 +361,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
 /// the sequence number, and advances the head pointer.
 pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     data_ptr: *const MaybeUninit<T>,
-    seq_ptr: *const AtomicUsize,
+    seq_ptr: *const SlotSequence,
     consumer: &'a mut Consumer<T, R>,
     head: usize,
 }

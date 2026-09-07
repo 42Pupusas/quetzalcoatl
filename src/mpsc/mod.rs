@@ -44,9 +44,6 @@ use crate::common::cursors::Cursors;
 use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, SeqSlot};
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 /// A lock-free MPSC ring buffer.
@@ -105,10 +102,7 @@ impl<T> RingBuffer<T> {
         let cap = capacity.get();
         let mut idx = 0usize;
         let buf = AlignedBuf::new_with(cap, || {
-            let slot = SeqSlot {
-                data: UnsafeCell::new(MaybeUninit::uninit()),
-                sequence: AtomicUsize::new(idx * 2),
-            };
+            let slot = SeqSlot::free_at(idx);
             idx += 1;
             slot
         });
@@ -288,18 +282,7 @@ impl<T> RingBuffer<T> {
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
         for pos in self.cursors.occupied() {
-            let slot = &mut self.buf[self.capacity.index_of(pos)];
-            let seq = *slot.sequence.get_mut();
-            // Skip tombstoned slots (abandoned reservations) and slots
-            // that were claimed but never had their sequence published.
-            if seq == pos * 2 + 1 {
-                // SAFETY: sequence == pos * 2 + 1 means this slot was
-                // published with valid data. Exclusive access in drop
-                // (&mut self) guarantees no concurrency.
-                unsafe {
-                    slot.data.get().cast::<T>().drop_in_place();
-                }
-            }
+            self.buf[self.capacity.index_of(pos)].drop_value_at(pos);
         }
     }
 }
@@ -2063,6 +2046,10 @@ mod tests {
     /// drops the first waker, stranding that future.
     #[test]
     #[cfg(feature = "async")]
+    #[cfg_attr(
+        miri,
+        ignore = "waits on a wall-clock deadline while a tokio runtime and three threads share one interpreted core; the budget expires from scheduling, not from a stranded future"
+    )]
     fn two_async_pushes_from_one_handle_both_complete() {
         use std::rc::Rc;
         use std::time::{Duration, Instant};

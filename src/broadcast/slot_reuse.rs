@@ -59,11 +59,13 @@ mod tests {
     }
 
     #[test]
-    fn published_or_tombstoned_occupant_permits_reuse() {
+    fn published_or_abandoned_occupant_permits_reuse() {
+        use super::super::slot_state::SlotState;
+
         let reuse = SlotReuse::new(4);
-        let published = AtomicUsize::new(1);
+        let published = AtomicUsize::new(SlotState::published_word(0));
         assert!(reuse.prior_occupant_resolved(4, &published));
-        let tombstoned = AtomicUsize::new(crate::common::TOMBSTONE);
-        assert!(reuse.prior_occupant_resolved(4, &tombstoned));
+        let abandoned = AtomicUsize::new(SlotState::abandoned_word(0));
+        assert!(reuse.prior_occupant_resolved(4, &abandoned));
     }
 }

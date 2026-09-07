@@ -1,8 +1,7 @@
 //! Unwind-safe release of a consumed MPSC slot.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use super::RingBuffer;
+use crate::common::SlotSequence;
 
 /// Owns the obligation to hand one consumed slot back to the producers.
 ///
@@ -24,7 +23,7 @@ use super::RingBuffer;
 /// normal one.
 pub(super) struct SlotRelease<'a, T> {
     ring: &'a RingBuffer<T>,
-    seq: &'a AtomicUsize,
+    seq: &'a SlotSequence,
     head: usize,
 }
 
@@ -33,15 +32,14 @@ impl<'a, T> SlotRelease<'a, T> {
     ///
     /// Construct this *before* any code that might panic — the value's
     /// destructor, in particular.
-    pub(super) const fn new(ring: &'a RingBuffer<T>, seq: &'a AtomicUsize, head: usize) -> Self {
+    pub(super) const fn new(ring: &'a RingBuffer<T>, seq: &'a SlotSequence, head: usize) -> Self {
         Self { ring, seq, head }
     }
 }
 
 impl<T> Drop for SlotRelease<'_, T> {
     fn drop(&mut self) {
-        self.seq
-            .store((self.head + self.ring.capacity.get()) * 2, Ordering::Release);
+        self.seq.release(self.head, self.ring.capacity);
         // SeqCst: see Consumer::pop. The `xchg` drains the store buffer,
         // publishing the sequence store above before the bitmap load
         // inside `wake_one_published`.

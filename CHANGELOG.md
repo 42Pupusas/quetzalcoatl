@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The published crate could not be compiled.** `Cargo.toml`'s
+  `include` listed `src/common` file by file, and nine modules declared
+  in `common/mod.rs` were missing from it, so the 0.14.0 tarball failed
+  with nine `file not found for module` errors. Every source directory
+  is now matched by glob. `cargo package` reproduces the failure and
+  verifies the fix, since it builds the tarball it produces.
+
 ### Changed
+- **`SlotSequence` owns the MPSC slot's sequence word.** The word
+  encodes free (`pos * 2`), published (`pos * 2 + 1`) and abandoned
+  (`TOMBSTONE`), and each writer open-coded the arithmetic: the release
+  transition `(head + capacity) * 2` appeared at seven call sites
+  across three modules, each restating that consuming `head` frees the
+  slot for `head + capacity`.
+
+  Writers now go through `publish`, `tombstone`, `release` and
+  `free_at`, and holders carry a `&SlotSequence` rather than a bare
+  `&AtomicUsize` — which is what let the encoding leak in the first
+  place. `TOMBSTONE` is no longer referenced outside the module that
+  defines it.
+
 - **`UncommittedSlot` owns the written-but-unpublished value.** Between
   `write` and `commit` a producer holds an initialized value no
   consumer can reach. All five rings tracked that with a `committed:
