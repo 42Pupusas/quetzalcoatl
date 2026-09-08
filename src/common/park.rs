@@ -268,6 +268,36 @@ impl WakeSet {
         self.wake.fetch_and(!slot.mask(), Ordering::Relaxed);
     }
 
+    /// Watches `slot`'s handle for up to `limit`, reporting whether a
+    /// waker claimed it.
+    ///
+    /// Diagnostic. Only a waker claims a handle, and it unparks the
+    /// thread in the same call, so a handle that goes unarmed while
+    /// its owner is still watching proves a wake was delivered —
+    /// late, but delivered. A handle still armed at the end of the
+    /// window had no waker coming for it in that time.
+    ///
+    /// The unpark that follows the claim lands as a token on a thread
+    /// that is not parked; the caller must drain it so the next park
+    /// does not return on it.
+    #[cfg(feature = "backstop-metrics")]
+    #[must_use]
+    pub fn handle_claimed_within(&self, slot: ParkSlot, limit: std::time::Duration) -> bool {
+        if !slot.is_leased() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if !self.is_armed(slot) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// How many waiters *other* than `slot` are parked right now.
     ///
     /// Diagnostic: [`wake_one`](Self::wake_one) serves one slot per

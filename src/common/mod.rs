@@ -30,6 +30,8 @@ pub mod seq_slot;
 pub mod single_parker;
 pub mod slot_sequence;
 pub mod sole_parker;
+#[cfg(test)]
+pub mod stress_iters;
 pub mod thread_parker;
 pub mod uncommitted_slot;
 #[cfg(feature = "async")]

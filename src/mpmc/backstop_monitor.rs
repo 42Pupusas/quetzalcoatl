@@ -89,7 +89,7 @@
 //! bodies, and [`RingBuffer`](super::RingBuffer) carries no counters.
 
 #[cfg(feature = "backstop-metrics")]
-use super::rescue_evidence::{RescueEvidence, RescueExplanation};
+use super::rescue_evidence::{RescueEvidence, RescueExplanation, RescueTiming};
 #[cfg(feature = "backstop-metrics")]
 use crate::common::park_registry::ParkSlot;
 #[cfg(feature = "backstop-metrics")]
@@ -108,6 +108,58 @@ pub struct BackstopStats {
     /// Rescues where no other waiter was parked on this side, so
     /// round-robin cannot explain the wake going elsewhere.
     pub sole_waiter_rescues: u64,
+    /// Sole-waiter rescues suffered by producers specifically.
+    ///
+    /// The two sides park on different conditions and are woken by
+    /// different releases, so a lost wake on one says nothing about
+    /// the other. A consumer's rescue is a published item it failed
+    /// to find; a producer's is a freed position it was not told
+    /// about. Attributing the residual to a side is what makes a
+    /// candidate mechanism testable.
+    pub producer_sole_waiter_rescues: u64,
+    /// Sole-waiter rescues where work was already visible to the
+    /// waiter when it parked.
+    ///
+    /// These are not lost wakes. The publish preceded the arm, so no
+    /// wake was owed; the waiter's own pre-park re-check is what
+    /// failed to find the item, and the timeout is what finally did.
+    /// From the waiter's side the two are identical — untouched bit,
+    /// work waiting — which is why the pre-park sample is needed to
+    /// separate them.
+    ///
+    /// The complement,
+    /// [`unexplained_sole_waiter_rescues`](Self::unexplained_sole_waiter_rescues),
+    /// is the residual that a lost wake would have to be found in.
+    pub blind_sole_waiter_rescues: u64,
+    /// Sole-waiter rescues where work was *not* visible the instant
+    /// the park returned.
+    ///
+    /// The timeout did not rescue these; the work arrived in the gap
+    /// between the sleep ending and the next attempt, and the rescue
+    /// count attributes it to the timeout only because that is what
+    /// preceded it. Not a lost wake: nothing was there to be woken
+    /// for while the waiter slept.
+    pub late_sole_waiter_rescues: u64,
+    /// Sole-waiter rescues where work was absent before the sleep
+    /// and present the instant it ended.
+    ///
+    /// The item was published while the waiter slept, and the waiter
+    /// was not woken for it. With an untouched bit and no peer to
+    /// have absorbed the wake, this is the signature of a wake that
+    /// went missing, and the only timing a delivery defect can
+    /// produce. This is the count to explain.
+    pub waiting_sole_waiter_rescues: u64,
+    /// Parks that returned on the clock looking like the residual —
+    /// untouched bit, work waiting, nobody else parked — whose handle
+    /// a waker then claimed within [`LATE_WAKE_GRACE`].
+    ///
+    /// The wake was coming; the clock beat it. The publisher was
+    /// between publishing and waking when the timeout fired, which
+    /// is a window of a few hundred instructions unless the
+    /// publisher is descheduled inside it. These are re-sampled
+    /// after the grace and counted as woken, so they leave the
+    /// rescue counts. Reported so the size of the window is known.
+    pub wakes_arriving_after_timeout: u64,
     /// Sole-waiter rescues where the waiter's wake bit had been
     /// cleared but no unpark ever arrived.
     ///
@@ -183,7 +235,45 @@ pub struct BackstopStats {
 }
 
 #[cfg(feature = "backstop-metrics")]
+impl std::ops::AddAssign for BackstopStats {
+    fn add_assign(&mut self, other: Self) {
+        self.unwoken_timeouts += other.unwoken_timeouts;
+        self.rescues += other.rescues;
+        self.sole_waiter_rescues += other.sole_waiter_rescues;
+        self.producer_sole_waiter_rescues += other.producer_sole_waiter_rescues;
+        self.blind_sole_waiter_rescues += other.blind_sole_waiter_rescues;
+        self.late_sole_waiter_rescues += other.late_sole_waiter_rescues;
+        self.waiting_sole_waiter_rescues += other.waiting_sole_waiter_rescues;
+        self.wakes_arriving_after_timeout += other.wakes_arriving_after_timeout;
+        self.bit_taken_rescues += other.bit_taken_rescues;
+        self.slotless_rescues += other.slotless_rescues;
+        self.blind_futile_wakes += other.blind_futile_wakes;
+        self.producer_blind_futile_wakes += other.producer_blind_futile_wakes;
+        self.producer_futile_wakes += other.producer_futile_wakes;
+        self.futile_wakes += other.futile_wakes;
+    }
+}
+
+#[cfg(feature = "backstop-metrics")]
 impl BackstopStats {
+    /// The all-zero reading, for accumulating across rings.
+    pub const ZERO: Self = Self {
+        unwoken_timeouts: 0,
+        rescues: 0,
+        sole_waiter_rescues: 0,
+        producer_sole_waiter_rescues: 0,
+        blind_sole_waiter_rescues: 0,
+        late_sole_waiter_rescues: 0,
+        waiting_sole_waiter_rescues: 0,
+        wakes_arriving_after_timeout: 0,
+        bit_taken_rescues: 0,
+        slotless_rescues: 0,
+        blind_futile_wakes: 0,
+        producer_blind_futile_wakes: 0,
+        producer_futile_wakes: 0,
+        futile_wakes: 0,
+    };
+
     /// Whether the backstop ever released a waiter that had work
     /// available — the signature of a wake that went missing.
     #[must_use]
@@ -197,6 +287,27 @@ impl BackstopStats {
     #[must_use]
     pub const fn saw_unexplained_rescue(self) -> bool {
         self.sole_waiter_rescues > 0
+    }
+
+    /// Sole-waiter rescues suffered by consumers.
+    #[must_use]
+    pub const fn consumer_sole_waiter_rescues(self) -> u64 {
+        self.sole_waiter_rescues
+            .saturating_sub(self.producer_sole_waiter_rescues)
+    }
+
+    /// The residual a lost wake would have to be found in: sole-waiter
+    /// rescues that were neither blind nor late.
+    ///
+    /// Both subtractions are sound where the bit-taken one was not.
+    /// Blindness is diagnosed from the waiter's *own* failed re-check,
+    /// before any peer is involved; lateness from the work being
+    /// absent when the sleep ended. Neither can be confused with a
+    /// peer's wake going missing, because in neither was a wake owed
+    /// during the sleep.
+    #[must_use]
+    pub const fn unexplained_sole_waiter_rescues(self) -> u64 {
+        self.waiting_sole_waiter_rescues
     }
 
     /// Sole-waiter rescues where nobody had even taken the wake bit.
@@ -234,6 +345,11 @@ pub struct BackstopMonitor {
     unwoken_timeouts: AtomicU64,
     rescues: AtomicU64,
     sole_waiter_rescues: AtomicU64,
+    producer_sole_waiter_rescues: AtomicU64,
+    blind_sole_waiter_rescues: AtomicU64,
+    late_sole_waiter_rescues: AtomicU64,
+    waiting_sole_waiter_rescues: AtomicU64,
+    wakes_arriving_after_timeout: AtomicU64,
     bit_taken_rescues: AtomicU64,
     slotless_rescues: AtomicU64,
     futile_wakes: AtomicU64,
@@ -261,6 +377,11 @@ impl BackstopMonitor {
             unwoken_timeouts: AtomicU64::new(0),
             rescues: AtomicU64::new(0),
             sole_waiter_rescues: AtomicU64::new(0),
+            producer_sole_waiter_rescues: AtomicU64::new(0),
+            blind_sole_waiter_rescues: AtomicU64::new(0),
+            late_sole_waiter_rescues: AtomicU64::new(0),
+            waiting_sole_waiter_rescues: AtomicU64::new(0),
+            wakes_arriving_after_timeout: AtomicU64::new(0),
             bit_taken_rescues: AtomicU64::new(0),
             slotless_rescues: AtomicU64::new(0),
             futile_wakes: AtomicU64::new(0),
@@ -274,7 +395,12 @@ impl BackstopMonitor {
         self.unwoken_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_rescue(&self, evidence: RescueEvidence) {
+    fn record_late_wake(&self) {
+        self.wakes_arriving_after_timeout
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rescue(&self, side: WaiterSide, evidence: RescueEvidence) {
         self.rescues.fetch_add(1, Ordering::Relaxed);
         if matches!(evidence.explanation(), RescueExplanation::Slotless) {
             self.slotless_rescues.fetch_add(1, Ordering::Relaxed);
@@ -284,6 +410,16 @@ impl BackstopMonitor {
             return;
         }
         self.sole_waiter_rescues.fetch_add(1, Ordering::Relaxed);
+        if matches!(side, WaiterSide::Producer) {
+            self.producer_sole_waiter_rescues
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let timing_counter = match evidence.timing() {
+            RescueTiming::Blind => &self.blind_sole_waiter_rescues,
+            RescueTiming::Late => &self.late_sole_waiter_rescues,
+            RescueTiming::Waiting => &self.waiting_sole_waiter_rescues,
+        };
+        timing_counter.fetch_add(1, Ordering::Relaxed);
         if matches!(evidence.explanation(), RescueExplanation::BitTaken) {
             self.bit_taken_rescues.fetch_add(1, Ordering::Relaxed);
         }
@@ -313,6 +449,21 @@ impl BackstopMonitor {
             unwoken_timeouts: self.unwoken_timeouts.load(Ordering::Relaxed),
             rescues: self.rescues.load(Ordering::Relaxed),
             sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
+            producer_sole_waiter_rescues: self
+                .producer_sole_waiter_rescues
+                .load(Ordering::Relaxed),
+            blind_sole_waiter_rescues: self
+                .blind_sole_waiter_rescues
+                .load(Ordering::Relaxed),
+            late_sole_waiter_rescues: self
+                .late_sole_waiter_rescues
+                .load(Ordering::Relaxed),
+            waiting_sole_waiter_rescues: self
+                .waiting_sole_waiter_rescues
+                .load(Ordering::Relaxed),
+            wakes_arriving_after_timeout: self
+                .wakes_arriving_after_timeout
+                .load(Ordering::Relaxed),
             bit_taken_rescues: self.bit_taken_rescues.load(Ordering::Relaxed),
             slotless_rescues: self.slotless_rescues.load(Ordering::Relaxed),
             futile_wakes: self.futile_wakes.load(Ordering::Relaxed),
@@ -331,6 +482,18 @@ impl Default for BackstopMonitor {
         Self::new()
     }
 }
+
+/// How long a park that looks like the residual waits for a wake
+/// that may be a few instructions behind the clock.
+///
+/// A publisher stores the item, then loads the wake bitmap and
+/// unparks. A timeout firing between those two steps finds the
+/// item present and the bit untouched — the residual's exact
+/// signature — with the wake nanoseconds away. The grace is long
+/// enough to cover a publisher descheduled inside that window on a
+/// loaded box; a wake that has not arrived by then was not coming.
+#[cfg(feature = "backstop-metrics")]
+pub const LATE_WAKE_GRACE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Tracks one waiter's park loop, attributing a rescue to the timeout
 /// that preceded it.
@@ -382,29 +545,56 @@ impl BackstopWatch {
         if std::mem::replace(&mut self.woken, false) {
             self.monitor().record_futile_wake(self.side, work_visible);
         }
-        self.evidence.about_to_park(peers_parked);
+        self.evidence.about_to_park(peers_parked, work_visible);
     }
 
     /// Records how the park that just returned ended, reading the
     /// waiter's state out of `set` itself.
     ///
+    /// `work_visible` is consulted only when the park ended on the
+    /// timeout: it is the return-time half of the timing bracket, and
+    /// a delivered wake has no rescue to time. Keeping it a closure
+    /// spares the woken path a scan of the ring.
+    ///
     /// Sampling here rather than at the call site keeps
     /// [`WakeDelivery`] out of the uninstrumented build, where the
     /// no-op twin takes the same arguments and does nothing.
-    pub(crate) fn parked_at(&mut self, set: &crate::common::park::WakeSet, slot: ParkSlot) {
-        self.parked(WakeDelivery::sample(set, slot), set.others_parked(slot));
+    pub(crate) fn parked_at(
+        &mut self,
+        set: &crate::common::park::WakeSet,
+        slot: ParkSlot,
+        work_visible: impl FnOnce() -> bool,
+    ) {
+        let mut delivery = WakeDelivery::sample(set, slot);
+        let work = delivery.is_unwoken() && work_visible();
+        let peers = set.others_parked(slot);
+        if delivery == WakeDelivery::Untouched
+            && work
+            && peers == 0
+            && !self.evidence.was_blind()
+            && set.handle_claimed_within(slot, LATE_WAKE_GRACE)
+        {
+            self.monitor().record_late_wake();
+            // The claim's unpark landed as a token on this thread,
+            // which is not parked; drain it so the next park does
+            // not return on it and read as a spurious timeout.
+            std::thread::park_timeout(std::time::Duration::ZERO);
+            delivery = WakeDelivery::sample(set, slot);
+        }
+        self.parked(delivery, peers, work);
     }
 
     /// Records how the park that just returned ended. `delivery` says
     /// whether a peer's unpark reached us, was in flight, or had not
     /// begun; `peers_parked` is how many other waiters on this side
     /// were parked, which is what round-robin could have served
-    /// instead of us.
-    fn parked(&mut self, delivery: WakeDelivery, peers_parked: u32) {
+    /// instead of us; `work_visible` is whether the ring held work
+    /// the instant the park returned.
+    fn parked(&mut self, delivery: WakeDelivery, peers_parked: u32, work_visible: bool) {
         let unwoken = delivery.is_unwoken();
         self.timed_out = unwoken;
         self.woken = !unwoken;
-        self.evidence.parked(delivery, peers_parked);
+        self.evidence.parked(delivery, peers_parked, work_visible);
         if unwoken {
             self.monitor().record_timeout();
         }
@@ -416,7 +606,7 @@ impl BackstopWatch {
         self.woken = false;
         let evidence = self.evidence.take();
         if std::mem::replace(&mut self.timed_out, false) {
-            self.monitor().record_rescue(evidence);
+            self.monitor().record_rescue(self.side, evidence);
         }
     }
 }
@@ -454,7 +644,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Delivered, 0);
+        watch.parked(WakeDelivery::Delivered, 0, false);
         watch.about_to_park(0, true);
 
         let stats = cycle.monitor.stats();
@@ -471,7 +661,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Delivered, 0);
+        watch.parked(WakeDelivery::Delivered, 0, false);
         watch.about_to_park(0, false);
 
         let stats = cycle.monitor.stats();
@@ -491,7 +681,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Untouched, 0);
+        watch.parked(WakeDelivery::Untouched, 0, true);
         watch.about_to_park(0, true);
 
         let stats = cycle.monitor.stats();
@@ -512,7 +702,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Producer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Delivered, 0);
+        watch.parked(WakeDelivery::Delivered, 0, false);
         watch.made_progress();
         watch.about_to_park(0, true);
 
@@ -530,7 +720,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::InFlight, 0);
+        watch.parked(WakeDelivery::InFlight, 0, true);
         watch.made_progress();
 
         let stats = cycle.monitor.stats();
@@ -552,7 +742,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Untouched, 0);
+        watch.parked(WakeDelivery::Untouched, 0, true);
         watch.made_progress();
 
         let stats = cycle.monitor.stats();
@@ -574,7 +764,7 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Slotless, 0);
+        watch.parked(WakeDelivery::Slotless, 0, true);
         watch.made_progress();
 
         let stats = cycle.monitor.stats();
@@ -597,14 +787,200 @@ mod tests {
         let mut watch = cycle.watch(WaiterSide::Consumer);
 
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::InFlight, 0);
+        watch.parked(WakeDelivery::InFlight, 0, true);
         watch.about_to_park(0, false);
-        watch.parked(WakeDelivery::Untouched, 0);
+        watch.parked(WakeDelivery::Untouched, 0, true);
         watch.made_progress();
 
         let stats = cycle.monitor.stats();
         assert_eq!(stats.sole_waiter_rescues, 1);
         assert_eq!(stats.bit_taken_rescues, 1, "{stats:?}");
+    }
+
+    /// A waiter that parks with work already visible was not owed a
+    /// wake, so its rescue is explained without one going missing.
+    /// It stays in the raw sole-waiter count and leaves the
+    /// unexplained residual.
+    #[test]
+    fn a_sole_waiter_that_parked_blind_is_an_explained_rescue() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, true);
+        watch.parked(WakeDelivery::Untouched, 0, true);
+        watch.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.sole_waiter_rescues, 1);
+        assert_eq!(stats.blind_sole_waiter_rescues, 1, "{stats:?}");
+        assert_eq!(
+            stats.unexplained_sole_waiter_rescues(),
+            0,
+            "the item was there before the park; no wake was owed: {stats:?}"
+        );
+    }
+
+    /// Nothing before the sleep, work the instant it ended, nobody
+    /// else parked, bit untouched: every benign explanation is ruled
+    /// out, and this is the residual.
+    #[test]
+    fn a_sole_waiter_whose_work_arrived_during_the_sleep_is_unexplained() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, false);
+        watch.parked(WakeDelivery::Untouched, 0, true);
+        watch.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.blind_sole_waiter_rescues, 0);
+        assert_eq!(stats.late_sole_waiter_rescues, 0);
+        assert_eq!(stats.waiting_sole_waiter_rescues, 1, "{stats:?}");
+        assert_eq!(stats.unexplained_sole_waiter_rescues(), 1, "{stats:?}");
+    }
+
+    /// Work absent when the park returned: the timeout preceded the
+    /// work rather than rescuing the waiter from it. Still counted as
+    /// a rescue and a sole-waiter one, but explained.
+    #[test]
+    fn a_sole_waiter_whose_work_arrived_after_the_park_is_explained() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+
+        watch.about_to_park(0, false);
+        watch.parked(WakeDelivery::Untouched, 0, false);
+        watch.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.sole_waiter_rescues, 1);
+        assert_eq!(stats.late_sole_waiter_rescues, 1, "{stats:?}");
+        assert_eq!(
+            stats.unexplained_sole_waiter_rescues(),
+            0,
+            "nothing was there while the waiter slept: {stats:?}"
+        );
+    }
+
+    /// The return-time sample is only taken when the park ended on
+    /// the clock: a delivered wake has no rescue to time, and the
+    /// closure is the cost of a ring scan.
+    #[test]
+    fn a_delivered_wake_does_not_sample_the_ring() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+        let set = crate::common::park::WakeSet::new();
+        let slot = crate::common::park_registry::ParkSlot::Leased(0);
+        set.arm(slot);
+        set.wake_one();
+
+        watch.about_to_park(0, false);
+        watch.parked_at(&set, slot, || panic!("a woken waiter must not pay for the sample"));
+    }
+
+    /// A publisher caught between publish and wake by the timeout
+    /// delivers its wake a moment later. The grace catches it, and
+    /// the park is recorded as woken rather than as the residual.
+    #[test]
+    fn a_wake_arriving_within_the_grace_is_not_a_rescue() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+        let set = std::sync::Arc::new(crate::common::park::WakeSet::new());
+        let slot = crate::common::park_registry::ParkSlot::Leased(0);
+        set.arm(slot);
+
+        let late_waker = {
+            let set = std::sync::Arc::clone(&set);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                set.wake_one();
+            })
+        };
+
+        watch.about_to_park(0, false);
+        watch.parked_at(&set, slot, || true);
+        watch.made_progress();
+        late_waker.join().unwrap();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.wakes_arriving_after_timeout, 1, "{stats:?}");
+        assert_eq!(
+            stats.waiting_sole_waiter_rescues, 0,
+            "the wake was in flight; the clock merely beat it: {stats:?}"
+        );
+        assert_eq!(stats.rescues, 0, "{stats:?}");
+    }
+
+    /// The grace must not invent a wake: with nobody coming, the park
+    /// stays a residual rescue.
+    #[test]
+    fn a_wake_that_never_arrives_is_still_the_residual() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+        let set = crate::common::park::WakeSet::new();
+        let slot = crate::common::park_registry::ParkSlot::Leased(0);
+        set.arm(slot);
+
+        watch.about_to_park(0, false);
+        watch.parked_at(&set, slot, || true);
+        watch.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.wakes_arriving_after_timeout, 0, "{stats:?}");
+        assert_eq!(stats.waiting_sole_waiter_rescues, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn an_unwoken_timeout_samples_the_ring_at_return() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Consumer);
+        let set = crate::common::park::WakeSet::new();
+        let slot = crate::common::park_registry::ParkSlot::Leased(0);
+        set.arm(slot);
+
+        watch.about_to_park(0, false);
+        watch.parked_at(&set, slot, || true);
+        watch.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.waiting_sole_waiter_rescues, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn readings_sum_field_by_field() {
+        let cycle = Cycle::new();
+        let mut watch = cycle.watch(WaiterSide::Producer);
+        watch.about_to_park(0, false);
+        watch.parked(WakeDelivery::Untouched, 0, true);
+        watch.made_progress();
+        let one = cycle.monitor.stats();
+
+        let mut total = super::BackstopStats::ZERO;
+        total += one;
+        total += one;
+
+        assert_eq!(total.rescues, 2);
+        assert_eq!(total.sole_waiter_rescues, 2);
+        assert_eq!(total.producer_sole_waiter_rescues, 2);
+        assert_eq!(total.unwoken_timeouts, 2);
+    }
+
+    #[test]
+    fn a_sole_waiter_rescue_is_attributed_to_its_side() {
+        let cycle = Cycle::new();
+        let mut producer = cycle.watch(WaiterSide::Producer);
+        producer.about_to_park(0, false);
+        producer.parked(WakeDelivery::Untouched, 0, true);
+        producer.made_progress();
+
+        let mut consumer = cycle.watch(WaiterSide::Consumer);
+        consumer.about_to_park(0, false);
+        consumer.parked(WakeDelivery::Untouched, 0, true);
+        consumer.made_progress();
+
+        let stats = cycle.monitor.stats();
+        assert_eq!(stats.sole_waiter_rescues, 2);
+        assert_eq!(stats.producer_sole_waiter_rescues, 1, "{stats:?}");
+        assert_eq!(stats.consumer_sole_waiter_rescues(), 1, "{stats:?}");
     }
 
     /// The side split and the blindness split are independent axes.
@@ -613,12 +989,12 @@ mod tests {
         let cycle = Cycle::new();
         let mut producer = cycle.watch(WaiterSide::Producer);
         producer.about_to_park(0, false);
-        producer.parked(WakeDelivery::Delivered, 0);
+        producer.parked(WakeDelivery::Delivered, 0, false);
         producer.about_to_park(0, true);
 
         let mut consumer = cycle.watch(WaiterSide::Consumer);
         consumer.about_to_park(0, false);
-        consumer.parked(WakeDelivery::Delivered, 0);
+        consumer.parked(WakeDelivery::Delivered, 0, false);
         consumer.about_to_park(0, true);
 
         let stats = cycle.monitor.stats();
@@ -649,12 +1025,12 @@ impl BackstopWatch {
     #[inline]
     pub(crate) const fn about_to_park(&mut self, _peers_parked: u32, _work_visible: bool) {}
 
-
     #[inline]
-    pub(crate) const fn parked_at(
+    pub(crate) fn parked_at(
         &mut self,
         _set: &crate::common::park::WakeSet,
         _slot: crate::common::park_registry::ParkSlot,
+        _work_visible: impl FnOnce() -> bool,
     ) {
     }
 

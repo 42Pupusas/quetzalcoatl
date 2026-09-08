@@ -361,16 +361,30 @@ The two quantities were conflated: how far to jump clear of a contended
 cache line, and how much of a bounded search that costs. A jump is only
 meaningful modulo the ring — 128 positions on a ring of 16 lands back
 on the same slot. [`ScanBudget`](src/mpmc/scan_budget.rs) now owns
-both, clamping the skip to `cap - 1` so a jump stays large in position
-where the ring is large, and can never end the lap on its own. The
-defect is pinned by a unit test that fails against the old arithmetic
-and passes against the new one.
+both.
 
-**It did not reduce blind futile wakes.** Baseline 4, fixed 6 and 9 —
-noise, in a metric with a known false-positive mode (below). The fix is
-kept because the unit test proves the arithmetic was wrong, not because
-the stress numbers improved. Whatever produces the blind wakes is
-something else.
+**The first fix was off by one and did not fix it.** It clamped the
+skip to `cap - 1` and charged that against the lap, and the call site
+then charged one more for the step every examined position pays. On
+the stress ring that is 15 + 1 = 16: a single lost CAS still ended the
+lap. This is why "it did not reduce blind futile wakes" was the result
+— the fix had not engaged. The unit test that pinned the first version
+passed because it checked the skip alone, not the skip followed by the
+step the caller always makes.
+
+The corrected accounting charges a lost CAS **one examination**,
+whichever distance it jumps: the lap bounds the search in slots looked
+at, and a lost CAS is one slot looked at. The jump is still clamped to
+`cap - 1`, which is coprime with the power-of-two capacity, so a lap
+of lost CASes walks every slot rather than the one it lost. The call
+site no longer steps after a skip. Tests now cover the lap surviving
+`cap - 1` lost CASes and ending on the `cap`th, and the clamped walk
+visiting every slot.
+
+With that in place the blind rate over 2000-iteration campaigns is
+21–36 per 2000, against a futile total of ~750–830, and the
+*sole-waiter* rescues split by timing (next section) show `blind=0` in
+every campaign. The scan defect is no longer producing the residual.
 
 ### What the blind-futile counter can and cannot say
 
@@ -396,6 +410,69 @@ gave `producer_blind` of 0, 0 and 0 — but a fourth produced a single
 one, so "only consumers can be blind" is false and the mechanism is not
 exclusive to the scan.
 
+### The residual, bracketed and explained
+
+The harness no longer aborts on a sole-waiter rescue; it accumulates
+`BackstopStats` across iterations and prints totals, and
+`QUETZALCOATL_STRESS_ITERS` scales it up. 2000 iterations is ~200 s in
+release and is the campaign size below.
+
+**Rate.** Before the changes in this section: 3, 5 and 7 sole-waiter
+rescues per 2000 iterations, on 51–116 unwoken timeouts. Both sides
+produce them (producer 0–3, consumer 2–5 per campaign).
+
+**When the work arrived.** A rescue is "timeout, then work found". That
+says nothing about *when* the work appeared, so two samples now bracket
+the sleep — one just before the park, one the instant it returns — and
+[`RescueTiming`](src/mpmc/rescue_evidence.rs) names the three answers:
+
+- *Blind*: visible before the park. The pre-park re-check missed it; no
+  wake was owed. A scan defect.
+- *Late*: not visible when the park returned. The work arrived after the
+  sleep ended; the timeout rescued nothing and merely preceded it.
+- *Waiting*: absent before, present at return. Published during the
+  sleep, and the waiter was not woken for it. This is the only timing a
+  lost wake can produce.
+
+The first bracketed campaign: `blind=0 late=4 waiting=3`. Blind is
+zero, so the scan is not the residual. Late is the majority, and those
+are not lost wakes. `waiting=3` is what remained to explain.
+
+**Waiting, explained.** A publisher stores the item, then loads the
+wake bitmap and unparks. A timeout that fires between those two steps
+finds the item present and the bit untouched — the exact `Waiting`
+signature — with the wake nanoseconds away. The instrument now holds a
+park that matches the residual's signature for a
+[`LATE_WAKE_GRACE`](src/mpmc/backstop_monitor.rs) of 5 ms, watching
+for a waker to claim its handle. A claim within the grace proves the
+wake was in flight; the clock beat it. Two calibration tests pin the
+grace both ways: a 200 µs-late waker is caught, and a wake that never
+comes is still counted as the residual.
+
+Two 2000-iteration campaigns with the grace in place:
+
+| | sole | blind | late | waiting | wakes after timeout | unwoken timeouts |
+|---|---|---|---|---|---|---|
+| run 1 | 3 | 0 | 3 | **0** | 9 | 141 |
+| run 2 | 0 | 0 | 0 | **0** | 4 | 100 |
+
+Every park that matched the residual's signature received its wake
+inside the grace — 13 of 13. `waiting` is zero in both.
+
+**What this does and does not establish.** The sole-waiter rescues
+seen in 4000 iterations are all accounted for by benign timing: the
+work arrived after the park returned, or the wake was in flight when
+the clock fired. No park in this campaign was left asleep on work with
+no wake coming. That is the evidence `PARK_BACKSTOP` was waiting for,
+for this harness on this host, and it is stated as such. It is not a
+proof for other shapes: the harness is 2×2 on a 16-slot ring, and the
+grace-catch counter reads 4–9 per 2000 on this box, so a host that
+deschedules publishers for longer than 5 ms between publish and wake
+would need a longer grace before its `waiting` count meant anything.
+The instrument stays, the counters stay gated, and the harness prints
+rather than asserts — a non-zero `waiting` in a future campaign is the
+signal, and it now has one benign explanation fewer to hide behind.
+
 ## Checks completed on HEAD
 
 - Default workspace tests: 493 passed, 43 ignored; 15 doctests passed.
@@ -417,8 +494,9 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
-7. **Find out what the consumer *blind* futile wakes are.** Asking this question found and fixed one real defect — a lost CAS could exhaust the whole lap budget (see "The scan budget a single lost CAS could exhaust") — but fixing it did not move the count, so the cause is elsewhere. What is now known: blind futile wakes are almost entirely consumer-side, and the counter has a false-positive mode where an item published between the failed re-check and the sample looks like blindness. Before chasing it further, tighten the sample so the two are distinguishable — recording *which* position was visible and whether that position was still unclaimed when the waiter next ran would separate a genuine scan miss from a publish that simply arrived late. Position-targeted wakes were built for the producer side and measured as no better than baseline; the code was reverted rather than kept on the strength of the mechanism alone.
+7. **Consumer blind futile wakes: resolved as far as the residual goes.** The scan-budget fix was off by one on its first attempt and did nothing; the corrected accounting (one examination per lost CAS) engaged, and `blind` sole-waiter rescues read zero in every bracketed campaign since. The blind *futile* count is still non-zero (21–36 per 2000) and still has the documented false-positive mode; it is a rate for comparing policies, not a defect count, and is no longer on the path to the backstop decision.
 
-8. **Explain the sole-waiter rescues before removing `PARK_BACKSTOP`.** Each is a waiter the timeout released with no peer parked to have absorbed its wake, and this is the remaining reason the backstop cannot go. The instrument is now sharper (see "Sharpening the instrument"): rescues are split by whether the waiter's wake bit had been taken, and slotless waiters — which time out by construction — are separated out. What is *not* yet true is that the event has been caught with the sharper instrument: four consecutive runs since produced `rescues=0`. The quoted rate of one per two or three runs comes from a small, biased sample, because a run that hits the assertion aborts early. Next: get a real rate. The stress harness aborts on the event it is trying to measure, which is the wrong shape for estimating a frequency — accumulate across runs without aborting, then compare populations.
-8. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
-9. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
+8. **`PARK_BACKSTOP`: the residual is explained for this harness.** See "The residual, bracketed and explained". Two 2000-iteration campaigns with the timing bracket and the late-wake grace show `waiting=0`; every park matching a lost wake's signature received its wake within 5 ms. Before removing the bound: (a) run the same campaign on the rest of the ignored mpmc matrix, not just 2×2/cap-16, with the async saturated stress included; (b) run it on at least one other host; (c) decide what to do about the `Shared` park slot, which polls on the same 1 ms interval by construction and is unaffected by the bound. If all of those read `waiting=0`, remove the bound with the instrument left in place so a regression is a non-zero counter rather than a hang. If the bound is removed, `wake_one`'s stale-bit defect (fixed) is the kind of thing that used to need a timeout to arm itself — re-run the campaign after removal, since the rate of anything left may change.
+
+9. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
+10. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

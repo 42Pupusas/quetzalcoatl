@@ -92,12 +92,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skip to `cap - 1`, keeping the jump large where the ring is large
   while never letting one contended slot end the lap.
 
-  This did *not* reduce the blind-futile-wake count under stress; it is
-  kept because a unit test pins the arithmetic error, not because the
-  stress numbers moved. Whatever produces those wakes is something
-  else, and `PARK_BACKSTOP` still cannot be removed: sole-waiter
-  rescues continue to appear at roughly one per two or three
-  200-iteration runs, uncorrelated with any change made so far.
+  **The first version of this fix was off by one and did nothing.**
+  It clamped the skip to `cap - 1` and the call site then stepped once
+  more, so on the 16-slot stress ring a lost CAS still cost 16 of 16
+  — which is why it "did not reduce the blind-futile-wake count". The
+  corrected accounting charges a lost CAS one examination however far
+  it jumps, and the call site no longer steps after a skip. The
+  clamped jump is coprime with the capacity, so a lap of lost CASes
+  visits every slot. Tests now cover the lap surviving `cap - 1` lost
+  CASes and the walk visiting every slot, rather than the skip in
+  isolation.
+
+- **The sole-waiter rescues are explained, for the stress harness on
+  this host.** The harness now accumulates counters across iterations
+  instead of aborting on the first event (`QUETZALCOATL_STRESS_ITERS`
+  scales it), which gave a real rate: 3–7 per 2000 iterations.
+
+  A rescue is "timeout, then work found", which says nothing about
+  when the work arrived. Two samples now bracket the sleep, and
+  `RescueTiming` names the answers: *blind* (visible before the park —
+  a scan miss, no wake owed), *late* (absent when the park returned —
+  the work came afterwards, the timeout rescued nothing), and
+  *waiting* (published during the sleep and nobody woke the waiter —
+  the only timing a lost wake can produce). Blind read zero once the
+  scan budget was actually fixed; late was the majority; waiting was
+  3 per 2000.
+
+  Those three are the publish-to-wake window: a publisher stores the
+  item, then reads the wake bitmap and unparks, and a timeout firing
+  between the two steps sees the item present, the bit untouched, and
+  a wake nanoseconds away. Parks matching that signature are now held
+  for a 5 ms `LATE_WAKE_GRACE` watching for the waker to claim the
+  handle; two calibration tests pin the grace both ways. Two
+  2000-iteration campaigns since: `waiting=0`, with every one of the
+  13 parks matching the signature woken inside the grace.
+
+  This is not yet a removal of `PARK_BACKSTOP`. It is the evidence the
+  bound was waiting for, on one harness shape and one host, and the
+  remaining campaign is listed in `PERFORMANCE_AUDIT.md`. Sole-waiter
+  rescues are also now split by side, since a lost wake on one side
+  says nothing about the other.
 
   The count is now split by side, because only producers can be pinned
   to a position. That split is what settled the fix: **roughly 80% of
