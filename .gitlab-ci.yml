@@ -51,10 +51,23 @@ msrv:
     - rustup toolchain install 1.88 --profile minimal --no-self-update
     - cargo +1.88 check --all-targets --all-features
 
+# `rustfmt` and `clippy` ship as rustup components, not with the
+# compiler, so a runner whose toolchain was installed with
+# `--profile minimal` has neither. That is an environment failure and
+# says nothing about the code, so the components are installed here
+# rather than assumed.
+fmt:
+  stage: verify
+  extends: .on_host
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
 test:
   stage: verify
   extends: .on_host
   script:
+    - rustup component add clippy
     - cargo test
     - cargo test --features async
     - cargo test --all-features
