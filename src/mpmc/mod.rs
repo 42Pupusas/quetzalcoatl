@@ -1889,7 +1889,9 @@ mod tests {
         for i in 0..3u32 {
             p.push(i).unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        ParkProbe::expect_until("the consumer to drain the first wave and park", || {
+            p.queue.consumer_park.wake.load(Ordering::SeqCst) != 0
+        });
         for i in 100..103u32 {
             p.push(i).unwrap();
         }
