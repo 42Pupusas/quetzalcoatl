@@ -50,7 +50,7 @@ impl ParkSlot {
     /// Indices past the wake table become [`Shared`](Self::Shared)
     /// rather than wrapping onto it: masking would alias a live waiter
     /// and lose its wakeups, while a shared waiter is still reachable
-    /// through the overflow list and the re-check timeout.
+    /// through the overflow list every wake path drains.
     #[must_use]
     #[inline]
     pub const fn from_exclusive_index(index: usize) -> Self {

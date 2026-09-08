@@ -27,11 +27,18 @@ use super::AlignedBuf;
 
 /// Park-slot count.
 ///
-/// Each waiter (producer or consumer) takes a stable slot at clone time;
-/// bit `i` of the wake bitmap flags "slot `i` parked." 64 fits in a
-/// single [`AtomicU64`]. Beyond 64 waiters of one kind, slots alias and
-/// a wake on bit `i` rouses any waiter mapped there (benign false wake;
-/// the woken waiter re-checks and re-parks).
+/// Each waiter (producer or consumer) leases a stable slot at clone
+/// time; bit `i` of the wake bitmap flags "slot `i` parked." 64 fits in
+/// a single [`AtomicU64`].
+///
+/// Beyond 64 live waiters of one kind the slots do **not** alias: a
+/// lease is refused and the waiter becomes
+/// [`ParkSlot::Shared`](super::park_registry::ParkSlot::Shared), which
+/// publishes no bit and is reached through the overflow stack every
+/// wake path drains. Aliasing would lose wakeups rather than cause
+/// merely spurious ones — two waiters on one bit means a wake clears it,
+/// rouses one, and leaves the other parked with nothing recording that
+/// it waits. See [`ParkRegistry`](super::park_registry::ParkRegistry).
 pub const PARK_SLOTS: usize = 64;
 pub const PARK_MASK: usize = PARK_SLOTS - 1;
 /// 32-bit version of [`PARK_MASK`] for `u32::rotate_right` shift
@@ -180,8 +187,8 @@ impl WakeSet {
         }
     }
 
-    /// Wakes the parked waiter for which `wants` holds, or falls back
-    /// to [`wake_one`](Self::wake_one) when none does.
+    /// Wakes the parked waiter with the strongest claim on this
+    /// release, asking `interest` what each one can do with it.
     ///
     /// For releases that only a specific waiter can use. Round-robin
     /// serves one waiter per release, so a release delivered to a
@@ -194,9 +201,6 @@ impl WakeSet {
     /// a want, be passed over here, and then park — but its own
     /// re-check after arming sees the release, which is the same
     /// handshake that protects the untargeted path.
-    ///
-    /// Wakes the parked waiter with the strongest claim on this
-    /// release, asking `interest` what each one can do with it.
     ///
     /// Two passes, strongest claim first: the waiter that reserved the
     /// position, then any waiter that can take whatever frees. A

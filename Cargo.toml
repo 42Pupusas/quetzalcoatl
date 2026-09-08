@@ -55,11 +55,18 @@ include = [
 # enabled — production builds are unaffected.
 async = []
 dhat-heap = ["dep:dhat"]
-# Counts mpmc parks that ended on the PARK_BACKSTOP timeout, and how
-# many of those found work immediately after — the signature of a wake
-# that went missing. Diagnostic only: the counters exist to decide
-# whether the backstop can be removed. Off by default; the ring carries
-# no counters and the call sites compile to nothing.
+# Counts mpmc parks that returned with their handle still armed — so
+# nobody woke them — and how many of those found work immediately
+# after: the signature of a wake that went missing.
+#
+# The 1 ms PARK_BACKSTOP these were built to evaluate is gone and every
+# blocking park is now untimed, so such a return means a spurious
+# unpark. The counters stay because they are the only instrument that
+# sees a lost wake short of a hang; the ignored stress harness prints
+# them. See src/mpmc/backstop_monitor.rs for how to read them.
+#
+# Diagnostic only, off by default: the ring carries no counters and the
+# call sites compile to nothing.
 backstop-metrics = []
 
 [lints.rust]
