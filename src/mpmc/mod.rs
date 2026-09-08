@@ -915,6 +915,7 @@ mod tests {
     /// on both sides, so an over-subscribed consumer side must also
     /// be reachable without a timeout.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow for Miri: 72 spinning consumers on a 4-slot ring")]
     fn pop_block_completes_with_more_consumers_than_park_slots() {
         use crate::common::park::PARK_SLOTS;
 
