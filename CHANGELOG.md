@@ -25,11 +25,47 @@ and a single lost CAS could exhaust a consumer's scan budget on any
 ring smaller than the skip distance. Seven unwind-safety bugs on the
 reservation and teardown paths were fixed before that.
 
+Auditing the async twin of that path found the same class of defect on
+it: registrations were identified by their task's waker, so cancelling
+one future could clear a sibling's registration and leave it parked.
+That one is reachable through the public API, and two tests that had
+been passing by luck of scheduling now cover it.
+
 Verification, since none of the above is provable by inspection: 2000
 stress iterations on a second host with no stall, 46 ignored stress
-tests, the parking layer clean under Miri, clippy clean on the declared
-1.88 MSRV, and `cargo package` verified — 0.14.0 shipped a tarball
-missing nine modules and did not compile for anyone.
+tests, the whole crate clean under Miri with `--features async`, five
+loom models over the park and wake handshakes, clippy clean in every
+feature combination, a `cargo check` on the declared 1.88 MSRV, and
+`cargo package` verified — 0.14.0 shipped a tarball missing nine
+modules and did not compile for anyone.
+
+### Fixed
+- **A cancelled async future could strand a sibling from the same
+  task.** Registrations were identified by `Waker::will_wake`, which
+  compares *tasks*, not registrations. Two futures polled from one task
+  carry equal wakers, so a cancelled future's withdrawal cleared
+  whichever record held the slot — including a live sibling's, which
+  then stayed parked with nothing recording that it waited.
+
+  Registrations now carry a `RegistrationId` minted per arm, and
+  `WakerSlot` stores a `Registration` rather than a bare `Waker`.
+  Withdrawal reports whether it found the caller's own entry, a peer's,
+  or nothing, because each demands different handling: a peer displaced
+  out of the slot is still parked and moves to the overflow.
+
+  Reachable through the public API — the pre-existing
+  `two_async_pushes_from_one_handle_both_complete` (mpsc) and
+  `two_async_pops_from_one_handle_both_complete` (spmc) were passing
+  only by luck of scheduling.
+
+- **Cancelled async waiters could accumulate on the overflow list.**
+  The same missing identity left the list with no key to remove by, so
+  withdrawal gave up for a slotless waiter and for one a peer had
+  displaced onto the list. A cancel/retry loop on an idle ring pushed
+  one registration per iteration that nothing removed until some
+  unrelated wake drained it. `WakerOverflow::withdraw` now detaches the
+  chain with the same swap a drain uses, drops the match, and re-pushes
+  the rest.
 
 ### Changed
 - **Blocking waiters with no park slot are now registered rather than
@@ -1255,7 +1291,11 @@ missing nine modules and did not compile for anyone.
 - Validated with extensive testing
 - Clippy clean with pedantic lints enabled
 
-[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/42Pupusas/quetzalcoatl/compare/v0.9.0...v0.10.0
