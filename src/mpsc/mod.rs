@@ -1510,6 +1510,8 @@ mod tests {
     /// temporarily flipping `wake_n(count)` back to `wake_one()`
     /// during development; this test reliably hangs.
     #[test]
+    // from_mins is stable only since 1.91; from_secs builds anywhere.
+    #[allow(unknown_lints, clippy::duration_suboptimal_units)]
     fn drain_wakes_all_parked_producers() {
         const CAP: u32 = 4;
         // N == CAP so the post-drain pushes all fit exactly.
@@ -1547,7 +1549,7 @@ mod tests {
         // Wait for all producers to complete WITHOUT calling drain
         // or pop again — those would each emit additional wakes and
         // mask the bug.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         for (i, h) in producers.into_iter().enumerate() {
             while !h.is_finished() {
                 assert!(

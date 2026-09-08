@@ -2,6 +2,14 @@
 name = "quetzalcoatl"
 version = "0.14.0"
 edition = "2021"
+# Bisected with `cargo +VERSION check --all-targets --all-features`, not
+# guessed: 1.87 fails on `const Cell::get` (const_cell, stable in 1.88),
+# and below that on `.addr()` (1.84) and `const fn` taking `&mut` (1.83).
+#
+# It exists because `Duration::from_mins` (1.91) reached a published
+# crate and was caught by a CI runner, not here. Raising this is now a
+# decision rather than an accident.
+rust-version = "1.88"
 authors = ["quetzalcoatl contributors"]
 description = "Lock-free ring buffers (SPSC, MPSC, SPMC, MPMC, and broadcast) for high-performance concurrent communication"
 license = "MIT"

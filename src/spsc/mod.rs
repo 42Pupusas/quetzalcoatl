@@ -1394,6 +1394,8 @@ mod tests {
     }
 
     #[test]
+    // from_mins is stable only since 1.91; from_secs builds anywhere.
+    #[allow(unknown_lints, clippy::duration_suboptimal_units)]
     fn drain_wakes_producer() {
         // SPSC has only one producer. Test that drain releasing the
         // ring wakes it from push_block.
@@ -1412,7 +1414,7 @@ mod tests {
         let n = c.drain(|_| {});
         assert_eq!(n, 4);
         // Producer should complete its 4 more pushes promptly.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !h.is_finished() {
             assert!(
                 std::time::Instant::now() < deadline,

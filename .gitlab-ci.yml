@@ -38,6 +38,19 @@ host:
   script:
     - echo "toolchain and core count recorded above"
 
+# The declared floor, checked rather than asserted. `Duration::from_mins`
+# (1.91) shipped in a published crate because every build that saw it was
+# newer than it needed to be; this job is the build that disagrees.
+# Allowed to fail only because the toolchain may be absent on the runner —
+# a compile error here is a real finding.
+msrv:
+  stage: verify
+  extends: .on_host
+  allow_failure: true
+  script:
+    - rustup toolchain install 1.88 --profile minimal --no-self-update
+    - cargo +1.88 check --all-targets --all-features
+
 test:
   stage: verify
   extends: .on_host
