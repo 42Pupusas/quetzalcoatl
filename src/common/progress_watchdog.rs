@@ -1,4 +1,9 @@
-//! A deadlock detector for the cross-thread async tests.
+//! A deadlock detector for the cross-thread tests.
+//!
+//! Every blocking park in the crate is untimed, so a waiter that
+//! parks when it should not have is a hang rather than a slow test.
+//! That applies to the blocking paths as much as the async ones,
+//! which is why this is not gated on the `async` feature.
 //!
 //! It aborts only when a test stops making progress, never on a
 //! deadline. A wall-clock budget is the obvious design and the wrong

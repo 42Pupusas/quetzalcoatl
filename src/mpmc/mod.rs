@@ -1952,6 +1952,87 @@ mod tests {
         assert!(c.pop_ref_block().is_none());
     }
 
+    /// The contended half of the pre-park gate.
+    ///
+    /// `pop_ref_block` is the one path that decides to park on
+    /// `has_item` rather than on a failed claim, and every other test
+    /// of it runs one consumer, where the gate and the claim can never
+    /// disagree. With peers they disagree constantly: `has_item` finds
+    /// a published slot, a peer claims it first, and the claim returns
+    /// `None` on a ring that is neither empty nor closed. Treating that
+    /// `None` as emptiness would end a blocking read early; treating it
+    /// as a reason to park would sleep on a ring holding work, and the
+    /// park is untimed.
+    ///
+    /// The assertion is on each consumer rather than on the total. A
+    /// consumer that gives up early is invisible in the total, because
+    /// its peers simply claim what it left; only a consumer that
+    /// returns `None` on an *open* ring reveals it. So every `None` is
+    /// checked against the close flag at the moment it arrives, which
+    /// is sound in one direction — the correct loop returns `None`
+    /// only from a branch that has already observed the close.
+    ///
+    /// The ring is smaller than the consumer count so the losing
+    /// consumers repeatedly take the gate-then-lose-the-claim path
+    /// this exists to cover. A consumer that parks with work available
+    /// hangs rather than failing, which is what the watchdog is for.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow for Miri: many threads")]
+    fn contending_consumers_never_end_a_blocking_read_early() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let n_consumers: u64 = 8;
+        let total: u64 = 4_000;
+        let received = Arc::new(AtomicU64::new(0));
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
+            received.clone(),
+            "mpmc contending_consumers_never_end_a_blocking_read_early",
+        );
+
+        let (p, c) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        let consumers: Vec<_> = (0..n_consumers)
+            .map(|_| {
+                let mut c = c.clone();
+                let received = received.clone();
+                std::thread::spawn(move || {
+                    let mut mine = 0u64;
+                    loop {
+                        let Some(reader) = c.pop_ref_block() else {
+                            assert!(
+                                c.is_closed(),
+                                "a blocking read ended on an open ring: a lost claim \
+                                 is contention, not emptiness"
+                            );
+                            break;
+                        };
+                        let value = *reader;
+                        drop(reader);
+                        assert!(value < total, "received a value never published");
+                        mine += 1;
+                        received.fetch_add(1, Ordering::Relaxed);
+                    }
+                    mine
+                })
+            })
+            .collect();
+        drop(c);
+
+        for i in 0..total {
+            while p.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+        drop(p);
+
+        let claimed: u64 = consumers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            claimed, total,
+            "every published item must be claimed exactly once"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Drain
     // -----------------------------------------------------------------------
