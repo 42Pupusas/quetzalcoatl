@@ -23,23 +23,25 @@ default:
 
 # The park campaign's whole claim is "another host, another
 # scheduler". A result without the core count and kernel is not a
-# second data point, it is an anecdote.
-.host_identity: &host_identity
-  - uname -a
-  - nproc
-  - cargo --version
-  - rustc --version
+# second data point, it is an anecdote — so every job records both
+# before it does anything else.
+.on_host:
+  before_script:
+    - uname -a
+    - nproc
+    - cargo --version
+    - rustc --version
 
 host:
   stage: probe
+  extends: .on_host
   script:
-    - *host_identity
-    - cargo --version || echo "NO CARGO — install a toolchain on this runner"
+    - echo "toolchain and core count recorded above"
 
 test:
   stage: verify
+  extends: .on_host
   script:
-    - *host_identity
     - cargo test
     - cargo test --features async
     - cargo test --all-features
@@ -49,15 +51,15 @@ test:
 # The open audit item. Every blocking park in the crate is untimed, so
 # a lost wake is a hang: this job either completes or it stalls, and
 # both are results. Manual because it is ~200s per 2000 iterations and
-# because a stall should be looked at, not retried.
+# because a stall should be read, not retried.
 park-campaign:
   stage: campaign
+  extends: .on_host
   when: manual
   timeout: 2h
   variables:
     QUETZALCOATL_STRESS_ITERS: "2000"
   script:
-    - *host_identity
     - cargo test --release --features backstop-metrics -- --ignored --nocapture block_stress_diagnostic 2>&1 | tee campaign.log
   artifacts:
     when: always
@@ -67,19 +69,25 @@ park-campaign:
 
 stress:
   stage: campaign
+  extends: .on_host
   when: manual
   timeout: 3h
   script:
-    - *host_identity
-    - cargo test --release --features async -- --ignored
-    - cargo test --release --all-features -- --ignored
+    - cargo test --release --features async -- --ignored 2>&1 | tee stress-async.log
+    - cargo test --release --all-features -- --ignored 2>&1 | tee stress-all.log
+  artifacts:
+    when: always
+    paths:
+      - stress-async.log
+      - stress-all.log
+    expire_in: 1 month
 
 bench:
   stage: campaign
+  extends: .on_host
   when: manual
   timeout: 2h
   script:
-    - *host_identity
     - cargo bench 2>&1 | tee bench.log
   artifacts:
     when: always
