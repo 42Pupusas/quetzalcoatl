@@ -9,17 +9,23 @@
 //!   consumer is working the same cache line, and moving well clear of
 //!   it before the next attempt is worth real time.
 //! - **How much of the lap that costs.** The lap exists to bound the
-//!   search, and the search is over the ring's `cap` positions.
+//!   search, and it is spent in *examinations*: every position looked
+//!   at costs one, and a lost CAS is one position looked at.
 //!
-//! A jump is only meaningful modulo the ring: on a ring of 4, jumping
-//! 127 positions lands 31 laps later on the same slot. Charging 127
-//! against a budget of 4 ends the lap outright, so a consumer that
-//! loses a single CAS reports the ring empty while items sit in it —
-//! and the caller parks on a ring with work in it.
+//! Charging the jump distance against the lap conflates the two. On a
+//! ring of 16 with a skip of 128, one lost CAS spent the whole lap and
+//! the consumer reported the ring empty while items sat in it — and
+//! the caller parked on a ring with work in it. Clamping the jump to
+//! the ring was not enough: the clamp left it at 15 and the examined
+//! slot's own step made 16, so the lap still ended on one lost CAS.
 //!
 //! [`ScanBudget`] owns both quantities so the jump can be large in
-//! position and small in budget, and so the policy can be tested
+//! position and cost one examination, and so the policy can be tested
 //! without staging a CAS race between threads.
+//!
+//! The jump is still clamped to `capacity - 1`, which is coprime with
+//! the capacity: a scan that loses every CAS still walks distinct
+//! slots rather than returning to the one it lost.
 
 /// Tracks one lap of a consumer's scan: where to look next, and how
 /// much of the lap is left.
@@ -64,13 +70,14 @@ impl ScanBudget {
 
     /// Moves clear of a slot a peer claimed first.
     ///
-    /// Charges only the positions actually skipped over, which the
-    /// clamp keeps within the lap. A lost CAS is evidence the ring is
-    /// *busy*, not that it is empty, so it must not be able to end the
-    /// lap on its own.
+    /// Charges one examination — the slot that was lost — however far
+    /// the position moves. A lost CAS is evidence the ring is *busy*,
+    /// not that it is empty, so it must not be able to end the lap on
+    /// its own. This replaces [`step`](Self::step) for that slot; the
+    /// caller does not step again.
     pub(super) const fn skip_contended(&mut self) {
         self.position += self.cas_skip;
-        self.spent += self.cas_skip;
+        self.spent += 1;
     }
 
     /// Whether the lap is over.
@@ -96,8 +103,23 @@ mod tests {
         );
     }
 
-    /// The clamp must leave at least one position examinable per skip,
-    /// otherwise a ring of contended slots would loop forever.
+    /// A lost CAS is one examination, so a lap survives `cap - 1` of
+    /// them and ends on the `cap`th. The first version of the clamp
+    /// got this wrong by one on the stress ring: the skip was charged
+    /// as 15 examinations and the step made 16.
+    #[test]
+    fn a_lost_cas_costs_one_examination() {
+        let mut budget = ScanBudget::new(0, 16, 128);
+        for lost in 1..16 {
+            budget.skip_contended();
+            assert!(!budget.exhausted(), "lost CAS {lost} of 15 must leave the lap alive");
+        }
+        budget.skip_contended();
+        assert!(budget.exhausted(), "a bounded lap must terminate");
+    }
+
+    /// A ring of contended slots still terminates, because each lost
+    /// CAS spends one of `cap` examinations.
     #[test]
     fn a_lap_of_contended_slots_still_ends() {
         let mut budget = ScanBudget::new(0, 4, 128);
@@ -105,6 +127,22 @@ mod tests {
             budget.skip_contended();
         }
         assert!(budget.exhausted(), "a bounded lap must terminate");
+    }
+
+    /// The clamped jump is coprime with the capacity, so losing every
+    /// CAS walks every slot rather than the one it lost.
+    #[test]
+    fn a_clamped_jump_visits_every_slot_before_repeating() {
+        let cap = 16;
+        let mut budget = ScanBudget::new(0, cap, 128);
+        let mut seen = vec![false; cap];
+        while !budget.exhausted() {
+            let slot = budget.position() % cap;
+            assert!(!seen[slot], "slot {slot} examined twice within one lap");
+            seen[slot] = true;
+            budget.skip_contended();
+        }
+        assert!(seen.iter().all(|&s| s), "every slot must be examined: {seen:?}");
     }
 
     #[test]

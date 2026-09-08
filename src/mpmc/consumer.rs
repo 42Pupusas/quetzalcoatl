@@ -128,9 +128,10 @@ impl<T, C: Config> Consumer<T, C> {
                 // CAS lost — move clear so the contended line cools
                 // before the next attempt.
                 budget.skip_contended();
+            } else {
+                budget.step();
             }
 
-            budget.step();
             if budget.exhausted() {
                 self.next_scan.set(budget.position());
                 return None;
@@ -335,7 +336,7 @@ impl<T, C: Config> Consumer<T, C> {
             // Bounded park backstop — see Producer::push_block.
             watch.about_to_park(q.consumer_park.others_parked(slot), self.has_item());
             slot.park_bounded(PARK_BACKSTOP);
-            watch.parked_at(&q.consumer_park, slot);
+            watch.parked_at(&q.consumer_park, slot, || self.has_item());
             q.consumer_park.disarm(slot);
         }
     }
@@ -444,7 +445,7 @@ impl<T, C: Config> Consumer<T, C> {
                 self.has_item(),
             );
             park_slot.park_bounded(PARK_BACKSTOP);
-            watch.parked_at(&self.queue.consumer_park, park_slot);
+            watch.parked_at(&self.queue.consumer_park, park_slot, || self.has_item());
             self.queue.consumer_park.disarm(park_slot);
         }
     }
