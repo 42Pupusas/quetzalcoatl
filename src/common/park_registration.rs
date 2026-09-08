@@ -6,12 +6,22 @@
 //!
 //! That is not merely a wasted wake event. A park slot belongs to an
 //! endpoint, and storing into an occupied slot displaces the previous
-//! waker into the overflow list rather than dropping it — the fix for
-//! two live futures sharing one handle. A cancel/retry loop on one
-//! endpoint therefore pushes a fresh entry on every iteration: each new
-//! future's waker displaces the dead one before it, and the overflow
-//! grows without bound for as long as no wake drains it. A thousand
-//! cancelled pushes on an idle ring leave a thousand live `Waker`s.
+//! registration into the overflow list rather than dropping it — the
+//! fix for two live futures sharing one handle. A cancel/retry loop on
+//! one endpoint therefore pushes a fresh entry on every iteration: each
+//! new future displaces the dead one before it, and the overflow grows
+//! without bound for as long as no wake drains it. A thousand cancelled
+//! pushes on an idle ring leave a thousand live `Waker`s.
+//!
+//! # Identity
+//!
+//! A registration is named by a [`RegistrationId`] minted per arm, not
+//! by its [`Waker`]. `Waker::will_wake` compares *tasks*: two futures
+//! polled from one task carry equal wakers, so identifying a
+//! registration by waker let a cancelled future withdraw a live
+//! sibling's record, leaving it parked with nothing saying it waits.
+//! The id also lets a withdrawal find its entry on the overflow, where
+//! a peer may have displaced it.
 //!
 //! Two wrappers tie a registration to a future's lifetime instead.
 //!
@@ -29,27 +39,29 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use super::park_registry::ParkSlot;
+use super::registration_id::RegistrationId;
 use super::wake_async::WakerSet;
 
 /// The record of one armed registration, independent of who owns it.
 ///
-/// `arm` replaces this registration's own previous waker in place; a
-/// waker armed by a peer is never touched here. `withdraw` removes the
-/// registration if it is still ours. A slot may hold a peer's waker
-/// rather than ours — the peer registered after us and displaced us —
-/// and that waker belongs to a future that is still parked, so it is
-/// moved to the overflow list rather than discarded, the same rule
+/// `arm` replaces this record's own previous registration in place; one
+/// armed by a peer is never touched here. `withdraw` removes the
+/// registration wherever it is — the slot, or the overflow a peer may
+/// have displaced it onto. A slot may hold a peer's registration rather
+/// than ours, and that belongs to a future which is still parked, so it
+/// is moved to the overflow list rather than discarded, the same rule
 /// [`WakerSet::register`](super::wake_async::WakerSet::register)
 /// follows. Every wake drains the overflow, so the peer stays
 /// reachable.
 pub struct ExclusiveRegistration {
     slot: ParkSlot,
-    /// The waker this record published, kept to recognise its own
-    /// registration at withdraw. `None` before the first `arm`.
-    armed: Option<Waker>,
+    /// The identity this record published, kept to recognise its own
+    /// registration at withdraw. `None` before the first `arm`, and
+    /// after a withdrawal.
+    armed: Option<RegistrationId>,
 }
 
 impl ExclusiveRegistration {
@@ -61,46 +73,43 @@ impl ExclusiveRegistration {
     /// Registers `cx`'s waker, replacing any registration this record
     /// already holds.
     ///
-    /// Re-arming with the same waker is the common case — an executor
-    /// polls a pending future with a stable waker — and a changed waker
-    /// (the future moved tasks) withdraws the old registration first,
-    /// so this record's own stale entry is never displaced into the
-    /// overflow.
+    /// Re-arming reuses the record's own id, so a re-registration
+    /// replaces its previous entry in the slot instead of displacing it
+    /// onto the overflow. A future that moved tasks brings a different
+    /// waker under the same id, which is the same replacement.
+    ///
+    /// The previous entry may have been displaced onto the overflow by
+    /// a peer, so it is withdrawn from there first; otherwise
+    /// re-arming across polls would leave one dead entry per poll.
     #[inline]
     pub fn arm(&mut self, set: &WakerSet, cx: &Context<'_>) {
-        let waker = cx.waker();
-        if self
-            .armed
-            .as_ref()
-            .is_some_and(|armed| !armed.will_wake(waker))
-        {
-            self.withdraw(set);
-        }
-        set.register(self.slot, cx);
-        self.armed = Some(waker.clone());
+        let id = self.armed.map_or_else(
+            || set.mint(),
+            |id| {
+                set.overflow.withdraw(id);
+                id
+            },
+        );
+        set.register_as(id, self.slot, cx);
+        self.armed = Some(id);
     }
 
     /// Drops the registration without waking it.
     #[inline]
     pub fn withdraw(&mut self, set: &WakerSet) {
-        let Some(waker) = self.armed.take() else {
+        let Some(id) = self.armed.take() else {
             return;
         };
-        let Some(index) = self.slot.index() else {
-            return;
-        };
-        if let Some(peer) = set.slots[index].clear_if(&waker) {
-            set.overflow.register_owned(peer);
-        }
+        set.withdraw(id, self.slot);
     }
 }
 
 impl Drop for ExclusiveRegistration {
     fn drop(&mut self) {
         // `armed` is cleared without touching the set: a record whose
-        // set is unreachable can only be holding a waker the set's own
-        // drop will free. `ParkRegistration` and `ParkedFuture` both
-        // withdraw through the set before this runs.
+        // set is unreachable can only be naming a registration the
+        // set's own drop will free. `ParkRegistration` and
+        // `ParkedFuture` both withdraw through the set before this runs.
         self.armed.take();
     }
 }
@@ -272,6 +281,136 @@ mod tests {
         }
 
         assert_eq!(set.overflow.depth(), 0);
+    }
+
+    /// The lost-wakeup defect this module's identity exists to fix.
+    ///
+    /// Two futures from one endpoint, polled by one task, carry equal
+    /// wakers. Identifying a registration by waker let the cancelled
+    /// one's withdrawal clear the sibling's record, leaving it parked
+    /// with nothing saying it waits. With ids, the sibling survives.
+    #[test]
+    fn cancelling_one_future_leaves_a_sibling_from_the_same_task_woken() {
+        let set = WakerSet::new();
+        let task = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&task));
+        let cx = Context::from_waker(&waker);
+
+        let mut sibling = ParkRegistration::new(&set, slot0());
+        sibling.arm(&cx);
+
+        {
+            let mut cancelled = ParkRegistration::new(&set, slot0());
+            cancelled.arm(&cx);
+        }
+
+        set.wake_all();
+        assert_eq!(
+            task.count(),
+            1,
+            "the surviving sibling was not woken exactly once"
+        );
+    }
+
+    /// The same race with the roles reversed: the guard armed *first*
+    /// is cancelled, and the one that displaced it must still be woken.
+    #[test]
+    fn cancelling_the_displaced_future_leaves_the_occupant_woken() {
+        let set = WakerSet::new();
+        let task = CountingWaker::new();
+        let waker = Waker::from(Arc::clone(&task));
+        let cx = Context::from_waker(&waker);
+
+        let mut occupant = ParkRegistration::new(&set, slot0());
+        {
+            let mut cancelled = ParkRegistration::new(&set, slot0());
+            cancelled.arm(&cx);
+            occupant.arm(&cx);
+        }
+
+        set.wake_all();
+        assert_eq!(
+            task.count(),
+            1,
+            "the occupant lost its wake to a cancelled peer"
+        );
+    }
+
+    /// A cancelled slotless waiter must leave nothing on the overflow:
+    /// it has no slot, so the withdrawal has to reach the list.
+    #[test]
+    fn a_cancelled_slotless_guard_leaves_nothing_behind() {
+        let set = WakerSet::new();
+
+        for _ in 0..1_000 {
+            let waker = Waker::from(CountingWaker::new());
+            let mut guard = ParkRegistration::new(&set, ParkSlot::Shared);
+            guard.arm(&Context::from_waker(&waker));
+        }
+
+        assert_eq!(set.overflow.depth(), 0);
+    }
+
+    /// A slotless waiter that is still armed must remain reachable.
+    #[test]
+    fn a_live_slotless_guard_is_still_woken() {
+        let set = WakerSet::new();
+        let waker = CountingWaker::new();
+        let handle = Waker::from(Arc::clone(&waker));
+        let mut guard = ParkRegistration::new(&set, ParkSlot::Shared);
+        guard.arm(&Context::from_waker(&handle));
+
+        set.wake_all();
+        assert_eq!(waker.count(), 1);
+    }
+
+    /// Re-arming a slotless guard across polls must hold exactly one
+    /// registration, not one per poll.
+    #[test]
+    fn re_arming_a_slotless_guard_holds_one_registration() {
+        let set = WakerSet::new();
+        let waker = Waker::from(CountingWaker::new());
+        let mut guard = ParkRegistration::new(&set, ParkSlot::Shared);
+
+        for _ in 0..1_000 {
+            guard.arm(&Context::from_waker(&waker));
+            assert_eq!(set.overflow.depth(), 1);
+        }
+    }
+
+    /// A guard displaced onto the overflow by a peer must withdraw from
+    /// there — the slot no longer holds it.
+    ///
+    /// The peer keeps its registration: taking it out of the slot to
+    /// look underneath is why the withdrawal hands it to the overflow
+    /// rather than dropping it. So one registration survives, and it is
+    /// the peer's.
+    #[test]
+    fn a_guard_displaced_onto_the_overflow_still_withdraws() {
+        let set = WakerSet::new();
+        let peer = CountingWaker::new();
+        let cancelled = CountingWaker::new();
+
+        {
+            let mut displaced = ParkRegistration::new(&set, slot0());
+            displaced.arm(&Context::from_waker(&Waker::from(Arc::clone(&cancelled))));
+
+            // A peer takes the slot, pushing `displaced` to the overflow.
+            let peer_waker = Waker::from(Arc::clone(&peer));
+            set.register(slot0(), &Context::from_waker(&peer_waker));
+
+            assert_eq!(set.overflow.depth(), 1);
+        }
+
+        assert_eq!(
+            set.overflow.depth(),
+            1,
+            "the cancelled guard was left alongside the peer"
+        );
+
+        set.wake_all();
+        assert_eq!(peer.count(), 1, "the peer lost its wake");
+        assert_eq!(cancelled.count(), 0, "a cancelled waiter was woken");
     }
 
     /// A peer that displaced this guard is still parked, so dropping

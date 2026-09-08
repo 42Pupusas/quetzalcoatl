@@ -29,6 +29,8 @@ pub mod park_registry;
 pub mod probe_budget;
 #[cfg(test)]
 pub mod progress_watchdog;
+#[cfg(feature = "async")]
+pub mod registration_id;
 pub mod seq_slot;
 pub mod single_parker;
 pub mod slot_sequence;
