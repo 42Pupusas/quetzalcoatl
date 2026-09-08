@@ -2167,19 +2167,21 @@ mod tests {
         // can see what state the threads were in when everything
         // parked.
         //
-        // Snapshot from a captured deadlock at iter 43:
-        //   claim = 1461
-        //   ready = [1458, 1459, 1460, 1461, 1462, 1431, 1448, ..., 1457]
-        //   done  = [1472, 1473, 1474, 1475, 1476, 1445, 1462, ..., 1471]
+        // The deadlock this was written to catch is fixed as of
+        // 4463d52 and pinned by `a_release_wakes_the_producer_that
+        // _reserved_the_position`. It was not a lost wake: a release
+        // issued one round-robin wake_one, which landed on a producer
+        // that was not the one holding the reserved position, so the
+        // reserver slept beside a free slot while the claim cursor
+        // waited on that same slot. Releases are routed by position
+        // now.
         //
-        // Every slot in state==2 ("consumed but next round not yet
-        // published"). Slot 5 is at round 89; rest at 90/91. Nobody
-        // ever published pos 1445 (round 90 slot 5) — refill_batch
-        // checks done[claim&mask]==claim before FAA'ing further, so
-        // claim is stuck at 1461 (slot 5, expects done[5]==1461 but
-        // it's 1445). Some producer that was supposed to publish pos
-        // 1445 either lost a wake event or its batch_unused never
-        // contained that bit. Investigation pending.
+        // The harness stays because that is one mechanism, not a
+        // proof that there are no others: every blocking park in the
+        // crate is untimed, so any remaining lost wake is a hang
+        // rather than a latency blip. The watchdog aborts on 10s
+        // without a completed iter, which is what makes a stall a
+        // failed job rather than a slow one.
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::sync::Arc;
 
