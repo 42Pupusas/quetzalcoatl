@@ -2236,6 +2236,107 @@ mod tests {
 
     }
 
+    /// Blocking and async producers on one saturated ring.
+    ///
+    /// The two sides are woken by different machinery. A release wakes
+    /// one *routed* blocking producer through `producer_park`, and
+    /// every async producer through `producer_waker`, and a release
+    /// belongs to whichever producer reserved the position regardless
+    /// of which kind that is. Each release site must therefore signal
+    /// both sets; signalling only the side the releasing consumer
+    /// happens to think about leaves the other kind parked with its
+    /// slot free.
+    ///
+    /// The ring is deliberately smaller than the producer count, so
+    /// every producer parks repeatedly and the two kinds interleave
+    /// through the same positions rather than each keeping to its own
+    /// region. A lost wake on either side is a hang, so the watchdog
+    /// turns it into a failure rather than a suite that never ends.
+    #[test]
+    #[cfg(feature = "async")]
+    #[cfg_attr(miri, ignore = "too slow for Miri: threads + tokio runtimes")]
+    fn blocking_and_async_producers_share_one_ring() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let per_producer: u64 = 500;
+        let blocking_producers: u64 = 2;
+        let async_producers: u64 = 2;
+        let total = (blocking_producers + async_producers) * per_producer;
+        let received = Arc::new(AtomicU64::new(0));
+        let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
+            received.clone(),
+            "mpmc blocking_and_async_producers_share_one_ring",
+        );
+
+        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+
+        let collector = {
+            let c = consumer.clone();
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while let Some(v) = c.pop_block() {
+                    seen.push(v);
+                    received.fetch_add(1, Ordering::Relaxed);
+                }
+                seen
+            })
+        };
+        drop(consumer);
+
+        let blocking: Vec<_> = (0..blocking_producers)
+            .map(|tid| {
+                let p = producer.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_producer {
+                        p.push_block(tid * per_producer + i)
+                            .expect("consumers dropped");
+                    }
+                })
+            })
+            .collect();
+
+        let asynchronous: Vec<_> = (0..async_producers)
+            .map(|tid| {
+                let p = producer.clone();
+                let base = (blocking_producers + tid) * per_producer;
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let local = tokio::task::LocalSet::new();
+                    rt.block_on(local.run_until(async move {
+                        for i in 0..per_producer {
+                            p.push_async(base + i).await.expect("consumers dropped");
+                        }
+                    }));
+                })
+            })
+            .collect();
+        drop(producer);
+
+        for h in blocking {
+            h.join().unwrap();
+        }
+        for h in asynchronous {
+            h.join().unwrap();
+        }
+
+        let mut seen = collector.join().unwrap();
+        assert_eq!(
+            seen.len() as u64,
+            total,
+            "every push from both producer kinds must be received"
+        );
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len() as u64,
+            total,
+            "no value may be delivered twice"
+        );
+    }
+
     #[test]
     #[cfg(feature = "async")]
     fn async_pop_returns_none_on_close() {
