@@ -23,50 +23,40 @@
 //! peer acts on it. Probe [`SoleParker::is_parked`] or the wake bitmap
 //! instead.
 //!
-//! The budget counts attempts, not time, and is deliberately small: a
-//! blown budget must fail the test quickly rather than burn CPU.
+//! How long the probe waits is [`ProbeBudget`]'s decision, because the
+//! right bound differs between Miri and real hardware.
 
-/// Polls a latching condition until it holds, or the attempt budget
-/// runs out.
-pub struct ParkProbe {
-    max_attempts: u32,
-}
+use super::probe_budget::ProbeBudget;
+
+/// Polls a latching condition until it holds, or the budget runs out.
+///
+/// Each wait draws its own [`ProbeBudget`], so one wait timing out
+/// does not eat the allowance of the next.
+pub struct ParkProbe;
 
 impl ParkProbe {
-    const DEFAULT_ATTEMPTS: u32 = 20_000;
-
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            max_attempts: Self::DEFAULT_ATTEMPTS,
-        }
-    }
-
     /// Returns `true` as soon as `cond` holds, `false` if the budget
     /// runs out first.
-    pub fn wait_until(&self, mut cond: impl FnMut() -> bool) -> bool {
-        for _ in 0..self.max_attempts {
+    pub fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let mut budget = ProbeBudget::new();
+        loop {
             if cond() {
                 return true;
             }
+            if budget.is_spent() {
+                return cond();
+            }
             std::thread::yield_now();
         }
-        cond()
     }
 
     /// Waits until `cond` holds. Panics with `what` if the budget runs
     /// out first.
-    pub fn expect_until(&self, what: &str, cond: impl FnMut() -> bool) {
+    pub fn expect_until(what: &str, cond: impl FnMut() -> bool) {
         assert!(
-            self.wait_until(cond),
-            "timed out after {} polls waiting for: {what}",
-            self.max_attempts
+            Self::wait_until(cond),
+            "timed out after {} waiting for: {what}",
+            ProbeBudget::describe()
         );
-    }
-}
-
-impl Default for ParkProbe {
-    fn default() -> Self {
-        Self::new()
     }
 }

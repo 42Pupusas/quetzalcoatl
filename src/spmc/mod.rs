@@ -1417,7 +1417,7 @@ mod tests {
         }
 
         let pusher = std::thread::spawn(move || producer.push_block(99));
-        crate::common::park_probe::ParkProbe::new().expect_until("push_block to arm its park", || {
+        crate::common::park_probe::ParkProbe::expect_until("push_block to arm its park", || {
             consumer.queue.producer_park.is_parked()
         });
 

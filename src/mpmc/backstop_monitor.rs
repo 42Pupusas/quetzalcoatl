@@ -621,7 +621,8 @@ impl BackstopWatch {
 
 #[cfg(all(test, feature = "backstop-metrics"))]
 mod tests {
-    use super::{BackstopMonitor, BackstopWatch, WaiterSide, WakeDelivery};
+    use super::{BackstopMonitor, BackstopStats, BackstopWatch, WaiterSide, WakeDelivery};
+    use std::sync::atomic::Ordering;
 
     /// Drives a watch through one park cycle, so the counter logic is
     /// tested without threads, rings or timing.
@@ -885,37 +886,73 @@ mod tests {
         watch.parked_at(&set, slot, || panic!("a woken waiter must not pay for the sample"));
     }
 
+    /// One attempt at the late-wake bracket.
+    ///
+    /// The wake has to land after the park is sampled and before the
+    /// grace expires, and both ends belong to the scheduler: fire too
+    /// early and the park reads as woken outright, too late and it
+    /// reads as the residual. An attempt therefore reports what it
+    /// produced instead of asserting, and the test retries until the
+    /// bracket is hit.
+    struct LateWakeEpisode;
+
+    impl LateWakeEpisode {
+        /// Biases the wake past the sample at the top of `parked_at`
+        /// without reaching the 5ms grace. Missing either edge costs
+        /// an attempt, not the run.
+        const NUDGE: std::time::Duration = std::time::Duration::from_micros(200);
+
+        fn run() -> BackstopStats {
+            let cycle = Cycle::new();
+            let mut watch = cycle.watch(WaiterSide::Consumer);
+            let set = std::sync::Arc::new(crate::common::park::WakeSet::new());
+            let slot = crate::common::park_registry::ParkSlot::Leased(0);
+            set.arm(slot);
+
+            let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let late_waker = {
+                let set = std::sync::Arc::clone(&set);
+                let release = std::sync::Arc::clone(&release);
+                std::thread::spawn(move || {
+                    while !release.load(Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    std::thread::sleep(Self::NUDGE);
+                    set.wake_one();
+                })
+            };
+
+            watch.about_to_park(0, false);
+            release.store(true, Ordering::Release);
+            watch.parked_at(&set, slot, || true);
+            watch.made_progress();
+            late_waker.join().unwrap();
+            cycle.monitor.stats()
+        }
+    }
+
     /// A publisher caught between publish and wake by the timeout
     /// delivers its wake a moment later. The grace catches it, and
     /// the park is recorded as woken rather than as the residual.
     #[test]
     fn a_wake_arriving_within_the_grace_is_not_a_rescue() {
-        let cycle = Cycle::new();
-        let mut watch = cycle.watch(WaiterSide::Consumer);
-        let set = std::sync::Arc::new(crate::common::park::WakeSet::new());
-        let slot = crate::common::park_registry::ParkSlot::Leased(0);
-        set.arm(slot);
+        const ATTEMPTS: u32 = 64;
 
-        let late_waker = {
-            let set = std::sync::Arc::clone(&set);
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-                set.wake_one();
-            })
-        };
-
-        watch.about_to_park(0, false);
-        watch.parked_at(&set, slot, || true);
-        watch.made_progress();
-        late_waker.join().unwrap();
-
-        let stats = cycle.monitor.stats();
-        assert_eq!(stats.wakes_arriving_after_timeout, 1, "{stats:?}");
-        assert_eq!(
-            stats.waiting_sole_waiter_rescues, 0,
-            "the wake was in flight; the clock merely beat it: {stats:?}"
-        );
-        assert_eq!(stats.rescues, 0, "{stats:?}");
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let stats = LateWakeEpisode::run();
+            if stats.wakes_arriving_after_timeout != 1 {
+                last = Some(stats);
+                continue;
+            }
+            assert_eq!(
+                stats.waiting_sole_waiter_rescues, 0,
+                "the wake was in flight; the clock merely beat it: {stats:?}"
+            );
+            assert_eq!(stats.rescues, 0, "{stats:?}");
+            return;
+        }
+        panic!("the wake never landed inside the grace in {ATTEMPTS} attempts: {last:?}");
     }
 
     /// The grace must not invent a wake: with nobody coming, the park

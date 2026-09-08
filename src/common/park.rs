@@ -830,8 +830,9 @@ mod tests {
             peer.disarm(ParkSlot::Leased(1));
         });
 
-        crate::common::park_probe::ParkProbe::new()
-            .expect_until("the waiter to park", || set.parked_bits() & (1 << 1) != 0);
+        crate::common::park_probe::ParkProbe::expect_until("the waiter to park", || {
+            set.parked_bits() & (1 << 1) != 0
+        });
         set.wake_one();
         waiter.join().unwrap();
     }

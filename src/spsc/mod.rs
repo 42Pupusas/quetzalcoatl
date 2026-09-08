@@ -1187,7 +1187,7 @@ mod tests {
         }
 
         let pusher = std::thread::spawn(move || p.push_block(99));
-        ParkProbe::new().expect_until("push_block to arm its park", || {
+        ParkProbe::expect_until("push_block to arm its park", || {
             c.queue.producer_park.is_parked()
         });
 
@@ -1243,7 +1243,7 @@ mod tests {
         }
         assert!(p.push(99).is_err());
         let h = std::thread::spawn(move || p.push_block(99));
-        ParkProbe::new().expect_until("push_block to arm its park", || {
+        ParkProbe::expect_until("push_block to arm its park", || {
             c.queue.producer_park.is_parked()
         });
         // Close without freeing a slot. Consumer::drop drains first, and
@@ -1290,7 +1290,7 @@ mod tests {
         p.push(1).unwrap();
         p.push(2).unwrap();
         let h = std::thread::spawn(move || p.reserve_block().is_some());
-        ParkProbe::new().expect_until("reserve_block to arm its park", || {
+        ParkProbe::expect_until("reserve_block to arm its park", || {
             c.queue.producer_park.is_parked()
         });
         // Close without freeing a slot, as in

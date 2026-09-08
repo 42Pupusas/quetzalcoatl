@@ -25,6 +25,8 @@ pub mod park_probe;
 #[cfg(feature = "async")]
 pub mod park_registration;
 pub mod park_registry;
+#[cfg(test)]
+pub mod probe_budget;
 #[cfg(all(test, feature = "async"))]
 pub mod progress_watchdog;
 pub mod seq_slot;

@@ -475,7 +475,7 @@ mod tests {
         // Clearing the bit is the one way to stage this without
         // going through the ring's wake path: claiming the handle
         // would deliver the very unpark whose absence is the point.
-        ParkProbe::new().expect_until("the consumer to park", || {
+        ParkProbe::expect_until("the consumer to park", || {
             ring.consumer_park.wake.load(Ordering::Relaxed) != 0
         });
         ring.consumer_park.wake.store(0, Ordering::SeqCst);
@@ -515,12 +515,12 @@ mod tests {
 
         let reader = std::thread::spawn(move || consumer.pop_block());
 
-        ParkProbe::new().expect_until("the consumer to park", || {
+        ParkProbe::expect_until("the consumer to park", || {
             ring.consumer_park.wake.load(Ordering::Relaxed) != 0
         });
         // A real unpark, with nothing for the consumer to find.
         ring.consumer_park.wake_one();
-        ParkProbe::new().expect_until("the consumer to park again", || {
+        ParkProbe::expect_until("the consumer to park again", || {
             ring.consumer_park.wake.load(Ordering::Relaxed) != 0
         });
 
@@ -646,7 +646,7 @@ mod tests {
             producer.push_block(100).expect("consumers dropped");
         });
 
-        ParkProbe::new().expect_until("the pinned producer to park", || {
+        ParkProbe::expect_until("the pinned producer to park", || {
             ring.producer_park.wake.load(Ordering::Relaxed) != 0
         });
 
@@ -654,7 +654,7 @@ mod tests {
         // parked producer is the one that needs slot 0.
         assert_eq!(drainer.pop(), Some(3));
 
-        ParkProbe::new().expect_until("the wake to be spent and the producer to re-park", || {
+        ParkProbe::expect_until("the wake to be spent and the producer to re-park", || {
             ring.backstop_stats().saw_futile_wake()
         });
 
@@ -713,7 +713,7 @@ mod tests {
         let pinned_to_3 = std::thread::spawn(move || {
             other.push_block(97).expect("consumers dropped");
         });
-        ParkProbe::new().expect_until("both producers to park", || {
+        ParkProbe::expect_until("both producers to park", || {
             ring.parked_producer_count() == 2
         });
 
@@ -729,7 +729,7 @@ mod tests {
         // producer never returns and a join would hang the test
         // instead of failing it.
         assert!(
-            ParkProbe::new().wait_until(|| ring.parked_producer_count() == 1),
+            ParkProbe::wait_until(|| ring.parked_producer_count() == 1),
             "the release of slot 0 must wake the producer pinned to it, not the cursor's pick"
         );
         assert!(
@@ -779,14 +779,14 @@ mod tests {
         let a = std::thread::spawn(move || producer.push_block(100));
         let b = std::thread::spawn(move || second.push_block(101));
 
-        ParkProbe::new().expect_until("both producers to park", || {
+        ParkProbe::expect_until("both producers to park", || {
             ring.parked_producer_count() == 2
         });
 
         // One pop, one freed position, one wake.
         assert_eq!(consumer.pop(), Some(0));
 
-        ParkProbe::new().expect_until("a producer to take the freed position", || {
+        ParkProbe::expect_until("a producer to take the freed position", || {
             ring.parked_producer_count() == 1
         });
 
@@ -813,7 +813,7 @@ mod tests {
 
         let reader = std::thread::spawn(move || consumer.pop_block());
 
-        ParkProbe::new().expect_until("the consumer to park", || {
+        ParkProbe::expect_until("the consumer to park", || {
             ring.consumer_park.wake.load(Ordering::Relaxed) != 0
         });
         producer.push(7).unwrap();
@@ -1917,7 +1917,7 @@ mod tests {
             std::thread::spawn(move || p.push_block(99).expect("consumers dropped"))
         };
         drop(p);
-        ParkProbe::new().expect_until("push_block to set its wake bit", || {
+        ParkProbe::expect_until("push_block to set its wake bit", || {
             c.queue.producer_park.wake.load(Ordering::SeqCst) != 0
         });
 
@@ -1958,7 +1958,7 @@ mod tests {
         // Every producer must set its wake bit before the drain runs.
         // Otherwise a producer still spinning can push into a slot the
         // drain just freed, and the drain collects more than CAP.
-        ParkProbe::new().expect_until("all producers to set their wake bit", || {
+        ParkProbe::expect_until("all producers to set their wake bit", || {
             c.queue
                 .producer_park
                 .wake
@@ -1980,9 +1980,8 @@ mod tests {
         // The regression this guards: with wake_one only one producer
         // woke and the rest stayed parked forever. Draining until every
         // producer finishes keeps that a hang-free failure.
-        let probe = ParkProbe::new();
         for (i, h) in producers.into_iter().enumerate() {
-            probe.expect_until(
+            ParkProbe::expect_until(
                 &format!("drain to wake parked producer {i} of {N_PRODUCERS}"),
                 || {
                     c.drain(|_| {});
