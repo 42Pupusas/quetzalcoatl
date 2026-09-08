@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-08
+
+A minor bump with no public API change. The version moves because the
+blocking park path was rewritten underneath it: `PARK_BACKSTOP` is gone
+and every blocking park in the crate is now untimed, so a lost wake is
+a hang rather than a millisecond of latency. That is a different
+failure mode for anyone relying on the old behaviour, whether or not
+the signatures moved.
+
+What that rewrite settled, in order: a stale wake bit could consume a
+wake meant for a live waiter; a release woke a producer round-robin
+rather than the one holding the reserved position, which deadlocked a
+saturated ring once the timeout stopped hiding it; a slotless waiter
+past 64 per side had no way to be found and polled at 1 ms instead;
+and a single lost CAS could exhaust a consumer's scan budget on any
+ring smaller than the skip distance. Seven unwind-safety bugs on the
+reservation and teardown paths were fixed before that.
+
+Verification, since none of the above is provable by inspection: 2000
+stress iterations on a second host with no stall, 46 ignored stress
+tests, the parking layer clean under Miri, clippy clean on the declared
+1.88 MSRV, and `cargo package` verified — 0.14.0 shipped a tarball
+missing nine modules and did not compile for anyone.
+
 ### Changed
 - **Blocking waiters with no park slot are now registered rather than
   polled.** The wake bitmap holds one bit per waiter in a single `u64`,

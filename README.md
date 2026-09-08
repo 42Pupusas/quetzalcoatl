@@ -36,14 +36,14 @@ per-slot atomics, futex-style park/unpark on backpressure. Use
 
 ```toml
 [dependencies]
-quetzalcoatl = "0.12"
+quetzalcoatl = "0.15"
 ```
 
 To enable async support:
 
 ```toml
 [dependencies]
-quetzalcoatl = { version = "0.12", features = ["async"] }
+quetzalcoatl = { version = "0.15", features = ["async"] }
 ```
 
 ## Quick start

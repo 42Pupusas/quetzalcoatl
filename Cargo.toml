@@ -1,6 +1,6 @@
 [package]
 name = "quetzalcoatl"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 # Bisected with `cargo +VERSION check --all-targets --all-features`, not
 # guessed: 1.87 fails on `const Cell::get` (const_cell, stable in 1.88),
