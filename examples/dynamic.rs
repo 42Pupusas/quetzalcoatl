@@ -29,13 +29,13 @@ fn main() {
 
             let p = producer.clone(); // Each connection gets its own producer
             thread::spawn(move || {
-                println!("Connection {} established", connection_id);
+                println!("Connection {connection_id} established");
 
                 // Each connection sends a few messages
                 for msg_num in 0..5 {
                     let message = Message {
                         connection_id,
-                        data: format!("Message {} from connection {}", msg_num, connection_id),
+                        data: format!("Message {msg_num} from connection {connection_id}"),
                     };
 
                     // Push with retry
@@ -54,7 +54,7 @@ fn main() {
                     thread::sleep(Duration::from_millis(5));
                 }
 
-                println!("Connection {} closed", connection_id);
+                println!("Connection {connection_id} closed");
             })
         })
         .collect();
@@ -87,7 +87,7 @@ fn main() {
             }
         }
 
-        println!("\nServer: Processed {} messages total", messages_received);
+        println!("\nServer: Processed {messages_received} messages total");
         messages_received
     });
 
@@ -100,7 +100,7 @@ fn main() {
     let total = consumer_handle.join().unwrap();
 
     println!("\n=== Results ===");
-    println!("Total messages processed: {}", total);
+    println!("Total messages processed: {total}");
     println!("Expected: 50 (10 connections × 5 messages)");
     assert_eq!(total, 50);
     println!("\n✓ All messages received successfully!");

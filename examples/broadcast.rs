@@ -25,12 +25,12 @@ fn main() {
     // Both consumers see the same items
     println!("Consumer 1:");
     while let Some(v) = c1.pop() {
-        println!("  Got: {}", v);
+        println!("  Got: {v}");
     }
 
     println!("\nConsumer 2:");
     while let Some(v) = c2.pop() {
-        println!("  Got: {}", v);
+        println!("  Got: {v}");
     }
 
     // Create a third consumer — it only sees items published from now on.
@@ -43,12 +43,12 @@ fn main() {
 
     println!("Consumer 1:");
     while let Some(v) = c1.pop() {
-        println!("  Got: {}", v);
+        println!("  Got: {v}");
     }
 
     println!("\nConsumer 3 (joined late):");
     while let Some(v) = c3.pop() {
-        println!("  Got: {}", v);
+        println!("  Got: {v}");
     }
 
     // Multi-producer: clone the producer for another thread.
@@ -71,7 +71,7 @@ fn main() {
 
     println!("\nConsumer 2 (multi-producer items):");
     while let Some(v) = c2.pop() {
-        println!("  Got: {}", v);
+        println!("  Got: {v}");
     }
 
     println!("\n=== Example Complete ===");

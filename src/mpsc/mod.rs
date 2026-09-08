@@ -2104,7 +2104,7 @@ mod tests {
         // `Waker::noop()` would not do here: every noop waker is
         // `will_wake`-identical to every other, which would collapse the
         // distinct tasks this test needs.
-        #[allow(clippy::manual_noop_waker)]
+        #[allow(unknown_lints, clippy::manual_noop_waker)]
         impl Wake for Noop {
             fn wake(self: Arc<Self>) {}
         }

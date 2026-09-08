@@ -17,8 +17,7 @@ fn main() {
     let items_per_producer = 100;
 
     println!(
-        "Spawning {} producer threads, each pushing {} items\n",
-        num_producers, items_per_producer
+        "Spawning {num_producers} producer threads, each pushing {items_per_producer} items\n"
     );
 
     // Spawn producer threads
@@ -26,7 +25,7 @@ fn main() {
         .map(|producer_id| {
             let p = producer.clone(); // Clone producer for each thread
             thread::spawn(move || {
-                println!("Producer {} started", producer_id);
+                println!("Producer {producer_id} started");
 
                 for i in 0..items_per_producer {
                     let value = producer_id * 1000 + i;
@@ -42,7 +41,7 @@ fn main() {
                     }
                 }
 
-                println!("Producer {} finished", producer_id);
+                println!("Producer {producer_id} finished");
             })
         })
         .collect();
@@ -68,15 +67,15 @@ fn main() {
         total_consumed += 1;
     }
 
-    println!("Consumer finished consuming {} items\n", total_consumed);
+    println!("Consumer finished consuming {total_consumed} items\n");
 
     // Verify results
     println!("=== Results ===");
-    println!("Total items consumed: {}", total_consumed);
+    println!("Total items consumed: {total_consumed}");
     println!("Expected: {}", num_producers * items_per_producer);
 
     for (id, count) in items_by_producer.iter().enumerate() {
-        println!("  Producer {}: {} items", id, count);
+        println!("  Producer {id}: {count} items");
     }
 
     assert_eq!(total_consumed, num_producers * items_per_producer);

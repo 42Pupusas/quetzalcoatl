@@ -152,7 +152,7 @@ fn main() -> anyhow::Result<()> {
     let result = cqe.result();
 
     assert_eq!(request_id, 42, "unexpected user_data");
-    assert!(result >= 0, "recv failed: {}", result);
+    assert!(result >= 0, "recv failed: {result}");
 
     // Transition slot to COMPLETE — kernel is done.
     // SAFETY: CQE arrived, kernel will not touch this buffer again.

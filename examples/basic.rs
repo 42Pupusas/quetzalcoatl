@@ -16,20 +16,20 @@ fn main() {
     println!("Producer: Pushing items 0-4");
     for i in 0..5 {
         match producer.push(i) {
-            Ok(()) => println!("  Pushed: {}", i),
-            Err(val) => println!("  Failed to push {} (buffer full)", val),
+            Ok(()) => println!("  Pushed: {i}"),
+            Err(val) => println!("  Failed to push {val} (buffer full)"),
         }
     }
 
     println!("\nConsumer: Popping items");
     // Consumer pops items
     while let Some(item) = consumer.pop() {
-        println!("  Popped: {}", item);
+        println!("  Popped: {item}");
     }
 
     println!("\nConsumer: Trying to pop from empty buffer");
     match consumer.pop() {
-        Some(item) => println!("  Popped: {}", item),
+        Some(item) => println!("  Popped: {item}"),
         None => println!("  Buffer is empty"),
     }
 
@@ -43,13 +43,13 @@ fn main() {
     println!("\nConsumer: Popping 3 items");
     for _ in 0..3 {
         if let Some(item) = consumer.pop() {
-            println!("  Popped: {}", item);
+            println!("  Popped: {item}");
         }
     }
 
     println!("\nConsumer: Popping all remaining items");
     while let Some(item) = consumer.pop() {
-        println!("  Popped: {}", item);
+        println!("  Popped: {item}");
     }
 
     println!("\n=== Example Complete ===");

@@ -9,8 +9,6 @@ use super::batch_release::BatchRelease;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
 #[cfg(feature = "async")]
-#[cfg(feature = "async")]
-#[cfg(feature = "async")]
 use crate::common::park_registration::{ParkSite, ParkedFuture};
 #[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
