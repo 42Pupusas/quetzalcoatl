@@ -113,7 +113,6 @@ impl WakeDelivery {
     pub const fn is_in_flight(self) -> bool {
         matches!(self, Self::InFlight)
     }
-
 }
 
 #[cfg(all(test, not(loom)))]

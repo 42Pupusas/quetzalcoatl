@@ -1,7 +1,7 @@
 //! Unwind-safe producer wakes for MPMC drains.
 
-use super::RingBuffer;
 use super::Config;
+use super::RingBuffer;
 
 /// Owns the obligation to wake producers after a drain has freed slots.
 ///

@@ -89,7 +89,6 @@ impl ParkSlot {
     pub const fn is_leased(self) -> bool {
         matches!(self, Self::Leased(_))
     }
-
 }
 
 /// Allocator for the `PARK_SLOTS` park-slot indices of one wake set.

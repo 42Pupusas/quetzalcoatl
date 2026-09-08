@@ -172,7 +172,9 @@ mod tests {
     fn length_survives_the_position_rollover() {
         let cursors = Cursors::new();
         cursors.publish_head(usize::MAX - 1);
-        cursors.tail().store(usize::MAX.wrapping_add(3), Ordering::Relaxed);
+        cursors
+            .tail()
+            .store(usize::MAX.wrapping_add(3), Ordering::Relaxed);
         assert_eq!(cursors.len(), 4);
     }
 

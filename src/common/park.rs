@@ -236,7 +236,11 @@ impl WakeSet {
     /// Starts at the round-robin cursor so that equally-ranked waiters
     /// take turns, rather than the lowest bit absorbing every release.
     #[inline]
-    fn wake_one_ranked(&self, rank: WakeInterest, interest: &impl Fn(usize) -> WakeInterest) -> bool {
+    fn wake_one_ranked(
+        &self,
+        rank: WakeInterest,
+        interest: &impl Fn(usize) -> WakeInterest,
+    ) -> bool {
         loop {
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
@@ -528,7 +532,10 @@ mod tests {
     #[test]
     fn every_wake_path_drains_the_overflow() {
         for (name, wake) in [
-            ("wake_one", &(|s: &WakeSet| s.wake_one()) as &dyn Fn(&WakeSet)),
+            (
+                "wake_one",
+                &(|s: &WakeSet| s.wake_one()) as &dyn Fn(&WakeSet),
+            ),
             ("wake_n", &|s: &WakeSet| s.wake_n(1)),
             ("flush", &|s: &WakeSet| s.flush()),
             ("wake_one_interested", &|s: &WakeSet| {

@@ -14,13 +14,13 @@
 //! [`crate::common::atomics`], which is what makes them modelable.
 
 use crate::common::atomics::AtomicUsize;
-use crate::common::park_registry::ParkRegistry;
 use crate::common::park_registration::{ExclusiveRegistration, ParkRegistration};
+use crate::common::park_registry::ParkRegistry;
 use crate::common::park_registry::ParkSlot;
 use crate::common::wake_async::WakerSet;
 use loom::sync::Arc;
-use std::sync::Arc as StdArc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc as StdArc;
 use std::task::{Context, Wake, Waker};
 
 /// A waker whose wake count is a model-visible atomic, so the final
@@ -238,18 +238,8 @@ fn concurrent_registrations_and_wakes_deliver_exactly_one_wake_each() {
 
         set.wake_all();
 
-        assert_eq!(
-            first.count(),
-            1,
-            "waiter fired {} times",
-            first.count()
-        );
-        assert_eq!(
-            second.count(),
-            1,
-            "waiter fired {} times",
-            second.count()
-        );
+        assert_eq!(first.count(), 1, "waiter fired {} times", first.count());
+        assert_eq!(second.count(), 1, "waiter fired {} times", second.count());
     });
 }
 

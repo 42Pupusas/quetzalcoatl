@@ -55,12 +55,12 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 use crate::capacity::Capacity;
 #[cfg(feature = "async")]
 use crate::common::close_state::CloseState;
+#[cfg(feature = "async")]
+use crate::common::endpoint_count::EndpointCount;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-#[cfg(feature = "async")]
-use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use consumer_floor::ConsumerFloor;
@@ -284,7 +284,6 @@ impl<T> RingBuffer<T> {
     pub fn is_full(&self) -> bool {
         self.len() >= self.capacity.get()
     }
-
 }
 
 impl<T> Drop for RingBuffer<T> {
@@ -1374,7 +1373,6 @@ mod tests {
                 h.join().unwrap();
             }
         }
-
     }
 
     /// A `Waker` is user code and may panic. `commit` publishes the

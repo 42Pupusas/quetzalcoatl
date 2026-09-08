@@ -35,14 +35,14 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+use crate::common::close_state::CloseState;
+use crate::common::cursors::Cursors;
+use crate::common::endpoint_count::EndpointCount;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
-use crate::common::close_state::CloseState;
 use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::cursors::Cursors;
-use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, SeqSlot};
 
 use std::sync::Arc;
@@ -1876,7 +1876,6 @@ mod tests {
             h.join().unwrap();
         }
         ch.join().unwrap();
-
     }
 
     /// A `Waker` is user code and may panic. `commit` publishes the

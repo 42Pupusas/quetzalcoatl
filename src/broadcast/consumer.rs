@@ -76,7 +76,9 @@ impl<T> Consumer<T> {
     /// a capacity-releasing event a blocked producer must learn about.
     #[inline]
     fn advance_head(&self, head: usize) {
-        self.queue.consumers.publish_head_past(self.slot_index, head);
+        self.queue
+            .consumers
+            .publish_head_past(self.slot_index, head);
         self.queue.wake_producer();
         self.queue.notify_producers();
     }

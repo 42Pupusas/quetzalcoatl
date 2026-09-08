@@ -457,29 +457,17 @@ impl BackstopMonitor {
             unwoken_timeouts: self.unwoken_timeouts.load(Ordering::Relaxed),
             rescues: self.rescues.load(Ordering::Relaxed),
             sole_waiter_rescues: self.sole_waiter_rescues.load(Ordering::Relaxed),
-            producer_sole_waiter_rescues: self
-                .producer_sole_waiter_rescues
-                .load(Ordering::Relaxed),
-            blind_sole_waiter_rescues: self
-                .blind_sole_waiter_rescues
-                .load(Ordering::Relaxed),
-            late_sole_waiter_rescues: self
-                .late_sole_waiter_rescues
-                .load(Ordering::Relaxed),
-            waiting_sole_waiter_rescues: self
-                .waiting_sole_waiter_rescues
-                .load(Ordering::Relaxed),
-            wakes_arriving_after_timeout: self
-                .wakes_arriving_after_timeout
-                .load(Ordering::Relaxed),
+            producer_sole_waiter_rescues: self.producer_sole_waiter_rescues.load(Ordering::Relaxed),
+            blind_sole_waiter_rescues: self.blind_sole_waiter_rescues.load(Ordering::Relaxed),
+            late_sole_waiter_rescues: self.late_sole_waiter_rescues.load(Ordering::Relaxed),
+            waiting_sole_waiter_rescues: self.waiting_sole_waiter_rescues.load(Ordering::Relaxed),
+            wakes_arriving_after_timeout: self.wakes_arriving_after_timeout.load(Ordering::Relaxed),
             bit_taken_rescues: self.bit_taken_rescues.load(Ordering::Relaxed),
             slotless_rescues: self.slotless_rescues.load(Ordering::Relaxed),
             futile_wakes: self.futile_wakes.load(Ordering::Relaxed),
             producer_futile_wakes: self.producer_futile_wakes.load(Ordering::Relaxed),
             blind_futile_wakes: self.blind_futile_wakes.load(Ordering::Relaxed),
-            producer_blind_futile_wakes: self
-                .producer_blind_futile_wakes
-                .load(Ordering::Relaxed),
+            producer_blind_futile_wakes: self.producer_blind_futile_wakes.load(Ordering::Relaxed),
         }
     }
 }
@@ -883,7 +871,9 @@ mod tests {
         set.wake_one();
 
         watch.about_to_park(0, false);
-        watch.parked_at(&set, slot, || panic!("a woken waiter must not pay for the sample"));
+        watch.parked_at(&set, slot, || {
+            panic!("a woken waiter must not pay for the sample")
+        });
     }
 
     /// One attempt at the late-wake bracket.

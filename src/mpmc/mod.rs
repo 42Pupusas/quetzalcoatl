@@ -63,9 +63,9 @@ mod done_word;
 mod drain_wake;
 mod producer;
 mod ready_word;
-mod reservation_return;
 #[cfg(feature = "backstop-metrics")]
 mod rescue_evidence;
+mod reservation_return;
 #[cfg(test)]
 mod ring_snapshot;
 mod scan_budget;
@@ -82,13 +82,13 @@ use done_word::DoneWord;
 use ready_word::{ReadyState, ReadyWord};
 
 use crate::capacity::Capacity;
-use crate::common::park::WakeSet;
 use crate::common::close_state::CloseState;
+use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
 
+use crate::common::endpoint_count::EndpointCount;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::endpoint_count::EndpointCount;
 use crate::common::{AlignedBuf, CachePadded};
 
 use std::cell::UnsafeCell;
@@ -390,7 +390,6 @@ impl<T, C: Config> RingBuffer<T, C> {
             self.consumer_park.wake.load(Ordering::Acquire),
         )
     }
-
 
     /// How many producers are currently parked.
     ///
@@ -822,7 +821,8 @@ mod tests {
         drop(holder);
 
         assert_eq!(
-            slot.index().and_then(|index| ring.awaited[index].announced()),
+            slot.index()
+                .and_then(|index| ring.awaited[index].announced()),
             None,
             "a departed producer left a want behind for the next lease to inherit"
         );
@@ -1085,7 +1085,10 @@ mod tests {
     /// on both sides, so an over-subscribed consumer side must also
     /// be reachable without a timeout.
     #[test]
-    #[cfg_attr(miri, ignore = "too slow for Miri: 72 spinning consumers on a 4-slot ring")]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow for Miri: 72 spinning consumers on a 4-slot ring"
+    )]
     fn pop_block_completes_with_more_consumers_than_park_slots() {
         use crate::common::park::PARK_SLOTS;
 
@@ -2318,7 +2321,6 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.load(Ordering::Relaxed), total);
-
     }
 
     /// Blocking and async producers on one saturated ring.
@@ -2415,11 +2417,7 @@ mod tests {
         );
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(
-            seen.len() as u64,
-            total,
-            "no value may be delivered twice"
-        );
+        assert_eq!(seen.len() as u64, total, "no value may be delivered twice");
     }
 
     #[test]
@@ -2777,6 +2775,5 @@ mod tests {
             }
             assert_eq!(received.load(Ordering::Relaxed), total);
         }
-
     }
 }

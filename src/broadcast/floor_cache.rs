@@ -209,7 +209,10 @@ mod tests {
     fn refreshing_republishes_to_both_levels() {
         let cache = FloorCache::new();
         let shared = SharedFloor::new();
-        assert_eq!(cache.refresh(&shared, || ConsumerFloor::At(5)), ConsumerFloor::At(5));
+        assert_eq!(
+            cache.refresh(&shared, || ConsumerFloor::At(5)),
+            ConsumerFloor::At(5)
+        );
         assert_eq!(cache.cached(), ConsumerFloor::At(5));
         assert_eq!(shared.get(), 5);
     }

@@ -442,10 +442,7 @@ mod tests {
         let ids = RegistrationIds::new();
         let peer = CountingWaker::new();
         let id = ids.mint();
-        overflow.register(Registration::new(
-            id,
-            Waker::from(CountingWaker::new()),
-        ));
+        overflow.register(Registration::new(id, Waker::from(CountingWaker::new())));
         overflow.register(Registration::new(
             ids.mint(),
             Waker::from(Arc::clone(&peer)),

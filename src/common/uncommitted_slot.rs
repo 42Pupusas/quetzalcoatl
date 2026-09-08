@@ -181,5 +181,4 @@ mod tests {
         unsafe { storage.assume_init_drop() };
         assert_eq!(count(&counter), 1);
     }
-
 }

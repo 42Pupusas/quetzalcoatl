@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
-use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 #[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
+use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use std::task::Poll;
 

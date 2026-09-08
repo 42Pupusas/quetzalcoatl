@@ -41,8 +41,7 @@ impl DoneWord {
     /// would be equivalent; putting it on the store keeps the pairing
     /// local to the call site.
     pub(super) fn release(&self, round_pos: usize, capacity: Capacity) {
-        self.0
-            .store(round_pos + capacity.get(), Ordering::SeqCst);
+        self.0.store(round_pos + capacity.get(), Ordering::SeqCst);
     }
 
     /// Whether the consumer that claimed `round_pos` released the slot.

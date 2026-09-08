@@ -529,7 +529,11 @@ mod tests {
             &Context::from_waker(&Waker::from(Arc::clone(&survivor))),
         );
         site.set.wake_all();
-        assert_eq!(survivor.count(), 1, "the set stopped working after withdraw");
+        assert_eq!(
+            survivor.count(),
+            1,
+            "the set stopped working after withdraw"
+        );
         let second = CountingWaker::new();
         site.set.register(
             slot0(),

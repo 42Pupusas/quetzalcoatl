@@ -75,7 +75,8 @@ impl SlotSequence {
     /// store that lets a producer overwrite it.
     #[inline]
     pub fn release(&self, head: usize, capacity: Capacity) {
-        self.word.store((head + capacity.get()) * 2, Ordering::Release);
+        self.word
+            .store((head + capacity.get()) * 2, Ordering::Release);
     }
 
     /// Classifies this word against `pos`, pairing it with the storage

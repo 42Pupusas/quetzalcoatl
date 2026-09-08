@@ -184,8 +184,7 @@ mod tests {
     fn waking_fires_the_registered_waker() {
         let ids = RegistrationIds::new();
         let waker = CountingWaker::new();
-        let registration =
-            Registration::new(ids.mint(), Waker::from(Arc::clone(&waker)));
+        let registration = Registration::new(ids.mint(), Waker::from(Arc::clone(&waker)));
 
         registration.wake();
         assert_eq!(waker.count.load(Ordering::Relaxed), 1);

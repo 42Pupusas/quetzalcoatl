@@ -1,6 +1,5 @@
 //! Batched release of consumed MPSC positions.
 
-
 use super::RingBuffer;
 
 /// Owns the obligation to publish a drain's head cursor and to wake the

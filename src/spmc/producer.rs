@@ -7,11 +7,11 @@ use std::task::Poll;
 
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
-use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 #[cfg(feature = "async")]
 use crate::common::park_registry::ParkSlot;
+use crate::common::UncommittedSlot;
 
 /// The producer side of an SPMC ring buffer.
 ///

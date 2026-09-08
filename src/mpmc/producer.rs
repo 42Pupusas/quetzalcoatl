@@ -8,15 +8,14 @@ use super::batch_abandon::BatchAbandon;
 use super::reservation_return::ReservationReturn;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::backoff::Backoff;
-use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::UncommittedSlot;
 
 /// Tight-spin iterations on the primary slot's `done` before
 /// falling back to bitmap scan.
 const PRIMARY_SHORT_SPIN: u32 = 4;
-
 
 /// Cloneable producer for an MPMC ring.
 ///
@@ -319,7 +318,9 @@ impl<T, C: Config> Producer<T, C> {
                 self.has_free_slot(),
             );
             self.queue.producer_park.park();
-            watch.parked_at(&self.queue.producer_park, park_slot, || self.has_free_slot());
+            watch.parked_at(&self.queue.producer_park, park_slot, || {
+                self.has_free_slot()
+            });
             self.queue.producer_park.disarm(park_slot);
         }
     }

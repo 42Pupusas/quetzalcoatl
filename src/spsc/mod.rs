@@ -36,10 +36,10 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::close_state::CloseState;
+use crate::common::cursors::Cursors;
 use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::cursors::Cursors;
 use crate::common::AlignedBuf;
 
 use std::cell::UnsafeCell;
@@ -1479,7 +1479,6 @@ mod tests {
 
         ph.join().unwrap();
         ch.join().unwrap();
-
     }
 
     // -----------------------------------------------------------------------

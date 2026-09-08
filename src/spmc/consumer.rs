@@ -6,9 +6,9 @@ use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
 
+use super::consumer_close::ConsumerClose;
 use super::done_word::DoneWord;
 use super::drain_wake::DrainWake;
-use super::consumer_close::ConsumerClose;
 use super::slot_release::SlotRelease;
 use super::RingBuffer;
 use crate::capacity::Capacity;
@@ -505,7 +505,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
         // SAFETY: `done_ptr` names the slot at `head`, in a ring the
         // consumer's borrow keeps alive.
         let _release = unsafe {
-            SlotRelease::new(self.consumer.ring(), self.done_ptr, self.head, self.capacity)
+            SlotRelease::new(
+                self.consumer.ring(),
+                self.done_ptr,
+                self.head,
+                self.capacity,
+            )
         };
         // SAFETY: the consumer claimed this published position, so the
         // value is initialized and owned by this reader.

@@ -97,8 +97,8 @@ impl<C: Config> ConfigBounds<C> {
 #[cfg(test)]
 mod tests {
     use super::super::RingBuffer;
-    use crate::capacity::Capacity;
     use super::{Cfg, Config, ConfigBounds, DefaultConfig};
+    use crate::capacity::Capacity;
 
     #[test]
     fn default_values_match_the_documented_sweep() {

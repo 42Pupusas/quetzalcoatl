@@ -46,8 +46,8 @@
 //! ```
 
 mod consumer;
-mod done_word;
 mod consumer_close;
+mod done_word;
 mod drain_wake;
 mod producer;
 mod slot_release;
@@ -56,14 +56,14 @@ pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
+use crate::common::close_state::CloseState;
+use crate::common::cursors::Cursors;
+use crate::common::endpoint_count::EndpointCount;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
-use crate::common::close_state::CloseState;
 use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::cursors::Cursors;
-use crate::common::endpoint_count::EndpointCount;
 use crate::common::AlignedBuf;
 use done_word::DoneWord;
 
@@ -1293,8 +1293,7 @@ mod tests {
             }
         }
 
-        let (producer, mut consumer) =
-            RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
         // The first value is read out here; the second stays unread in
         // the consumer's claimed batch, so teardown is what runs its
         // destructor, and it is the one that panics.
@@ -1580,7 +1579,6 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.load(Ordering::Relaxed), total);
-
     }
 
     #[test]

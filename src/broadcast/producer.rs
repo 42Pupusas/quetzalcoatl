@@ -10,10 +10,10 @@ use super::slot_reuse::SlotReuse;
 use super::slot_state::SequenceWord;
 use super::RingBuffer;
 use crate::common::backoff::Backoff;
-use crate::common::UncommittedSlot;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::UncommittedSlot;
 
 /// The producer side of a broadcast ring buffer.
 ///
@@ -172,7 +172,6 @@ impl<T> Producer<T> {
             || self.queue.consumer_floor(),
         )
     }
-
 
     /// Pushes a value, blocking the calling thread when the ring is full
     /// (the slowest consumer hasn't caught up) until a consumer advances

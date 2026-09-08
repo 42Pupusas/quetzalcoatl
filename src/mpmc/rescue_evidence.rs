@@ -80,7 +80,6 @@ impl RescueExplanation {
     pub fn strongest(self, other: Self) -> Self {
         self.max(other)
     }
-
 }
 
 impl From<WakeDelivery> for RescueExplanation {
@@ -192,7 +191,6 @@ impl RescueEvidence {
     pub const fn explanation(self) -> RescueExplanation {
         self.explanation
     }
-
 
     /// Consumes the evidence, resetting for the next episode.
     pub const fn take(&mut self) -> Self {

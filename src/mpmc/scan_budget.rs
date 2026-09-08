@@ -271,10 +271,7 @@ mod tests {
             while !budget.exhausted() {
                 this.seen[budget.position() % cap] = true;
                 this.examinations += 1;
-                assert!(
-                    this.examinations <= 4 * cap,
-                    "a bounded lap must terminate"
-                );
+                assert!(this.examinations <= 4 * cap, "a bounded lap must terminate");
                 advance(&mut budget);
             }
             this
