@@ -93,7 +93,11 @@ impl Registration {
     /// Whether this registration's waker would wake the same task as
     /// `other`'s — true for two futures polled from one task, which is
     /// exactly why the waker cannot serve as identity.
-    #[cfg(test)]
+    ///
+    /// Its only caller is gated out under Miri, where `will_wake` is
+    /// unreliable, so this is gated the same way rather than left as
+    /// dead code there.
+    #[cfg(all(test, not(miri)))]
     #[must_use]
     pub fn will_wake_same_task_as(&self, other: &Self) -> bool {
         self.waker.will_wake(&other.waker)

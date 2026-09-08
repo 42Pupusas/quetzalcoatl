@@ -1049,6 +1049,10 @@ mod tests {
     /// no wake bit, so they are only reachable through the overflow
     /// stack; without it they park untimed and never return.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow for Miri: 72 spinning producers on a 4-slot ring"
+    )]
     fn push_block_completes_with_more_producers_than_park_slots() {
         use crate::common::park::PARK_SLOTS;
 
