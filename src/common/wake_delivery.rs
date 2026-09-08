@@ -2,8 +2,8 @@
 //!
 //! A waiter whose [`park`](super::park_registry::ParkSlot::park) has
 //! returned needs to know whether a peer released it or something else
-//! did — a spurious unpark, a slotless re-check interval, or the timed
-//! park the ring used before the lost-wake defect was found. The
+//! did — a spurious unpark, or the timed park the ring used before the
+//! lost-wake defect was found. The
 //! obvious test is whether its park handle is still armed, since a
 //! waker claims the handle out of the slot to unpark it. That test is
 //! too coarse, and the gap is what this type closes.
@@ -42,9 +42,11 @@
 //! where to look.
 //!
 //! A [`ParkSlot::Shared`] waiter publishes no bit and arms no handle,
-//! so nothing can be inferred about it: its parks *always* end on the
-//! timeout by construction. That is [`Slotless`](Self::Slotless),
-//! which is unwoken without being evidence of anything.
+//! so neither column says anything about it. It is reached through
+//! [`ParkOverflow`](super::park_overflow::ParkOverflow) instead, which
+//! records no per-waiter state a sample could read. That is
+//! [`Slotless`](Self::Slotless): not evidence of a lost wake, just a
+//! waiter this classification cannot see.
 
 use super::park::WakeSet;
 use super::park_registry::ParkSlot;
@@ -195,8 +197,9 @@ mod tests {
         );
     }
 
-    /// A slotless waiter is invisible to every peer, so its timeouts
-    /// are by construction rather than evidence.
+    /// A slotless waiter publishes no bit and arms no handle, so this
+    /// classification cannot see it either way — it is reached through
+    /// the overflow stack, which keeps no per-waiter state to sample.
     #[test]
     fn a_slotless_waiter_is_unwoken_without_being_untouched() {
         let set = WakeSet::new();

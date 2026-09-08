@@ -203,11 +203,12 @@ impl WakerSet {
     ///
     /// # Why every waker, and not one
     ///
-    /// A thread parked by [`super::park::WakeSet`] re-checks the ring
-    /// on a 1 ms `park_timeout`, so a wake sent to a waiter that cannot
-    /// progress costs latency only. An async waiter has no such
-    /// backstop. Once it returns `Poll::Pending`, only its waker can
-    /// poll it again. A wake spent on the wrong waiter is lost for good.
+    /// A thread parked by [`super::park::WakeSet`] is reached through
+    /// its wake bit or the overflow stack, and a peer that cannot use
+    /// a wake re-parks and stays findable. An async waiter has no such
+    /// standing registration. Once it returns `Poll::Pending`, only
+    /// its waker can poll it again, so a wake spent on the wrong
+    /// waiter is lost for good.
     ///
     /// A registered waiter cannot always use the position that was just
     /// freed. An mpmc producer publishes into a per-producer batch, so

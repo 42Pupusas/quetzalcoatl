@@ -332,7 +332,7 @@ impl<T, C: Config> Consumer<T, C> {
             }
 
             watch.about_to_park(q.consumer_park.others_parked(slot), self.has_item());
-            slot.park();
+            q.consumer_park.park();
             watch.parked_at(&q.consumer_park, slot, || self.has_item());
             q.consumer_park.disarm(slot);
         }
@@ -440,7 +440,7 @@ impl<T, C: Config> Consumer<T, C> {
                 self.queue.consumer_park.others_parked(park_slot),
                 self.has_item(),
             );
-            park_slot.park();
+            self.queue.consumer_park.park();
             watch.parked_at(&self.queue.consumer_park, park_slot, || self.has_item());
             self.queue.consumer_park.disarm(park_slot);
         }

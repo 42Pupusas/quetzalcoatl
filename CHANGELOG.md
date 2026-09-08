@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Blocking waiters with no park slot are now registered rather than
+  polled.** The wake bitmap holds one bit per waiter in a single `u64`,
+  so past 64 waiters on a side a lease is refused and the waiter is
+  `ParkSlot::Shared`: it publishes no bit and arms no handle, so no peer
+  can find it. Its only way back to the ring was a 1 ms `park_timeout`.
+
+  That is polling, and it hides exactly the defect this park path has
+  been audited for — a missed wake becomes a millisecond of latency,
+  indistinguishable from scheduling noise — while costing every slotless
+  waiter a thousand wakeups a second on a ring that may be idle.
+
+  `ParkOverflow` gives those waiters somewhere to be found instead: a
+  Treiber stack of `Thread` handles, pushed by `WakeSet::arm` when no
+  lease is held and drained by every wake path (`wake_one`, `wake_n`,
+  `wake_one_wanting`, `flush`). It mirrors `WakerOverflow`, which
+  already did this for async waiters. An empty stack — the case for any
+  ring under 64 waiters per side — costs one `SeqCst` load per wake.
+
+  **Every blocking park in the crate is now untimed.** A wake that never
+  comes is a hang rather than a stall, so a lost-wake defect can no
+  longer hide as latency.
+
+  `ParkSlot::park` is gone; parking no longer depends on which slot a
+  waiter holds, so it is `WakeSet::park`, beside the `arm`/`disarm` it
+  is sequenced with.
+
 ### Added
 - **`backstop-metrics`, a diagnostic feature that measures whether
   mpmc's `PARK_BACKSTOP` is still needed.** The 1ms bound on a parked

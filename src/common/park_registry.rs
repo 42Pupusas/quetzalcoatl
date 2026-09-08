@@ -16,27 +16,21 @@
 //! [`ParkRegistry`] instead leases slots and takes them back, so an
 //! index is reused only after its previous holder is gone. A lease is
 //! refused when every slot is held; the caller falls back to
-//! [`ParkSlot::Shared`], which self-rescues on a timeout rather than
-//! relying on a wake that has nowhere to land.
+//! [`ParkSlot::Shared`], which has no bit to publish and is instead
+//! found through [`ParkOverflow`], the stack every wake path drains.
+//!
+//! [`ParkOverflow`]: super::park_overflow::ParkOverflow
 
 use super::atomics::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use super::park::PARK_SLOTS;
 
-/// How long a slotless waiter sleeps before re-checking on its own.
-///
-/// It holds no bit in the wake bitmap, so no peer can find it. The
-/// timeout is its only path back to the ring, and it bounds the extra
-/// latency such a waiter can suffer.
-#[cfg(not(loom))]
-const SHARED_PARK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
-
 /// A waiter's claim on a park slot.
 ///
 /// `Leased` carries an index no other live waiter holds. `Shared` means
-/// the registry was full: the waiter parks on a timeout and re-checks
-/// the ring itself.
+/// the registry was full: the waiter has no bit in the wake bitmap and
+/// is reached through the overflow stack instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ParkSlot {
     Leased(u32),
@@ -96,24 +90,6 @@ impl ParkSlot {
         matches!(self, Self::Leased(_))
     }
 
-    /// Parks the calling thread until woken, or — with no slot — until
-    /// the re-check interval elapses.
-    ///
-    /// A leased waiter's park has no timeout: a wake that never comes
-    /// is a hang, not a stall, so a lost-wake defect cannot hide as
-    /// latency.
-    #[inline]
-    pub fn park(self) {
-        match self {
-            Self::Leased(_) => super::atomics::thread::park(),
-            #[cfg(not(loom))]
-            Self::Shared => std::thread::park_timeout(SHARED_PARK_INTERVAL),
-            // Loom does not mock `park_timeout`; a slotless waiter
-            // under the model relies on its peers' wakes instead.
-            #[cfg(loom)]
-            Self::Shared => super::atomics::thread::park(),
-        }
-    }
 }
 
 /// Allocator for the `PARK_SLOTS` park-slot indices of one wake set.

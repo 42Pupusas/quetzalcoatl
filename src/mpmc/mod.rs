@@ -878,6 +878,72 @@ mod tests {
         assert_eq!(h.join().unwrap(), Some(7));
     }
 
+    /// More blocking producers than `PARK_SLOTS`, so the registry is
+    /// exhausted and the surplus are [`ParkSlot::Shared`]. Those hold
+    /// no wake bit, so they are only reachable through the overflow
+    /// stack; without it they park untimed and never return.
+    #[test]
+    fn push_block_completes_with_more_producers_than_park_slots() {
+        use crate::common::park::PARK_SLOTS;
+
+        const EXTRA: usize = 8;
+        let n_producers = PARK_SLOTS + EXTRA;
+        let (p, c) = RingBuffer::<usize>::new(Capacity::exact(4)).split();
+
+        let handles: Vec<_> = (0..n_producers)
+            .map(|i| {
+                let p = p.clone();
+                std::thread::spawn(move || p.push_block(i))
+            })
+            .collect();
+        drop(p);
+
+        let mut got = 0usize;
+        while got < n_producers {
+            if c.pop().is_some() {
+                got += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Ok(()));
+        }
+    }
+
+    /// The consumer half of the same property: mpmc leases park slots
+    /// on both sides, so an over-subscribed consumer side must also
+    /// be reachable without a timeout.
+    #[test]
+    fn pop_block_completes_with_more_consumers_than_park_slots() {
+        use crate::common::park::PARK_SLOTS;
+
+        const EXTRA: usize = 8;
+        let n_consumers = PARK_SLOTS + EXTRA;
+        let (p, c) = RingBuffer::<usize>::new(Capacity::exact(4)).split();
+
+        let handles: Vec<_> = (0..n_consumers)
+            .map(|_| {
+                let c = c.clone();
+                std::thread::spawn(move || c.pop_block())
+            })
+            .collect();
+        drop(c);
+
+        for i in 0..n_consumers {
+            while p.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+
+        let mut received: Vec<usize> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().expect("every consumer got a value"))
+            .collect();
+        received.sort_unstable();
+        assert_eq!(received, (0..n_consumers).collect::<Vec<_>>());
+    }
+
     #[test]
     fn pop_block_returns_none_on_close() {
         // After all producers drop and the queue is empty,

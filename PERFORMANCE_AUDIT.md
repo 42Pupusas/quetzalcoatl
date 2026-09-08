@@ -301,6 +301,61 @@ small and biased sample, not a measured frequency. Slotless waiters are
 ruled out for this harness specifically: it uses two producers and two
 consumers against 64 park slots, so every waiter holds a lease.
 
+### The last timeout: slotless waiters
+
+With `PARK_BACKSTOP` gone, one timed park remained. The wake bitmap is
+a single `u64`, so past 64 waiters on a side a lease is refused and the
+waiter becomes [`ParkSlot::Shared`] — no bit, no handle, unreachable by
+any peer. Its rescue was a 1 ms `park_timeout`: sleep, re-check, sleep
+again. Correct, but polling, and the exact shape this audit exists to
+remove: a lost wake and a slow one are indistinguishable, and every
+slotless waiter costs a thousand wakeups a second on an idle ring.
+
+The async side had already solved the same problem. A slotless *async*
+waiter cannot poll itself at all, so
+[`WakerOverflow`](src/common/waker_overflow.rs) gives it somewhere to
+be found. [`ParkOverflow`](src/common/park_overflow.rs) is the blocking
+twin: a Treiber stack of `Thread` handles that `WakeSet::arm` pushes to
+when no lease is held, and that all four wake paths drain. Every
+blocking park in the crate is now untimed.
+
+The drain is load-bearing, and shown to be: with it disabled, both the
+new slotless test and the pre-existing mpsc
+`push_block_completes_with_more_producers_than_park_slots` hang rather
+than fail. That second one is the interesting half — it has always
+over-subscribed the registry, and the timeout was what let it pass.
+mpmc twins now cover both of its sides, since mpmc leases producer and
+consumer slots independently.
+
+Clippy caught the design consequence: `ParkSlot::park` no longer read
+its own slot. Parking had stopped being a property of *which* slot a
+waiter holds, so it moved to `WakeSet::park`, beside the `arm` and
+`disarm` it is sequenced with.
+
+#### A metric shift that is not a regression
+
+On `block_stress_diagnostic` the change looked alarming:
+`sole_waiter_rescues` went from 0–1 (baseline, three runs) to 3–8
+(three runs), and futile wakes roughly doubled.
+
+It is timing, not correctness. The harness runs two producers and two
+consumers against 64 slots, so it **never leases a slotless waiter and
+never touches the overflow at all**. Two controls confirm it:
+
+1. A bare dummy `SeqCst` load/store added to `wake_one_published` and
+   `arm` on baseline — no overflow, no logic change — reproduced
+   `futile=184` against a baseline of ~90.
+2. A full `ParkOverflow` field, allocated and drained on every wake
+   path exactly as in the real change, but whose `arm` never registers,
+   gave `sole=5, futile=146, unwoken=16` — squarely in the range of the
+   real change.
+
+The counters are sensitive to a few extra atomic operations on the wake
+path. That is a caveat on the instrument, recorded here because the
+naive reading of those numbers is that a fix caused a regression.
+
+[`ParkSlot::Shared`]: src/common/park_registry.rs
+
 ### Position-targeted wakes: built, measured, rejected
 
 The obvious fix follows from the pin: have a waiter publish the

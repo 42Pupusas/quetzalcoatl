@@ -19,6 +19,7 @@
 use super::atomics::{fence, AtomicU64};
 use std::sync::atomic::Ordering;
 
+use super::park_overflow::ParkOverflow;
 use super::park_registry::ParkSlot;
 use super::thread_parker::ThreadParker;
 use super::AlignedBuf;
@@ -61,6 +62,13 @@ pub struct WakeSet {
     /// (holding the position the refill needed) stayed parked
     /// forever.
     pub cursor: AtomicU64,
+    /// Waiters that could not lease a park slot. The bitmap has room
+    /// for exactly [`PARK_SLOTS`], so past that a waiter is
+    /// [`ParkSlot::Shared`] and has no bit to publish; it registers
+    /// here instead and every wake path drains the stack. Empty in
+    /// all but heavily over-subscribed rings, where it costs one
+    /// `SeqCst` load per wake.
+    pub overflow: ParkOverflow,
 }
 
 impl WakeSet {
@@ -70,6 +78,7 @@ impl WakeSet {
             wake: AtomicU64::new(0),
             parkers: AlignedBuf::new_with(PARK_SLOTS, ThreadParker::new),
             cursor: AtomicU64::new(0),
+            overflow: ParkOverflow::new(),
         }
     }
 
@@ -125,6 +134,7 @@ impl WakeSet {
     /// Dekker-style missed wake described on [`wake_one`].
     #[inline]
     pub fn wake_one_published(&self) {
+        self.overflow.wake_all();
         // Round-robin: rotate the bitmap so the slot just past
         // `cursor` is the new lowest bit, and pick its trailing
         // zero. Without this, `trailing_zeros` always picks the
@@ -186,6 +196,7 @@ impl WakeSet {
     #[inline]
     pub fn wake_one_wanting(&self, wants: impl Fn(usize) -> bool) {
         fence(Ordering::SeqCst);
+        self.overflow.wake_all();
         let mut bits = self.wake.load(Ordering::SeqCst);
         while bits != 0 {
             let bit = bits.trailing_zeros();
@@ -227,6 +238,7 @@ impl WakeSet {
         // sampling the bitmap so prior Release stores on
         // `ready`/`done` are globally visible.
         fence(Ordering::SeqCst);
+        self.overflow.wake_all();
         let mut cursor = self.cursor.load(Ordering::Relaxed);
         let mut woken = 0usize;
         while woken < n {
@@ -259,6 +271,7 @@ impl WakeSet {
     /// Wakes every waiter parked on the bitmap, swapping it to zero
     /// in the process. Cold-path helper for close-time draining.
     pub fn flush(&self) {
+        self.overflow.wake_all();
         let mut bits = self.wake.swap(0, Ordering::AcqRel);
         while bits != 0 {
             let b = bits.trailing_zeros() as usize;
@@ -290,14 +303,37 @@ impl WakeSet {
     }
 
     /// Arms this waiter's handle and publishes its wake bit, so a peer
-    /// can find it. Slotless waiters publish nothing.
+    /// can find it.
     ///
-    /// The `SeqCst` `fetch_or` is the ordering half of the handshake:
+    /// A slotless waiter has no bit; it registers on the
+    /// [`overflow`](Self::overflow) stack instead, which every wake
+    /// path drains. Either way the waiter is reachable by a peer
+    /// before it parks, so its park needs no timeout.
+    ///
+    /// The `SeqCst` `fetch_or` — and the `SeqCst` CAS that pushes an
+    /// overflow registration — is the ordering half of the handshake:
     /// it must precede the caller's final re-check of the ring.
     #[inline]
     pub fn arm(&self, slot: ParkSlot) {
+        if !slot.is_leased() {
+            self.overflow.register();
+            return;
+        }
         self.arm_handle(slot);
         self.wake.fetch_or(slot.mask(), Ordering::SeqCst);
+    }
+
+    /// Parks the calling thread until a peer wakes it.
+    ///
+    /// No timeout, and none is needed: [`arm`](Self::arm) leaves every
+    /// waiter reachable before it parks — a leased one through its
+    /// wake bit, a slotless one through the overflow stack. A wake
+    /// that never comes is therefore a hang rather than a stall, so a
+    /// lost-wake defect cannot hide as latency.
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub fn park(&self) {
+        super::atomics::thread::park();
     }
 
     /// Clears this waiter's wake bit.
@@ -406,6 +442,79 @@ mod tests {
         set.arm(ParkSlot::Shared);
         assert_eq!(set.parked_bits(), 0);
         assert!(!set.is_armed(ParkSlot::Shared));
+    }
+
+    /// Having no bit is why it must be registered somewhere else: the
+    /// bitmap cannot represent it, so the overflow stack does.
+    #[test]
+    fn a_slotless_waiter_registers_on_the_overflow() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Shared);
+        assert_eq!(set.overflow.depth(), 1);
+    }
+
+    #[test]
+    fn a_leased_waiter_never_touches_the_overflow() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Leased(4));
+        assert!(set.overflow.is_empty());
+    }
+
+    /// Every wake path has to drain the overflow, or a slotless
+    /// waiter parks with nobody able to reach it.
+    #[test]
+    fn every_wake_path_drains_the_overflow() {
+        for (name, wake) in [
+            ("wake_one", &(|s: &WakeSet| s.wake_one()) as &dyn Fn(&WakeSet)),
+            ("wake_n", &|s: &WakeSet| s.wake_n(1)),
+            ("flush", &|s: &WakeSet| s.flush()),
+            ("wake_one_wanting", &|s: &WakeSet| {
+                s.wake_one_wanting(|_| true);
+            }),
+        ] {
+            let set = WakeSet::new();
+            set.arm(ParkSlot::Shared);
+            assert_eq!(set.overflow.depth(), 1, "{name}: registration lost");
+            wake(&set);
+            assert!(
+                set.overflow.is_empty(),
+                "{name} left a slotless waiter registered and unreachable"
+            );
+        }
+    }
+
+    /// The behaviour the timeout used to provide, now provided by a
+    /// peer: a slotless waiter parks untimed and a wake releases it.
+    /// Without the overflow drain this hangs.
+    #[cfg(not(loom))]
+    #[test]
+    fn a_slotless_waiter_parks_untimed_and_a_peer_wake_releases_it() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let set = Arc::new(WakeSet::new());
+        let released = Arc::new(AtomicBool::new(false));
+
+        let waiter = {
+            let set = Arc::clone(&set);
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                set.arm(ParkSlot::Shared);
+                set.park();
+                released.store(true, Ordering::Release);
+            })
+        };
+
+        while set.overflow.is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(
+            !released.load(Ordering::Acquire),
+            "the waiter returned before any wake — the park was not untimed"
+        );
+        set.wake_one();
+        waiter.join().unwrap();
+        assert!(released.load(Ordering::Acquire));
     }
 
     #[test]

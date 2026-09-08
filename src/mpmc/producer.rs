@@ -300,7 +300,7 @@ impl<T, C: Config> Producer<T, C> {
                 self.queue.producer_park.others_parked(park_slot),
                 self.has_free_slot(),
             );
-            park_slot.park();
+            self.queue.producer_park.park();
             watch.parked_at(&self.queue.producer_park, park_slot, || self.has_free_slot());
             self.queue.producer_park.disarm(park_slot);
         }
@@ -360,7 +360,7 @@ impl<T, C: Config> Producer<T, C> {
             }
 
             watch.about_to_park(q.producer_park.others_parked(slot), self.has_free_slot());
-            slot.park();
+            q.producer_park.park();
             watch.parked_at(&q.producer_park, slot, || self.has_free_slot());
             q.producer_park.disarm(slot);
         }

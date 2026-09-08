@@ -286,7 +286,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 return self.pop();
             }
 
-            slot.park();
+            q.consumer_park.park();
             q.consumer_park.disarm(slot);
         }
     }
@@ -400,7 +400,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 return None;
             }
 
-            slot.park();
+            self.ring().consumer_park.park();
             self.ring().consumer_park.disarm(slot);
         }
     }

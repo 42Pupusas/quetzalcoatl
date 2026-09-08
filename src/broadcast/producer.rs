@@ -240,7 +240,7 @@ impl<T> Producer<T> {
                 continue;
             }
 
-            slot.park();
+            q.producer_park.park();
             q.producer_park.disarm(slot);
             backoff.reset();
         }
@@ -278,7 +278,7 @@ impl<T> Producer<T> {
                 return self.reserve();
             }
 
-            slot.park();
+            self.queue.producer_park.park();
             self.queue.producer_park.disarm(slot);
         }
     }

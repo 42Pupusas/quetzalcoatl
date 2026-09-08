@@ -188,7 +188,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 Err(returned) => val = returned,
             }
 
-            slot.park();
+            q.producer_park.park();
             q.producer_park.disarm(slot);
             backoff.reset();
         }
@@ -299,7 +299,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
                 return Some(claim);
             }
 
-            slot.park();
+            self.ring().producer_park.park();
             self.ring().producer_park.disarm(slot);
             backoff.reset();
         }

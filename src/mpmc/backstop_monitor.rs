@@ -8,23 +8,23 @@
 //! against. Silently, the backstop could not tell those apart — a lost
 //! wake became a millisecond of latency and nothing else.
 //!
-//! The bound is gone. The counters stay, because they are the only
-//! instrument that can see a lost wake short of a hang, and the
-//! ignored stress harness prints them. What changes without the
-//! timeout is *when* a park can return unwoken: only on a spurious
-//! unpark, or on the slotless re-check interval. A rescue is
-//! therefore no longer common enough to need the round-robin and
-//! timing splits to interpret — but the splits still apply, and a
-//! non-zero `waiting_sole_waiter_rescues` remains the one reading
-//! that only a lost wake can produce.
+//! The bound is gone, and so is the slotless waiter's re-check
+//! interval: every blocking park in the ring is now untimed. The
+//! counters stay, because they are the only instrument that can see a
+//! lost wake short of a hang, and the ignored stress harness prints
+//! them. What changes without any timeout is *when* a park can return
+//! unwoken: only on a spurious unpark. A rescue is therefore no longer
+//! common enough to need the round-robin and timing splits to
+//! interpret — but the splits still apply, and a non-zero
+//! `waiting_sole_waiter_rescues` remains the one reading that only a
+//! lost wake can produce.
 //!
 //! # What the counts mean
 //!
 //! A waiter's park handle is claimed by whoever wakes it, so a handle
 //! still armed after the park returns proves no peer delivered a wake.
 //! That is an *unwoken timeout* (the name predates the bound's
-//! removal), and a slotless waiter produces one per re-check interval
-//! by construction.
+//! removal).
 //!
 //! The diagnostic count is a *rescue*: an unwoken timeout whose very
 //! next re-check found work. The waiter was waiting for something that

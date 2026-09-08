@@ -9,8 +9,9 @@
 //! `park_registry`) and the blocking park/wake handshake.
 //!
 //! Loom does mock `park` and `unpark`, so parking is modelable; the
-//! [`thread`] alias below routes it. What loom does not mock is
-//! `park_timeout`, which only the slotless fallback still uses.
+//! [`thread`] alias below routes it. No park in the blocking path
+//! takes a timeout, so nothing here depends on `park_timeout`, which
+//! loom does not mock.
 //!
 //! The ring slot machinery stays out of scope: a model of it would be
 //! far too large to enumerate.

@@ -19,6 +19,7 @@ mod loom_models;
 pub mod park;
 #[cfg(all(test, loom))]
 mod park_handshake_model;
+pub mod park_overflow;
 #[cfg(test)]
 pub mod park_probe;
 #[cfg(feature = "async")]
