@@ -1,0 +1,88 @@
+stages:
+  - probe
+  - verify
+  - campaign
+
+variables:
+  CARGO_TERM_COLOR: never
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+  RUST_BACKTRACE: "1"
+
+default:
+  tags:
+    - ansible
+  cache:
+    key:
+      files:
+        - Cargo.toml
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - target
+
+# The park campaign's whole claim is "another host, another
+# scheduler". A result without the core count and kernel is not a
+# second data point, it is an anecdote.
+.host_identity: &host_identity
+  - uname -a
+  - nproc
+  - cargo --version
+  - rustc --version
+
+host:
+  stage: probe
+  script:
+    - *host_identity
+    - cargo --version || echo "NO CARGO — install a toolchain on this runner"
+
+test:
+  stage: verify
+  script:
+    - *host_identity
+    - cargo test
+    - cargo test --features async
+    - cargo test --all-features
+    - cargo clippy --all-targets -- -D warnings
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+# The open audit item. Every blocking park in the crate is untimed, so
+# a lost wake is a hang: this job either completes or it stalls, and
+# both are results. Manual because it is ~200s per 2000 iterations and
+# because a stall should be looked at, not retried.
+park-campaign:
+  stage: campaign
+  when: manual
+  timeout: 2h
+  variables:
+    QUETZALCOATL_STRESS_ITERS: "2000"
+  script:
+    - *host_identity
+    - cargo test --release --features backstop-metrics -- --ignored --nocapture block_stress_diagnostic 2>&1 | tee campaign.log
+  artifacts:
+    when: always
+    paths:
+      - campaign.log
+    expire_in: 1 month
+
+stress:
+  stage: campaign
+  when: manual
+  timeout: 3h
+  script:
+    - *host_identity
+    - cargo test --release --features async -- --ignored
+    - cargo test --release --all-features -- --ignored
+
+bench:
+  stage: campaign
+  when: manual
+  timeout: 2h
+  script:
+    - *host_identity
+    - cargo bench 2>&1 | tee bench.log
+  artifacts:
+    when: always
+    paths:
+      - bench.log
+    expire_in: 1 month
