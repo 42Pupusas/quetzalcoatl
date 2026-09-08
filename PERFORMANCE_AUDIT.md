@@ -612,7 +612,38 @@ a lost wake, not a latency artefact.
 - Linux perf counters are available. A HEAD MPSC spin/8 screening run worked, but counters wrapped Cargo and the entire benchmark process; they are not per-item costs.
 - `cargo graph --manifest-path ... --report` returned zero types. This is not a valid structural-health result; resolve its source-root invocation before relying on it. Doctor likewise checked the home directory rather than the repository; Cargo commands here used explicit manifest paths.
 
-Ignored stress tests, package verification, and a complete feature/build matrix have not been run in this audit. Passing ordinary tests is not proof of concurrency correctness.
+Ignored stress tests, package verification, and a complete feature/build
+matrix have since been run; see "Release gates" below. Passing ordinary
+tests is still not proof of concurrency correctness.
+
+## Release gates
+
+Run against `308ec59`, after the campaign completed on a second host.
+
+| Gate | Result |
+|---|---|
+| `cargo package` (builds the tarball it produces) | verifies; 83 files |
+| Ignored stress tests, release, all features | 46 passed |
+| `block_stress_diagnostic`, 200 iters, instrumented | `rescues=0`, `unwoken_timeouts=0` |
+| Park campaign, 2000 iters, second host | no stall |
+| Default / `async` / all-features tests | pass, 15 doctests |
+| `--no-default-features` tests | 551 passed |
+| Clippy, all targets: default, all-features, `backstop-metrics` | clean at `-D warnings` |
+| Clippy and tests on 1.88, the declared MSRV | clean |
+| Miri, parking layer | 68 tests clean |
+
+The tarball check is the one that matters most by history: 0.14.0
+shipped with nine `common/` modules missing from `include`, so the
+published crate did not compile at all. `cargo package` is what catches
+that, and it is now green.
+
+### What is not proven
+
+The campaign is evidence from two hosts, not a proof. `wake_one_wanting`
+is a linear walk of the parked bitmap with an announcement load per set
+bit: fine at the 2–8 parked producers every harness here exercises, and
+unmeasured at 64. Neither is a correctness gap, and neither blocks a
+patch release.
 
 ## Next steps, in priority order
 
@@ -621,10 +652,23 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 3. Cover all five topologies: push/pop, reserve/commit/pop_ref, drain, saturation, empty-to-nonempty wake latency, endpoint churn, and cancellation. Include async on/off and >64 live waiters for overflow paths.
 4. Run the ignored stress tests with timeouts, package verification, and the remaining build/test/Clippy feature combinations.
 5. Consider a debug-only assertion, or a test helper, that fails when a release/wake/close is reachable only through code that may unwind. Seven instances of one shape were found by reading; the eighth will not be.
-6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
+6. **Done — `PARK_BACKSTOP` is gone.** Kept for the reasoning, which
+   generalizes: a bound on the path being measured makes a lost wake
+   and a slow one indistinguishable, so the instrument agreed with a
+   benign explanation that was wrong. The original entry read:
+
+   **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
 7. **Consumer blind futile wakes: resolved as far as the residual goes.** The scan-budget fix was off by one on its first attempt and did nothing; the corrected accounting (one examination per lost CAS) engaged, and `blind` sole-waiter rescues read zero in every bracketed campaign since. The blind *futile* count is still non-zero (21–36 per 2000) and still has the documented false-positive mode; it is a rate for comparing policies, not a defect count, and is no longer on the path to the backstop decision.
 
-8. **`PARK_BACKSTOP` is removed; the deadlock it hid is fixed.** See "The deadlock, and the routing that fixes it". Remaining: (a) run the unbounded campaign on another host, since one box proves one scheduler; (b) the `Shared` park slot still polls at 1 ms by construction — a ring with more than 64 live producers or consumers on one side has waiters no wake can reach, and that is now the only timed park in mpmc; (c) `wake_one_wanting` is a linear walk of the parked bitmap with an announcement load per set bit — fine at 2–8 parked producers, unmeasured at 64.
+8. **`PARK_BACKSTOP` is removed; the deadlock it hid is fixed.** See
+   "The deadlock, and the routing that fixes it". Of the three items
+   left open here, (a) the campaign on a second host has run: 2000
+   iterations, no stall, on a lower-core and more loaded runner than
+   this one. (b) the `Shared` park slot no longer polls — `ParkOverflow`
+   closed that and every blocking park in the crate is untimed; see
+   "The last timeout: slotless waiters". (c) `wake_one_wanting`'s linear
+   walk is still unmeasured past 8 parked producers, and is the one
+   genuinely open item of the three.
 
 9. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 10. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.
