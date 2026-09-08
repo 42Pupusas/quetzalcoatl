@@ -637,6 +637,53 @@ shipped with nine `common/` modules missing from `include`, so the
 published crate did not compile at all. `cargo package` is what catches
 that, and it is now green.
 
+### Comparative screening against crossbeam and tokio
+
+Run at `ff07a84`, 20 samples, `--max-time 1`, same host as everything
+above. Medians. These compare against implementations whose correctness
+is not in question, which is the point: the internal benches can only
+say HEAD moved relative to itself.
+
+| Case | quetzalcoatl | crossbeam | tokio |
+|---|---:|---:|---:|
+| SPSC, 1M items | **19.6 ms** | 43.6 ms | — |
+| MPSC, 1 producer | 125.6 µs | **98.1 µs** | 560.6 µs |
+| MPSC, 4 | **251.1 µs** | 269.4 µs | 3.397 ms |
+| MPSC, 8 | **866.5 µs** | 1.007 ms | 7.339 ms |
+| MPSC, 16 | **1.655 ms** | 8.966 ms | 17.47 ms |
+| SPMC, 8 consumers | **440.0 µs** | 1.410 ms | — |
+| Broadcast, 8 consumers | **462.3 µs** | — | 2.124 ms |
+| Large (2 KB) SPSC | **474.2 µs** | 680.0 µs | — |
+| Large MPSC, 4 | **351.0 µs** | 863.2 µs | 724.7 µs |
+
+The shape worth reading is scaling, not any single row. crossbeam wins
+the uncontended MPSC case (98 µs against 126) and stays close through 8
+producers, then degrades sharply: at 16 producers it is 5.4x slower
+than quetzalcoatl, which is roughly flat from 4 producers on. Broadcast
+and SPMC hold their advantage across the consumer sweep.
+
+This does not contradict the MPSC-spin regressions in the tables above.
+Those are HEAD against v0.14.0 on a harness that times ring allocation
+and thread spawning; this is HEAD against other crates. Both can be
+true, and the second is the one that says the crate is not slow in
+absolute terms.
+
+**Zero-copy does not pay here.** `reserve`/`pop_ref` on a 2 KB payload
+is within noise of `push`/`pop` in SPSC (458.8 µs against 474.2 µs) and
+*slower* at MPSC/4 (434.3 µs against 351.0 µs). The API's value is
+avoiding a move of a type that cannot afford one; on a 2 KB `Copy`
+struct the memcpy is cheaper than the reservation protocol. Worth
+saying plainly rather than presenting the feature as a throughput win.
+
+**One construction cost, explained.** `mpsc_split`'s
+`quetzalcoatl_setup` is 52.6 µs against crossbeam's 2.6 µs, while
+`spmc_split`'s is 2.3 µs at the same 8192 capacity. The difference is
+`WakeSet::new`, which allocates `PARK_SLOTS` = 64 `ThreadParker`s;
+mpsc's producer side has one and spmc's does not. It is a fixed cost
+per ring, invisible in the steady-state rows, and it is why a harness
+that builds a ring inside the timed region measures something other
+than throughput.
+
 ### What is not proven
 
 The campaign is evidence from two hosts, not a proof. `wake_one_wanting`
