@@ -747,6 +747,67 @@ mod tests {
         assert_eq!(rest, vec![Some(97), Some(98), Some(99), Some(100)]);
     }
 
+    /// A park slot outlives the producer that leased it, so an
+    /// announcement must not.
+    ///
+    /// `wake_producer_for` routes by reading `awaited[slot]` for every
+    /// slot whose bit is set. A producer that stops parking leaves its
+    /// last announcement published; `ParkRegistry` then hands the slot
+    /// to a new producer, which arms the same bit. The new holder is
+    /// now advertising positions the *previous* holder reserved, and a
+    /// release of one of those is routed to it. It finds nothing, and
+    /// re-parks having consumed the release.
+    ///
+    /// The stale word is only reachable through a live bit, so the
+    /// test drives it through the lease: park a producer, let it
+    /// announce, drop it, and check the recycled slot answers as a
+    /// fresh one.
+    #[test]
+    fn a_recycled_park_slot_advertises_nothing_from_its_last_holder() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
+        let ring = std::sync::Arc::clone(&producer.queue);
+        let drainer = consumer.clone();
+        let mut holder = consumer;
+
+        producer.push(0).unwrap();
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        producer.push(3).unwrap();
+
+        let held = holder.pop_ref().unwrap();
+        assert_eq!(*held, 0);
+        assert_eq!(drainer.pop(), Some(1));
+        assert_eq!(drainer.pop(), Some(2));
+
+        producer.push(99).unwrap();
+        assert!(producer.push(100).is_err(), "pinned to slot 0");
+
+        let slot = producer.park_slot;
+        let parked = std::thread::spawn(move || {
+            producer.push_block(100).expect("consumers dropped");
+        });
+        ParkProbe::expect_until("the producer to park and announce", || {
+            ring.producer_park.wake.load(Ordering::Relaxed) != 0
+        });
+        assert!(
+            slot.index()
+                .is_some_and(|index| ring.awaited[index].announced().is_some()),
+            "the parked producer must have announced its batch"
+        );
+
+        drop(held);
+        parked.join().unwrap();
+        drop(drainer);
+        drop(holder);
+
+        assert_eq!(
+            slot.index().and_then(|index| ring.awaited[index].announced()),
+            None,
+            "a departed producer left a want behind for the next lease to inherit"
+        );
+    }
+
     /// The bound on the pin: producers blocked by a *full ring* are
     /// interchangeable, so misrouting is harmless there.
     ///

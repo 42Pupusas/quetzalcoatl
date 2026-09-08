@@ -206,6 +206,22 @@ impl<T, C: Config> Producer<T, C> {
         }
     }
 
+    /// Withdraws this producer's announcement, so the park slot names
+    /// nothing once it stops waiting.
+    ///
+    /// Park slots are recycled by
+    /// [`ParkRegistry`](crate::common::park_registry::ParkRegistry).
+    /// An announcement left published outlives the wait it described,
+    /// and the next producer to lease the slot arms its bit beneath
+    /// it — so a release is routed to a producer that never reserved
+    /// the position, and the one that did stays parked.
+    #[inline]
+    fn retract_awaited(&self) {
+        if let Some(index) = self.park_slot.index() {
+            self.queue.awaited[index].retract();
+        }
+    }
+
     /// Pushes a value. Returns `Err(val)` if the ring is full from
     /// this producer's perspective (approximate — based on the
     /// `consumed` watermark, which lags real consumer progress).
@@ -289,10 +305,12 @@ impl<T, C: Config> Producer<T, C> {
             // SeqCst: post-arm half of the close handshake.
             if self.queue.consumer_closed.is_closed_for_parking() {
                 self.queue.producer_park.disarm(park_slot);
+                self.retract_awaited();
                 return None;
             }
             if self.reserve().is_some() {
                 self.queue.producer_park.disarm(park_slot);
+                self.retract_awaited();
                 return self.reserve();
             }
 
@@ -350,12 +368,14 @@ impl<T, C: Config> Producer<T, C> {
                 Ok(()) => {
                     watch.made_progress();
                     q.producer_park.disarm(slot);
+                    self.retract_awaited();
                     return Ok(());
                 }
                 Err(returned) => val = returned,
             }
             if q.consumer_closed.is_closed_for_parking() {
                 q.producer_park.disarm(slot);
+                self.retract_awaited();
                 return Err(val);
             }
 
@@ -416,6 +436,9 @@ impl<T, C: Config> Drop for Producer<T, C> {
         // once the consumers are gone.
         BatchAbandon::new(&self.queue).release_all(self.batch_start.get(), self.batch_unused.get());
 
+        // Before the slot is handed to another producer, so it cannot
+        // inherit a want this producer no longer has.
+        self.retract_awaited();
         self.queue.producer_slots.release(self.park_slot);
         if self.queue.producer_count.release() {
             // SeqCst pairs with consumer's `closed.load(SeqCst)` in

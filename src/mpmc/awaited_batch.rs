@@ -55,6 +55,18 @@ impl AwaitedBatch {
         self.0.store(word, Ordering::Relaxed);
     }
 
+    /// Withdraws any announcement, leaving the slot as a fresh one.
+    ///
+    /// A producer that stops parking leaves its last announcement
+    /// published, and `ParkRegistry` recycles park slots. Without
+    /// this, a new lease holder arms its bit under the previous
+    /// holder's word and is routed positions it never reserved,
+    /// spending the release a pinned producer was waiting for.
+    #[inline]
+    pub(super) fn retract(&self) {
+        self.0.store(Self::ANY, Ordering::Relaxed);
+    }
+
     /// Whether the announcer reserved `pos` and is waiting for it.
     ///
     /// A producer waiting for a refill has reserved nothing and does
@@ -140,6 +152,56 @@ mod tests {
         awaited.announce(100, u32::MAX);
         assert!(awaited.wants(131));
         assert!(!awaited.wants(132));
+    }
+
+    /// A producer stops parking without retracting its announcement,
+    /// and `ParkRegistry` hands the slot to a new producer on the next
+    /// lease. The word left behind still names positions, so it can
+    /// attract a targeted wake on behalf of a producer that is no
+    /// longer waiting for anything.
+    ///
+    /// `wake_one_wanting` only spends the wake if the slot's bit is
+    /// also set, so a stale announcement over a *clear* bit costs
+    /// nothing. The reachable case is the inherited one: a new lease
+    /// holder arms its bit while the previous holder's word is still
+    /// published, and is then routed a position it never reserved.
+    /// Its own re-check finds nothing, and it re-parks having spent
+    /// the release that the genuinely pinned producer needed.
+    #[test]
+    fn a_slot_reused_by_a_new_producer_does_not_inherit_the_old_want() {
+        let awaited = AwaitedBatch::new();
+        awaited.announce(100, 0b1111);
+        assert!(awaited.wants(101), "the first producer is pinned here");
+
+        awaited.retract();
+
+        assert!(
+            !awaited.wants(101),
+            "a producer that stopped parking must not still attract a wake"
+        );
+        assert_eq!(
+            awaited.announced(),
+            None,
+            "a retracted slot is indistinguishable from a fresh one"
+        );
+    }
+
+    /// Retracting is what a fresh lease inherits, so the two must
+    /// agree: a recycled slot has to look exactly like a new one.
+    #[test]
+    fn a_retracted_slot_matches_a_fresh_one() {
+        let fresh = AwaitedBatch::new();
+        let reused = AwaitedBatch::new();
+        reused.announce(4096, 0b1011);
+        reused.retract();
+
+        for pos in [0usize, 1, 4095, 4096, 4097, 4099, usize::MAX] {
+            assert_eq!(
+                reused.wants(pos),
+                fresh.wants(pos),
+                "a recycled slot must not answer differently at {pos}"
+            );
+        }
     }
 
     /// The packed word keeps only the low 32 bits of `start`, so the
