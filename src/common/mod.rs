@@ -41,6 +41,8 @@ pub mod uncommitted_slot;
 pub mod wake_async;
 #[cfg(feature = "backstop-metrics")]
 pub mod wake_delivery;
+
+pub mod wake_interest;
 #[cfg(feature = "async")]
 pub mod waker_overflow;
 

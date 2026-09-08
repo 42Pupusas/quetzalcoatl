@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use super::park_overflow::ParkOverflow;
 use super::park_registry::ParkSlot;
 use super::thread_parker::ThreadParker;
+use super::wake_interest::WakeInterest;
 use super::AlignedBuf;
 
 /// Park-slot count.
@@ -193,18 +194,56 @@ impl WakeSet {
     /// a want, be passed over here, and then park — but its own
     /// re-check after arming sees the release, which is the same
     /// handshake that protects the untargeted path.
+    ///
+    /// Wakes the parked waiter with the strongest claim on this
+    /// release, asking `interest` what each one can do with it.
+    ///
+    /// Two passes, strongest claim first: the waiter that reserved the
+    /// position, then any waiter that can take whatever frees. A
+    /// waiter that declines is never woken, because waking it delivers
+    /// nothing and spends the release.
+    ///
+    /// The blind fallback this replaces treated "declines" and "wants
+    /// anything" alike, so a release nobody reserved could go to a
+    /// waiter pinned elsewhere while one that could use it stayed
+    /// parked. If every parked waiter declines, nothing is woken:
+    /// there is nobody this release can help, and retiring a bit to
+    /// prove it only strands the waiter behind it.
+    ///
+    /// Ordering matches [`wake_one`](Self::wake_one) — the leading
+    /// fence drains the caller's store buffer so a waiter that armed
+    /// before the release is visible here, and one that armed after
+    /// catches the release in its own post-arm re-check.
     #[inline]
-    pub fn wake_one_wanting(&self, wants: impl Fn(usize) -> bool) {
+    pub fn wake_one_interested(&self, interest: impl Fn(usize) -> WakeInterest) {
         fence(Ordering::SeqCst);
         self.overflow.wake_all();
-        let mut bits = self.wake.load(Ordering::SeqCst);
-        while bits != 0 {
-            let bit = bits.trailing_zeros();
-            let mask = 1u64 << bit;
-            bits &= !mask;
-            if !wants(bit as usize) {
-                continue;
+        for rank in [WakeInterest::Reserved, WakeInterest::Any] {
+            if self.wake_one_ranked(rank, &interest) {
+                return;
             }
+        }
+    }
+
+    /// One pass of [`wake_one_interested`](Self::wake_one_interested),
+    /// waking a waiter whose interest is exactly `rank`. Returns
+    /// whether an unpark was delivered.
+    ///
+    /// Starts at the round-robin cursor so that equally-ranked waiters
+    /// take turns, rather than the lowest bit absorbing every release.
+    #[inline]
+    fn wake_one_ranked(&self, rank: WakeInterest, interest: &impl Fn(usize) -> WakeInterest) -> bool {
+        loop {
+            let ws = self.wake.load(Ordering::SeqCst);
+            if ws == 0 {
+                return false;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let shift = self.cursor.load(Ordering::Relaxed) as u32 & PARK_MASK_U32;
+            let Some(bit) = Self::next_matching(ws, shift, rank, interest) else {
+                return false;
+            };
+            let mask = 1u64 << bit;
             let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
             if prev & mask == 0 {
                 continue;
@@ -212,10 +251,30 @@ impl WakeSet {
             self.cursor
                 .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
             if self.parkers[bit as usize].wake() {
-                return;
+                return true;
             }
         }
-        self.wake_one_published();
+    }
+
+    /// The first set bit at or after the cursor whose interest is
+    /// `rank`, scanning in round-robin order.
+    #[inline]
+    fn next_matching(
+        ws: u64,
+        shift: u32,
+        rank: WakeInterest,
+        interest: &impl Fn(usize) -> WakeInterest,
+    ) -> Option<u32> {
+        let mut rotated = ws.rotate_right(shift);
+        while rotated != 0 {
+            let rel_bit = rotated.trailing_zeros();
+            rotated &= !(1u64 << rel_bit);
+            let bit = (rel_bit + shift) & PARK_MASK_U32;
+            if interest(bit as usize) == rank {
+                return Some(bit);
+            }
+        }
+        None
     }
 
     /// Wakes up to `n` parked waiters. Used by drain-style operations
@@ -392,7 +451,7 @@ impl Default for WakeSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParkSlot, WakeSet, PARK_SLOTS};
+    use super::{ParkSlot, WakeInterest, WakeSet, PARK_SLOTS};
     use std::sync::atomic::Ordering;
 
     impl WakeSet {
@@ -468,8 +527,8 @@ mod tests {
             ("wake_one", &(|s: &WakeSet| s.wake_one()) as &dyn Fn(&WakeSet)),
             ("wake_n", &|s: &WakeSet| s.wake_n(1)),
             ("flush", &|s: &WakeSet| s.flush()),
-            ("wake_one_wanting", &|s: &WakeSet| {
-                s.wake_one_wanting(|_| true);
+            ("wake_one_interested", &|s: &WakeSet| {
+                s.wake_one_interested(|_| WakeInterest::Reserved);
             }),
         ] {
             let set = WakeSet::new();
@@ -642,7 +701,13 @@ mod tests {
         // Cursor would pick slot 0 next.
         set.cursor.store(0, Ordering::Relaxed);
 
-        set.wake_one_wanting(|slot| slot == 2);
+        set.wake_one_interested(|slot| {
+            if slot == 2 {
+                WakeInterest::Reserved
+            } else {
+                WakeInterest::Any
+            }
+        });
 
         assert!(set.is_armed(ParkSlot::Leased(0)));
         assert!(set.is_armed(ParkSlot::Leased(1)));
@@ -659,19 +724,86 @@ mod tests {
         set.arm_all(&[0, 1]);
         set.cursor.store(1, Ordering::Relaxed);
 
-        set.wake_one_wanting(|_| false);
+        set.wake_one_interested(|_| WakeInterest::Any);
 
         assert!(
             !set.is_armed(ParkSlot::Leased(1)),
-            "nobody wanted it, so the cursor's pick is served"
+            "nobody reserved it, so the cursor's pick among the takers is served"
         );
         assert!(set.is_armed(ParkSlot::Leased(0)));
+    }
+
+    /// A release every parked waiter declines must wake nobody.
+    /// Waking one anyway spends the release on a waiter that re-parks,
+    /// and the waiter it was owed to is never reached.
+    #[test]
+    fn a_release_every_waiter_declines_wakes_nobody() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1, 2]);
+
+        set.wake_one_interested(|_| WakeInterest::Declines);
+
+        assert_eq!(
+            set.parked_bits(),
+            0b111,
+            "a waiter that cannot use the release must stay parked"
+        );
+    }
+
+    /// Ranking is by claim, not by position: the reserving waiter is
+    /// served even when a waiter that would take anything sits ahead
+    /// of it in round-robin order.
+    #[test]
+    fn a_reserving_waiter_outranks_one_that_would_take_anything() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        set.cursor.store(0, Ordering::Relaxed);
+
+        set.wake_one_interested(|slot| {
+            if slot == 1 {
+                WakeInterest::Reserved
+            } else {
+                WakeInterest::Any
+            }
+        });
+
+        assert!(
+            set.is_armed(ParkSlot::Leased(0)),
+            "the waiter that would take anything must yield to the one that reserved it"
+        );
+        assert!(!set.is_armed(ParkSlot::Leased(1)));
+    }
+
+    /// With nobody reserving, the release still reaches a waiter that
+    /// can use it rather than stopping at one that declines.
+    #[test]
+    fn a_declining_waiter_does_not_absorb_a_release_another_can_use() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        set.cursor.store(0, Ordering::Relaxed);
+
+        set.wake_one_interested(|slot| {
+            if slot == 0 {
+                WakeInterest::Declines
+            } else {
+                WakeInterest::Any
+            }
+        });
+
+        assert!(
+            set.is_armed(ParkSlot::Leased(0)),
+            "the declining waiter must not be woken"
+        );
+        assert!(
+            !set.is_armed(ParkSlot::Leased(1)),
+            "the waiter that could use the release must get it"
+        );
     }
 
     #[test]
     fn a_targeted_wake_on_an_empty_set_wakes_nobody() {
         let set = WakeSet::new();
-        set.wake_one_wanting(|_| true);
+        set.wake_one_interested(|_| WakeInterest::Reserved);
         assert_eq!(set.parked_bits(), 0);
     }
 
@@ -683,7 +815,7 @@ mod tests {
         set.arm_all(&[0, 1]);
         assert!(set.parkers[0].wake());
 
-        set.wake_one_wanting(|_| true);
+        set.wake_one_interested(|_| WakeInterest::Reserved);
 
         assert!(
             !set.is_armed(ParkSlot::Leased(1)),

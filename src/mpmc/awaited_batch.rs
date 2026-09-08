@@ -7,7 +7,7 @@
 //! nothing and re-parks, and the pinned one is not woken again unless
 //! a further release happens to pick it. With the consumers idle there
 //! is no further release, and the ring is deadlocked with a free slot in
-//! it. `a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot`
+//! it. `a_release_a_pinned_producer_cannot_use_does_not_reach_it`
 //! stages exactly this.
 //!
 //! The batch is published here as a compact pair packed into one word:
@@ -23,6 +23,7 @@
 //! release is the deadlock in another form: a release for a pinned
 //! producer spent on one that cannot refill, and then re-parks.
 
+use crate::common::wake_interest::WakeInterest;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A parked producer's announced batch, or "anything".
@@ -67,14 +68,26 @@ impl AwaitedBatch {
         self.0.store(Self::ANY, Ordering::Relaxed);
     }
 
-    /// Whether the announcer reserved `pos` and is waiting for it.
+    /// What the announcer can do with a release of `pos`.
     ///
-    /// A producer waiting for a refill has reserved nothing and does
-    /// not want any specific position; it is served by the caller's
-    /// fallback, after every pinned producer has been asked.
+    /// The three cases are distinct and a router needs all three. A
+    /// producer that announced a batch containing `pos` is the one the
+    /// release belongs to. One that announced nothing is waiting for a
+    /// refill and will take whatever frees first. One that announced a
+    /// batch *without* `pos` is pinned elsewhere: the release cannot
+    /// advance it, so waking it spends the release and leaves the
+    /// producer that could have used it parked.
     #[inline]
-    pub(super) fn wants(&self, pos: usize) -> bool {
-        Self::matches(self.0.load(Ordering::Relaxed), pos)
+    pub(super) fn interest(&self, pos: usize) -> WakeInterest {
+        let word = self.0.load(Ordering::Relaxed);
+        if word == Self::ANY {
+            return WakeInterest::Any;
+        }
+        if Self::matches(word, pos) {
+            WakeInterest::Reserved
+        } else {
+            WakeInterest::Declines
+        }
     }
 
     /// The announced `(start, unused)`, or `None` for "anything".
@@ -105,36 +118,51 @@ impl AwaitedBatch {
 
 #[cfg(test)]
 mod tests {
-    use super::AwaitedBatch;
+    use super::{AwaitedBatch, WakeInterest};
 
     #[test]
     fn a_fresh_announcement_wants_nothing_in_particular() {
         let awaited = AwaitedBatch::new();
-        assert!(!awaited.wants(0));
-        assert!(!awaited.wants(usize::MAX));
+        assert_eq!(awaited.interest(0), WakeInterest::Any);
+        assert_eq!(awaited.interest(usize::MAX), WakeInterest::Any);
     }
 
     #[test]
     fn an_announced_batch_wants_only_its_unused_positions() {
         let awaited = AwaitedBatch::new();
         awaited.announce(100, 0b1010);
-        assert!(!awaited.wants(100));
-        assert!(awaited.wants(101));
-        assert!(!awaited.wants(102));
-        assert!(awaited.wants(103));
-        assert!(!awaited.wants(104));
-        assert!(!awaited.wants(99));
+        assert_eq!(awaited.interest(101), WakeInterest::Reserved);
+        assert_eq!(awaited.interest(103), WakeInterest::Reserved);
+        for pos in [99usize, 100, 102, 104] {
+            assert_eq!(awaited.interest(pos), WakeInterest::Declines);
+        }
+    }
+
+    /// The distinction routing depends on: a producer pinned to other
+    /// positions can do nothing with this release, while one waiting
+    /// to refill can take whatever frees. Both fail to name `pos`, so
+    /// a yes/no answer collapses them and the release goes to the one
+    /// that cannot use it.
+    #[test]
+    fn a_pinned_producer_declines_where_a_refilling_one_takes_anything() {
+        let pinned = AwaitedBatch::new();
+        pinned.announce(100, 0b1);
+        let refilling = AwaitedBatch::new();
+        refilling.announce(100, 0);
+
+        assert_eq!(pinned.interest(200), WakeInterest::Declines);
+        assert_eq!(refilling.interest(200), WakeInterest::Any);
     }
 
     /// A producer waiting to refill is not a taker for a specific
-    /// release: serving it first would spend a pinned producer's wake
-    /// on one that cannot use it.
+    /// release: serving it ahead of a pinned producer would spend the
+    /// wake the pinned one was owed.
     #[test]
     fn an_exhausted_batch_wants_nothing_in_particular() {
         let awaited = AwaitedBatch::new();
         awaited.announce(100, 0);
-        assert!(!awaited.wants(7));
-        assert!(!awaited.wants(100));
+        assert_eq!(awaited.interest(7), WakeInterest::Any);
+        assert_eq!(awaited.interest(100), WakeInterest::Any);
     }
 
     #[test]
@@ -142,16 +170,16 @@ mod tests {
         let awaited = AwaitedBatch::new();
         awaited.announce(100, 0b1);
         awaited.announce(200, 0b1);
-        assert!(!awaited.wants(100));
-        assert!(awaited.wants(200));
+        assert_eq!(awaited.interest(100), WakeInterest::Declines);
+        assert_eq!(awaited.interest(200), WakeInterest::Reserved);
     }
 
     #[test]
     fn a_position_far_beyond_the_batch_is_not_wanted() {
         let awaited = AwaitedBatch::new();
         awaited.announce(100, u32::MAX);
-        assert!(awaited.wants(131));
-        assert!(!awaited.wants(132));
+        assert_eq!(awaited.interest(131), WakeInterest::Reserved);
+        assert_eq!(awaited.interest(132), WakeInterest::Declines);
     }
 
     /// A producer stops parking without retracting its announcement,
@@ -160,7 +188,7 @@ mod tests {
     /// attract a targeted wake on behalf of a producer that is no
     /// longer waiting for anything.
     ///
-    /// `wake_one_wanting` only spends the wake if the slot's bit is
+    /// `wake_one_interested` only spends the wake if the slot's bit is
     /// also set, so a stale announcement over a *clear* bit costs
     /// nothing. The reachable case is the inherited one: a new lease
     /// holder arms its bit while the previous holder's word is still
@@ -171,12 +199,17 @@ mod tests {
     fn a_slot_reused_by_a_new_producer_does_not_inherit_the_old_want() {
         let awaited = AwaitedBatch::new();
         awaited.announce(100, 0b1111);
-        assert!(awaited.wants(101), "the first producer is pinned here");
+        assert_eq!(
+            awaited.interest(101),
+            WakeInterest::Reserved,
+            "the first producer is pinned here"
+        );
 
         awaited.retract();
 
-        assert!(
-            !awaited.wants(101),
+        assert_ne!(
+            awaited.interest(101),
+            WakeInterest::Reserved,
             "a producer that stopped parking must not still attract a wake"
         );
         assert_eq!(
@@ -197,8 +230,8 @@ mod tests {
 
         for pos in [0usize, 1, 4095, 4096, 4097, 4099, usize::MAX] {
             assert_eq!(
-                reused.wants(pos),
-                fresh.wants(pos),
+                reused.interest(pos),
+                fresh.interest(pos),
                 "a recycled slot must not answer differently at {pos}"
             );
         }
@@ -211,9 +244,9 @@ mod tests {
         let awaited = AwaitedBatch::new();
         let start = (1usize << 32) - 2;
         awaited.announce(start, 0b111);
-        assert!(awaited.wants(start));
-        assert!(awaited.wants(start + 1));
-        assert!(awaited.wants(start + 2));
-        assert!(!awaited.wants(start + 3));
+        for offset in 0..3 {
+            assert_eq!(awaited.interest(start + offset), WakeInterest::Reserved);
+        }
+        assert_eq!(awaited.interest(start + 3), WakeInterest::Declines);
     }
 }

@@ -288,10 +288,17 @@ impl<T, C: Config> RingBuffer<T, C> {
     /// holding a partial batch can only use the release of one of its
     /// own positions, and a wake spent on any other producer leaves
     /// it parked with its slot free.
+    ///
+    /// Routing reads each parked producer's announcement as a
+    /// three-way answer, because "did not reserve `pos`" hides two
+    /// different producers: one waiting for a refill, which any
+    /// release serves, and one pinned to other positions, which this
+    /// release cannot serve at all. Waking the latter spends the
+    /// release on a producer that re-parks immediately.
     #[inline]
     pub(crate) fn wake_producer_for(&self, pos: usize) {
         self.producer_park
-            .wake_one_wanting(|slot| self.awaited[slot].wants(pos));
+            .wake_one_interested(|slot| self.awaited[slot].interest(pos));
     }
 
     /// Wakes the async producer tasks waiting for space.
@@ -605,23 +612,28 @@ mod tests {
         );
     }
 
-    /// The consequence of the pin: a `pop` frees one exact position,
-    /// and a wake spent on a producer that cannot use it leaves the
-    /// one that can parked with its slot free.
+    /// The consequence of the pin: a release of a position the sole
+    /// parked producer did not reserve must not be delivered to it.
     ///
     /// `pinned` holds position 4 (slot 0) and is parked in
-    /// `push_block`. The freed position is 5 (slot 1), which `pinned`
-    /// cannot use. With one producer parked and round-robin routing,
-    /// the wake was spent on it and it re-parked; the futile-wake
-    /// counter recorded the loss. With routing by position the wake
-    /// is not delivered to it at all: nobody wants position 5, so the
-    /// fallback serves the cursor's pick, which is still `pinned` —
-    /// a futile wake either way when it is the sole waiter. The test
-    /// that separates the two routings is
-    /// [`a_release_wakes_the_producer_that_reserved_the_position`].
+    /// `push_block`. The freed position is 5 (slot 1), which it cannot
+    /// use. Round-robin routing spent the wake on it and it re-parked,
+    /// which the futile-wake counter recorded; routing on a yes/no
+    /// predicate did the same, because "did not reserve 5" fell
+    /// through to the cursor's pick and the cursor pointed back at the
+    /// only waiter there was.
+    ///
+    /// Reading the announcement as three-way ends that: `pinned`
+    /// declines position 5 outright, and a release no parked producer
+    /// can use wakes nobody. The waiter stays parked until its own
+    /// position frees, and the wake is not spent proving it could not
+    /// be used.
+    ///
+    /// The counter is the evidence, so it is asserted to stay at zero
+    /// across the whole episode rather than merely at the end.
     #[test]
     #[cfg(feature = "backstop-metrics")]
-    fn a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot() {
+    fn a_release_a_pinned_producer_cannot_use_does_not_reach_it() {
         let (producer, consumer) =
             RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
         let filler = producer.clone();
@@ -642,6 +654,7 @@ mod tests {
         producer.push(99).unwrap();
         assert!(producer.push(100).is_err(), "pinned to slot 0");
 
+        let park_slot = producer.park_slot;
         let pinned = std::thread::spawn(move || {
             producer.push_block(100).expect("consumers dropped");
         });
@@ -650,22 +663,29 @@ mod tests {
             ring.producer_park.wake.load(Ordering::Relaxed) != 0
         });
 
-        // Frees position 5 (slot 1) and wakes one producer. The only
-        // parked producer is the one that needs slot 0.
+        // Frees position 5 (slot 1). The only parked producer needs
+        // slot 0, so this release has no taker.
+        //
+        // Routing decides and clears the wake bit inside `pop`, on
+        // this thread, so the check needs no waiting: if the release
+        // had been delivered, the bit would already be gone.
         assert_eq!(drainer.pop(), Some(3));
 
-        ParkProbe::expect_until("the wake to be spent and the producer to re-park", || {
-            ring.backstop_stats().saw_futile_wake()
-        });
+        assert!(
+            ring.producer_park.is_armed(park_slot),
+            "a release the only parked producer had not reserved was \
+             delivered to it anyway"
+        );
 
+        // Its own position at last.
         drop(held);
         pinned.join().unwrap();
 
         let stats = ring.backstop_stats();
-        assert!(
-            stats.futile_wakes >= 1,
-            "a pop's wake reached a producer that could not use the freed \
-             position: {stats:?}"
+        assert_eq!(
+            stats.futile_wakes, 0,
+            "no wake should have been spent on a producer that could not \
+             use the freed position: {stats:?}"
         );
     }
 
@@ -808,6 +828,91 @@ mod tests {
         );
     }
 
+    /// A release nobody reserved must go to a producer that can use
+    /// it, not to one that provably cannot.
+    ///
+    /// Two producers park for different reasons. `pinned` holds a
+    /// partial batch and can only continue on position 4. `refilling`
+    /// has an exhausted batch and no reservation at all, so whatever
+    /// frees first lets it refill. The release of position 6 belongs
+    /// to neither, but only one of them can act on it.
+    ///
+    /// Routing on a yes/no predicate cannot tell them apart: both
+    /// answer "no", so the release fell through to round-robin, which
+    /// the cursor here points at `pinned`. It wakes, finds position 4
+    /// still held, and re-parks — and `refilling` is never woken,
+    /// because nothing else is going to release. Reading the
+    /// announcement as three-way separates "pinned elsewhere" from
+    /// "wants anything" and sends the wake to the producer that can
+    /// use it.
+    ///
+    /// The discriminating assertion is that `refilling` completes
+    /// while `pinned` is still parked. It is polled rather than
+    /// joined: with the wake misrouted this hangs, and a join would
+    /// hang the suite instead of failing the test.
+    #[test]
+    fn a_release_no_producer_reserved_goes_to_one_that_can_use_it() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
+        let refilling = producer.clone();
+        let ring = std::sync::Arc::clone(&producer.queue);
+        let drainer = consumer.clone();
+        let mut holder = consumer;
+
+        producer.push(0).unwrap();
+        producer.push(1).unwrap();
+        refilling.push(2).unwrap();
+        refilling.push(3).unwrap();
+
+        let held = holder.pop_ref().unwrap();
+        assert_eq!(*held, 0);
+        assert_eq!(drainer.pop(), Some(1));
+
+        // Takes batch {4, 5}: publishes 5, keeps 4 (slot 0, held).
+        producer.push(99).unwrap();
+        assert!(producer.push(100).is_err(), "pinned to slot 0");
+
+        let pinned_slot = producer.park_slot;
+        assert_eq!(pinned_slot, ParkSlot::Leased(0));
+
+        let pinned = std::thread::spawn(move || {
+            producer.push_block(100).expect("consumers dropped");
+        });
+        let refiller = std::thread::spawn(move || {
+            refilling.push_block(101).expect("consumers dropped");
+        });
+        ParkProbe::expect_until("both producers to park", || {
+            ring.parked_producer_count() == 2
+        });
+
+        // Round-robin would pick the pinned producer, which cannot use
+        // what this release frees.
+        ring.producer_park.cursor.store(0, Ordering::Relaxed);
+
+        // Frees position 2 (slot 2), releasing it for round 6. The
+        // pinned producer wants 4 and declines; only the refilling one
+        // can take it.
+        assert_eq!(drainer.pop(), Some(2));
+
+        assert!(
+            ParkProbe::wait_until(|| ring.parked_producer_count() == 1),
+            "a release nobody reserved was spent on the producer pinned elsewhere"
+        );
+        assert!(
+            ring.producer_park.is_armed(pinned_slot),
+            "the pinned producer must still be waiting for its own position"
+        );
+        refiller.join().unwrap();
+
+        // Its own position at last, which only it wants.
+        drop(held);
+        pinned.join().unwrap();
+
+        let mut rest = vec![drainer.pop(), drainer.pop(), drainer.pop(), drainer.pop()];
+        rest.sort_unstable();
+        assert_eq!(rest, vec![Some(3), Some(99), Some(100), Some(101)]);
+    }
+
     /// The bound on the pin: producers blocked by a *full ring* are
     /// interchangeable, so misrouting is harmless there.
     ///
@@ -820,7 +925,7 @@ mod tests {
     /// So the misrouting only bites when a producer parks holding a
     /// *partial batch* — which needs out-of-order consumption to
     /// arise, as in
-    /// [`a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot`].
+    /// [`a_release_a_pinned_producer_cannot_use_does_not_reach_it`].
     /// Recording the boundary keeps the claim from being stated more
     /// broadly than the evidence supports.
     #[test]
