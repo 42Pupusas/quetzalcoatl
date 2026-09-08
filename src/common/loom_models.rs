@@ -96,33 +96,112 @@ fn a_withdrawn_waiter_never_drops_a_live_peers_waker() {
 /// A wake racing a cancellation must claim the waker at most once:
 /// both paths take the registration with a single `swap`, so exactly
 /// one of them can find it. A double fire (`count == 2`) means a wake
-/// path fired a waker it had not removed. The cancelling thread owns
-/// the registration and reaches the set through it, the shape a real
-/// cancelled future has.
+/// path fired a registration it had not removed.
+///
+/// The withdrawal runs on this thread while a peer wakes concurrently,
+/// which is the shape a cancelled future has: the guard owns the
+/// registration and reaches the set through it.
+///
+/// This used to arm a registration and merely drop it. Dropping an
+/// [`ExclusiveRegistration`] only clears its local field — it does not
+/// touch the set — so no withdrawal ever ran and the model checked a
+/// lone `wake_all` against nothing. The `withdraw` call below is the
+/// race the name promises.
 #[test]
 fn a_wake_and_a_withdraw_claim_the_waker_at_most_once() {
     loom::model(|| {
         let set = Arc::new(WakerSet::new());
         let waiter = CountingWaker::new();
+        let waker = Waker::from(StdArc::clone(&waiter));
 
-        {
-            let waker = Waker::from(StdArc::clone(&waiter));
-            let mut reg = ExclusiveRegistration::new(slot0());
-            reg.arm(&set, &ctx(&waker));
-        }
+        let mut reg = ExclusiveRegistration::new(slot0());
+        reg.arm(&set, &ctx(&waker));
 
-        let canceller = {
+        let waking = {
             let set = Arc::clone(&set);
             loom::thread::spawn(move || {
                 set.wake_all();
             })
         };
-        canceller.join().unwrap();
+        reg.withdraw(&set);
+        waking.join().unwrap();
 
         assert!(
             waiter.count() <= 1,
             "the waker fired {} times",
             waiter.count()
+        );
+
+        // Whoever lost the race left nothing behind: a withdrawal that
+        // ran first must not leave its entry for a later wake, and a
+        // wake that ran first must not leave one for the withdrawal.
+        set.wake_all();
+        assert!(
+            waiter.count() <= 1,
+            "a registration outlived both the wake and the withdrawal"
+        );
+    });
+}
+
+/// A cancelled waiter must never take a sibling's registration with
+/// it. Two futures polled from one task carry equal wakers, so only
+/// the registration id distinguishes them; under every interleaving of
+/// a withdrawal against the sibling's arm, the sibling must still be
+/// reachable.
+///
+/// # Why "at least once" and not "exactly once"
+///
+/// One schedule leaves the cancelled registration behind for the next
+/// wake, so the task can be polled twice. The sibling's `arm` displaces
+/// the cancelled entry out of the slot and pushes it to the overflow in
+/// two steps, and a withdrawal that runs between them finds the slot
+/// holding the sibling and the overflow not yet holding itself. Both
+/// then land on the overflow.
+///
+/// That is a spurious poll, which the wake path already documents as
+/// its cost, and it is bounded: the entry is drained by the next wake
+/// rather than accumulating. A sequential cancel/retry loop — the case
+/// that actually leaked — has no such window, and
+/// `a_cancel_retry_loop_leaves_nothing_behind` pins it at zero.
+///
+/// The property that must hold under every schedule is that the live
+/// sibling is woken. Losing it is the lost-wakeup defect; an extra poll
+/// is not.
+#[test]
+fn a_withdrawal_never_removes_a_siblings_registration() {
+    loom::model(|| {
+        let set = Arc::new(WakerSet::new());
+        let task = CountingWaker::new();
+        let waker = Waker::from(StdArc::clone(&task));
+
+        let mut cancelled = ExclusiveRegistration::new(slot0());
+        cancelled.arm(&set, &ctx(&waker));
+
+        let sibling = {
+            let set = Arc::clone(&set);
+            let waker = Waker::from(StdArc::clone(&task));
+            loom::thread::spawn(move || {
+                let mut reg = ExclusiveRegistration::new(slot0());
+                reg.arm(&set, &ctx(&waker));
+            })
+        };
+        cancelled.withdraw(&set);
+        sibling.join().unwrap();
+
+        set.wake_all();
+        assert!(
+            task.count() >= 1,
+            "the sibling's registration was removed by a peer's withdrawal"
+        );
+
+        // Whatever the schedule left is drained, not held: a second
+        // sweep must find nothing further to fire.
+        let after_drain = task.count();
+        set.wake_all();
+        assert_eq!(
+            task.count(),
+            after_drain,
+            "a registration outlived the drain that should have taken it"
         );
     });
 }
