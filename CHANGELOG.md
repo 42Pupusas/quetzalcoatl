@@ -127,11 +127,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2000-iteration campaigns since: `waiting=0`, with every one of the
   13 parks matching the signature woken inside the grace.
 
-  This is not yet a removal of `PARK_BACKSTOP`. It is the evidence the
-  bound was waiting for, on one harness shape and one host, and the
-  remaining campaign is listed in `PERFORMANCE_AUDIT.md`. Sole-waiter
+  That reading was wrong, and the next entry says why. Sole-waiter
   rescues are also now split by side, since a lost wake on one side
   says nothing about the other.
+
+- **Fixed: a producer could be left parked with its own slot free,
+  and `PARK_BACKSTOP` is removed.** Removing the 1 ms bound on mpmc
+  parks turned the residual into a reproducible hang — the saturated
+  stress harness stalled at iterations 241, 50 and 37 of 2000 with
+  every thread parked — and the ring snapshot named the mechanism.
+
+  A producer parks holding a batch of specific reserved positions and
+  can only continue when one of *those* is released. A release issued
+  one `wake_one`, served round-robin, and when it landed on the other
+  producer that one found nothing, re-parked, and the wake was spent.
+  With the consumers then idle there was no further release, so the
+  producer that reserved the position slept for good next to a free
+  slot, and the ring was stuck behind it: the claim cursor waits on
+  exactly that slot, so the other producer could not refill either.
+
+  Under the bound, the pinned producer woke itself after a millisecond
+  and found its slot. That is what the backstop counters had been
+  reporting as rescues, and what the late-wake grace had misread: the
+  wake it caught within 5 ms was the other producer's timeout cycle
+  bouncing a wake back, not a publisher a few instructions behind the
+  clock. A timeout on the path being measured made the two
+  indistinguishable.
+
+  Wakes on the producer side are now routed by position. A producer
+  announces its batch (`AwaitedBatch`) before it arms, and a release
+  asks each parked producer whether the freed position is in its batch
+  before falling back to round-robin. A producer waiting for a refill
+  announces nothing: a refill needs the slot at the claim cursor
+  specifically, and treating such a producer as a taker for every
+  release reproduced the deadlock with the roles swapped. Every
+  release site routes, including `drain`, which now wakes per freed
+  position rather than `wake_n` at the end.
+
+  This is the design built and rejected at `72b221f`. The rejection
+  measured futile wakes under the bound that hid the hang.
+
+  `PARK_BACKSTOP` is gone; a parked mpmc waiter sleeps until a peer
+  wakes it. `ParkSlot::park_bounded` is gone with it. 2000 unbounded
+  iterations of the stress harness complete; the ignored mpmc matrix,
+  heavy, counter-free and async stress suites pass; `blocking_mpmc`
+  median improved from ~1.3 ms to ~0.77 ms on the audit host. The
+  deterministic reproduction is
+  `a_release_wakes_the_producer_that_reserved_the_position`, which
+  hangs under round-robin routing and is polled rather than joined so
+  a regression fails rather than stalls. The `backstop-metrics`
+  counters stay: with no timeout, `unwoken_timeouts` is spurious
+  unparks and slotless re-checks only, and a non-zero
+  `waiting_sole_waiter_rescues` is a lost wake.
 
   The count is now split by side, because only producers can be pinned
   to a position. That split is what settled the fix: **roughly 80% of

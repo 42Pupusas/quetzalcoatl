@@ -10,9 +10,7 @@
 //!
 //! Loom does mock `park` and `unpark`, so parking is modelable; the
 //! [`thread`] alias below routes it. What loom does not mock is
-//! `park_timeout`, which is why a model must exercise the handshake
-//! without the `PARK_BACKSTOP` bound — that is the point, since the
-//! bound is what hides the defect.
+//! `park_timeout`, which only the slotless fallback still uses.
 //!
 //! The ring slot machinery stays out of scope: a model of it would be
 //! far too large to enumerate.

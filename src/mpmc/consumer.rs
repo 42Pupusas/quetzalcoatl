@@ -8,7 +8,6 @@ use super::consumed_watermark::ConsumedTally;
 use super::drain_wake::DrainWake;
 use super::scan_budget::ScanBudget;
 use super::slot_release::SlotRelease;
-use super::PARK_BACKSTOP;
 use super::{Config, DefaultConfig, RingBuffer};
 use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
@@ -155,8 +154,7 @@ impl<T, C: Config> Consumer<T, C> {
         // producer committed the value before publishing.
         let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
         q.done_slot(pos).release(round_pos, q.capacity);
-        // Wake one parked producer if any.
-        q.producer_park.wake_one();
+        q.wake_producer_for(round_pos + q.capacity.get());
         q.notify_producers();
         Some(val)
     }
@@ -223,7 +221,7 @@ impl<T, C: Config> Consumer<T, C> {
             // (pos, round_pos). Producer committed before publishing.
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
-            wake.released();
+            wake.released(round_pos + q.capacity.get());
             count += 1;
             f(val);
         }
@@ -245,7 +243,7 @@ impl<T, C: Config> Consumer<T, C> {
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
-            wake.released();
+            wake.released(round_pos + q.capacity.get());
             count += 1;
             f(val);
         }
@@ -333,9 +331,8 @@ impl<T, C: Config> Consumer<T, C> {
                 return self.pop();
             }
 
-            // Bounded park backstop — see Producer::push_block.
             watch.about_to_park(q.consumer_park.others_parked(slot), self.has_item());
-            slot.park_bounded(PARK_BACKSTOP);
+            slot.park();
             watch.parked_at(&q.consumer_park, slot, || self.has_item());
             q.consumer_park.disarm(slot);
         }
@@ -439,12 +436,11 @@ impl<T, C: Config> Consumer<T, C> {
                 return None;
             }
 
-            // Bounded park backstop — see Consumer::pop_block.
             watch.about_to_park(
                 self.queue.consumer_park.others_parked(park_slot),
                 self.has_item(),
             );
-            park_slot.park_bounded(PARK_BACKSTOP);
+            park_slot.park();
             watch.parked_at(&self.queue.consumer_park, park_slot, || self.has_item());
             self.queue.consumer_park.disarm(park_slot);
         }

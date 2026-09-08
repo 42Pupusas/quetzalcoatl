@@ -1,16 +1,16 @@
 //! Exhaustive-schedule model of the blocking park/wake handshake.
 //!
-//! The mpmc rings bound every parked sleep with
-//! [`PARK_BACKSTOP`](crate::mpmc::PARK_BACKSTOP) because a missed wake
-//! was observed under stress and never explained. A timeout turns that
-//! defect into a millisecond of latency, which is exactly what makes it
-//! so hard to find by running the code: the bug repairs itself.
+//! The mpmc rings used to bound every parked sleep with a 1 ms
+//! `PARK_BACKSTOP` because a missed wake was observed under stress and
+//! never explained. A timeout turns that defect into a millisecond of
+//! latency, which is exactly what makes it so hard to find by running
+//! the code: the bug repairs itself.
 //!
 //! Stress testing samples schedules. At roughly one occurrence per four
 //! hundred saturated runs, a sampling search is a poor instrument. Loom
-//! enumerates instead, and models the handshake with **no timeout at
-//! all**, so a lost wake is a deadlock the model reports rather than a
-//! stall it sleeps through.
+//! enumerates instead, and models the handshake with no timeout, so a
+//! lost wake is a deadlock the model reports rather than a stall it
+//! sleeps through.
 //!
 //! # What is modeled
 //!
@@ -71,10 +71,12 @@
 //! and pinning it down means reducing this to a report against loom.
 //!
 //! What this does **not** show: nothing here vindicates the ring. The
-//! missed wake that motivated the work is still unexplained and
-//! [`PARK_BACKSTOP`](crate::mpmc::PARK_BACKSTOP) is still load-bearing.
-//! Loom simply cannot be the instrument. The park path stays wired
-//! through the shim so these models can be re-run against a later loom.
+//! missed wake was found by other means — `WakeSet::wake_one` consumed
+//! wakes on bits whose handles were already claimed — and the bound
+//! was removed once the `backstop-metrics` campaign showed no park
+//! left asleep on published work. Loom simply cannot be the
+//! instrument. The park path stays wired through the shim so these
+//! models can be re-run against a later loom.
 
 use super::atomics::{thread, AtomicU64};
 use super::park::WakeSet;

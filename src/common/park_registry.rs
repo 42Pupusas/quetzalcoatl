@@ -29,6 +29,7 @@ use super::park::PARK_SLOTS;
 /// It holds no bit in the wake bitmap, so no peer can find it. The
 /// timeout is its only path back to the ring, and it bounds the extra
 /// latency such a waiter can suffer.
+#[cfg(not(loom))]
 const SHARED_PARK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// A waiter's claim on a park slot.
@@ -97,6 +98,10 @@ impl ParkSlot {
 
     /// Parks the calling thread until woken, or — with no slot — until
     /// the re-check interval elapses.
+    ///
+    /// A leased waiter's park has no timeout: a wake that never comes
+    /// is a hang, not a stall, so a lost-wake defect cannot hide as
+    /// latency.
     #[inline]
     pub fn park(self) {
         match self {
@@ -108,21 +113,6 @@ impl ParkSlot {
             #[cfg(loom)]
             Self::Shared => super::atomics::thread::park(),
         }
-    }
-
-    /// Parks with a wake-independent upper bound on the sleep.
-    ///
-    /// For call sites that keep a timeout as a backstop against a
-    /// suspected residual missed-wake race, so the bound survives
-    /// unchanged rather than being removed on the assumption that it is
-    /// now unnecessary.
-    #[inline]
-    pub fn park_bounded(self, limit: std::time::Duration) {
-        let bound = match self {
-            Self::Leased(_) => limit,
-            Self::Shared => limit.min(SHARED_PARK_INTERVAL),
-        };
-        std::thread::park_timeout(bound);
     }
 }
 

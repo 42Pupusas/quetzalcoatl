@@ -44,7 +44,8 @@ impl<T, C: Config> Drop for SlotRelease<'_, T, C> {
         self.queue
             .done_slot(self.pos)
             .release(self.round_pos, self.queue.capacity);
-        self.queue.producer_park.wake_one();
+        self.queue
+            .wake_producer_for(self.round_pos + self.queue.capacity.get());
         self.queue.notify_producers();
     }
 }

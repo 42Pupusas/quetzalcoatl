@@ -53,6 +53,7 @@
 //! ones at the same total thread count because there's scheduling
 //! slack.
 
+mod awaited_batch;
 mod backstop_monitor;
 mod batch_abandon;
 mod config;
@@ -65,6 +66,8 @@ mod ready_word;
 mod reservation_return;
 #[cfg(feature = "backstop-metrics")]
 mod rescue_evidence;
+#[cfg(test)]
+mod ring_snapshot;
 mod scan_budget;
 mod slot_release;
 
@@ -72,6 +75,7 @@ pub use config::{Cfg, Config, DefaultConfig};
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
 
+use awaited_batch::AwaitedBatch;
 use config::ConfigBounds;
 use consumed_watermark::ConsumedWatermark;
 use done_word::DoneWord;
@@ -82,23 +86,6 @@ use crate::common::park::WakeSet;
 use crate::common::close_state::CloseState;
 use crate::common::park_registry::ParkRegistry;
 
-/// Upper bound on a parked mpmc waiter's sleep.
-///
-/// A backstop, not the wake path: a residual missed wake was observed
-/// under saturated stress (cap=16, ~3% of 5000-item runs) and its cause
-/// was never isolated. Exclusive park-slot leasing removed the aliasing
-/// that was the likeliest explanation, but the bug survived it.
-///
-/// The `backstop-metrics` feature counts the timeouts that rescue a
-/// waiter with work already available — what a lost wake looks like
-/// from outside. Instrumented, `block_stress_diagnostic` reported two
-/// rescues in one iteration of 400 (2 producers x 5000 items, cap=16),
-/// so wakes are still going missing at roughly 1 iteration in 400,
-/// three orders of magnitude rarer than the original 3%.
-///
-/// Removing this bound would turn each of those into a permanent hang.
-/// It stays until the cause is found; see [`backstop_monitor`].
-pub(crate) const PARK_BACKSTOP: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::endpoint_count::EndpointCount;
@@ -143,6 +130,10 @@ pub struct RingBuffer<T, C: Config = DefaultConfig> {
     /// release. Consumers wake one parked producer after each release
     /// (gated on the bitmap being non-zero).
     pub(crate) producer_park: WakeSet,
+    /// What each parked producer is waiting for, by park slot, so a
+    /// release can be routed to the producer it frees; see
+    /// [`awaited_batch`].
+    pub(in crate::mpmc) awaited: AlignedBuf<AwaitedBatch>,
     /// Consumer-side park state. Bit `i` of `consumer_park.wake` is
     /// set ↔ a consumer in slot `i` is parked waiting for any
     /// `ready[s]` publish. Producers wake one parked consumer after
@@ -220,6 +211,7 @@ impl<T, C: Config> RingBuffer<T, C> {
             consumer_closed: CloseState::new(),
             capacity,
             producer_park: WakeSet::new(),
+            awaited: AlignedBuf::new_with(crate::common::park::PARK_SLOTS, AwaitedBatch::new),
             producer_slots: ParkRegistry::new(),
             consumer_slots: ParkRegistry::new(),
             consumer_park: WakeSet::new(),
@@ -287,6 +279,19 @@ impl<T, C: Config> RingBuffer<T, C> {
     #[must_use]
     pub fn backstop_stats(&self) -> backstop_monitor::BackstopStats {
         self.backstop.stats()
+    }
+
+    /// Wakes the parked producer that reserved `pos`, if there is one,
+    /// and otherwise whichever producer round-robin picks.
+    ///
+    /// Every release of a slot goes through here. A producer parked
+    /// holding a partial batch can only use the release of one of its
+    /// own positions, and a wake spent on any other producer leaves
+    /// it parked with its slot free.
+    #[inline]
+    pub(crate) fn wake_producer_for(&self, pos: usize) {
+        self.producer_park
+            .wake_one_wanting(|slot| self.awaited[slot].wants(pos));
     }
 
     /// Wakes the async producer tasks waiting for space.
@@ -379,6 +384,7 @@ impl<T, C: Config> RingBuffer<T, C> {
         )
     }
 
+
     /// How many producers are currently parked.
     ///
     /// A bit is set per parked producer, so the population count is
@@ -437,6 +443,7 @@ mod tests {
     use super::*;
     use crate::capacity::Capacity;
     use crate::common::park_probe::ParkProbe;
+    use crate::common::park_registry::ParkSlot;
 
     #[test]
     #[should_panic(expected = "mpmc requires capacity >= 4")]
@@ -445,11 +452,13 @@ mod tests {
     }
 
     /// A counter that never fires proves nothing unless it *can* fire.
-    /// This stages the failure the backstop exists to survive: a
-    /// consumer parks, a producer publishes but its wake is stolen
-    /// before it reaches the parked thread, and only the timeout
-    /// releases the consumer. That is a rescue, and the monitor must
-    /// say so.
+    /// This stages a lost wake: a consumer parks, a producer publishes
+    /// but its wake is stolen before it reaches the parked thread. With
+    /// no timeout on the park, something else has to end the sleep for
+    /// the test to observe anything, so the test unparks the thread
+    /// itself — bypassing the ring, exactly as a spurious wakeup would.
+    /// The consumer then finds work with its handle still armed. That
+    /// is a rescue, and the monitor must say so.
     #[test]
     #[cfg(feature = "backstop-metrics")]
     fn the_monitor_counts_a_wake_that_never_arrived() {
@@ -462,16 +471,16 @@ mod tests {
         // wake bit. `wake_one` reads the bitmap to decide who to
         // unpark, so the publish below finds nobody and the parked
         // thread's handle is left armed — a wake that goes missing.
-        // Only PARK_BACKSTOP can end that sleep.
         //
         // Clearing the bit is the one way to stage this without
-        // unparking: claiming the handle directly would deliver the
-        // very unpark token whose absence is the point.
+        // going through the ring's wake path: claiming the handle
+        // would deliver the very unpark whose absence is the point.
         ParkProbe::new().expect_until("the consumer to park", || {
             ring.consumer_park.wake.load(Ordering::Relaxed) != 0
         });
         ring.consumer_park.wake.store(0, Ordering::SeqCst);
         producer.push(7).unwrap();
+        reader.thread().unpark();
 
         assert_eq!(reader.join().unwrap(), Some(7));
 
@@ -596,17 +605,20 @@ mod tests {
         );
     }
 
-    /// The consequence of the pin: a `pop` frees one exact position
-    /// and wakes one producer by park slot, so the wake can land on a
-    /// producer for which that position is useless.
+    /// The consequence of the pin: a `pop` frees one exact position,
+    /// and a wake spent on a producer that cannot use it leaves the
+    /// one that can parked with its slot free.
     ///
     /// `pinned` holds position 4 (slot 0) and is parked in
-    /// `push_block`. The freed position is 5 (slot 1), which only
-    /// `pinned` cannot use — so the wake is spent on it, it re-parks,
-    /// and the futile-wake counter records the loss.
-    ///
-    /// Without the backstop timeout this would be a hang rather than a
-    /// counted event, which is what makes the counter worth having.
+    /// `push_block`. The freed position is 5 (slot 1), which `pinned`
+    /// cannot use. With one producer parked and round-robin routing,
+    /// the wake was spent on it and it re-parked; the futile-wake
+    /// counter recorded the loss. With routing by position the wake
+    /// is not delivered to it at all: nobody wants position 5, so the
+    /// fallback serves the cursor's pick, which is still `pinned` —
+    /// a futile wake either way when it is the sole waiter. The test
+    /// that separates the two routings is
+    /// [`a_release_wakes_the_producer_that_reserved_the_position`].
     #[test]
     #[cfg(feature = "backstop-metrics")]
     fn a_pop_can_wake_the_one_producer_that_cannot_use_the_freed_slot() {
@@ -655,6 +667,84 @@ mod tests {
             "a pop's wake reached a producer that could not use the freed \
              position: {stats:?}"
         );
+    }
+
+    /// Two producers parked, one pinned to the freed position and one
+    /// pinned elsewhere: the release must wake the first, whatever the
+    /// round-robin cursor would have picked. This is the deadlock the
+    /// 1 ms backstop used to hide — with the wrong producer woken and
+    /// no further release coming, the right one slept for good.
+    ///
+    /// Both park slots are given `Leased` indices in cursor order, so
+    /// the cursor's pick is the *wrong* producer; only routing gets
+    /// the wake to the right one.
+    #[test]
+    fn a_release_wakes_the_producer_that_reserved_the_position() {
+        let (producer, consumer) =
+            RingBuffer::<u64, Cfg<2, 128, 1>>::new(Capacity::exact(4)).split();
+        let other = producer.clone();
+        let other_park_slot = other.park_slot;
+        let ring = std::sync::Arc::clone(&producer.queue);
+        let drainer = consumer.clone();
+        let mut holder = consumer;
+
+        producer.push(0).unwrap();
+        producer.push(1).unwrap();
+        other.push(2).unwrap();
+        other.push(3).unwrap();
+
+        // Slot 0 is held; slots 1 and 2 are consumed and released.
+        let held = holder.pop_ref().unwrap();
+        assert_eq!(*held, 0);
+        assert_eq!(drainer.pop(), Some(1));
+        assert_eq!(drainer.pop(), Some(2));
+
+        // `producer` takes batch {4, 5}: publishes 5 (slot 1), keeps 4
+        // (slot 0, held). `other` then takes batch {6, 7}: 6 is slot 2
+        // (free), 7 is slot 3 (unconsumed).
+        producer.push(99).unwrap();
+        assert!(producer.push(100).is_err(), "pinned to slot 0");
+        other.push(98).unwrap();
+        assert!(other.push(97).is_err(), "pinned to slot 3");
+
+        let pinned_to_0 = std::thread::spawn(move || {
+            producer.push_block(100).expect("consumers dropped");
+        });
+        let pinned_to_3 = std::thread::spawn(move || {
+            other.push_block(97).expect("consumers dropped");
+        });
+        ParkProbe::new().expect_until("both producers to park", || {
+            ring.parked_producer_count() == 2
+        });
+
+        // `other` is the second lease, park slot 1. Point the cursor
+        // at it so a round-robin wake would go there.
+        assert_eq!(other_park_slot, ParkSlot::Leased(1));
+        ring.producer_park.cursor.store(1, Ordering::Relaxed);
+
+        // Frees position 8 = slot 0, which only `pinned_to_0` wants.
+        drop(held);
+
+        // Polled rather than joined: with the wake misrouted, the
+        // producer never returns and a join would hang the test
+        // instead of failing it.
+        assert!(
+            ParkProbe::new().wait_until(|| ring.parked_producer_count() == 1),
+            "the release of slot 0 must wake the producer pinned to it, not the cursor's pick"
+        );
+        assert!(
+            ring.producer_park.is_armed(other_park_slot),
+            "the producer that wanted slot 3 must not have been woken for slot 0"
+        );
+        pinned_to_0.join().unwrap();
+
+        // Free slot 3 so the second producer can finish.
+        assert_eq!(drainer.pop(), Some(3));
+        pinned_to_3.join().unwrap();
+
+        let mut rest = vec![drainer.pop(), drainer.pop(), drainer.pop(), drainer.pop()];
+        rest.sort_unstable();
+        assert_eq!(rest, vec![Some(97), Some(98), Some(99), Some(100)]);
     }
 
     /// The bound on the pin: producers blocked by a *full ring* are
@@ -1930,9 +2020,9 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// The blocking twin survives this only because `push_block` parks
-    /// with `PARK_BACKSTOP`; the async path has no such timeout, so a
-    /// waker skipped by an unwinding drain callback strands the task
+    /// Async twin of
+    /// [`a_panicking_drain_callback_still_wakes_the_blocked_producers`]:
+    /// a waker skipped by an unwinding drain callback strands the task
     /// permanently.
     #[test]
     #[cfg(feature = "async")]
@@ -2002,7 +2092,7 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic — instruments the saturated mpmc/block deadlock; runs 200 iters of 5k items each"]
-    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    #[allow(clippy::too_many_lines)]
     fn block_stress_diagnostic() {
         // Instrumented variant: when the watchdog fires (10s without
         // any iter completing), dump the ring's debug snapshot so we
@@ -2029,9 +2119,8 @@ mod tests {
         let test_done_watchdog = test_done.clone();
         let progress = Arc::new(AtomicU64::new(0)); // bumped every completed iter
         let progress_watchdog = progress.clone();
-        let snapshot_holder: Arc<
-            std::sync::Mutex<Option<(usize, Vec<usize>, Vec<usize>, u64, u64)>>,
-        > = Arc::new(std::sync::Mutex::new(None));
+        let snapshot_holder: Arc<std::sync::Mutex<Option<ring_snapshot::RingSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let snapshot_holder_w = snapshot_holder.clone();
 
         let watchdog = std::thread::spawn(move || {
@@ -2051,12 +2140,8 @@ mod tests {
                     let mut stderr = std::io::stderr().lock();
                     let _ = writeln!(stderr, "\n\n=== DEADLOCK at iter {cur} ===");
                     if let Ok(g) = snapshot_holder_w.lock() {
-                        if let Some((claim, ready, done_arr, p_park, c_park)) = &*g {
-                            let _ = writeln!(stderr, "claim = {claim}");
-                            let _ = writeln!(stderr, "ready = {ready:?}");
-                            let _ = writeln!(stderr, "done  = {done_arr:?}");
-                            let _ = writeln!(stderr, "producer_park = {p_park:#x}");
-                            let _ = writeln!(stderr, "consumer_park = {c_park:#x}");
+                        if let Some(snapshot) = &*g {
+                            let _ = write!(stderr, "{snapshot}");
                         } else {
                             let _ = writeln!(stderr, "(no snapshot captured)");
                         }
@@ -2086,10 +2171,9 @@ mod tests {
             let snap_done2 = snap_done.clone();
             let snap_thread = std::thread::spawn(move || {
                 while !snap_done2.load(Ordering::Acquire) {
-                    let (claim, ready, done_arr) = snap_q.debug_snapshot();
-                    let (p_park, c_park) = snap_q.debug_park_snapshot();
+                    let snapshot = ring_snapshot::RingSnapshot::take(&*snap_q);
                     if let Ok(mut g) = snap_holder.lock() {
-                        *g = Some((claim, ready, done_arr, p_park, c_park));
+                        *g = Some(snapshot);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -2197,10 +2281,8 @@ mod tests {
     #[ignore = "slow stress: 2k iters x 500 items through a 16-slot ring"]
     fn async_push_pop_cross_thread_iters_saturated() {
         // Saturated: small ring forces producers to park, drain wakes
-        // multiple parked producers per batch. The 1ms park_timeout
-        // backstop in push_block / pop_block keeps this from
-        // deadlocking even when the SeqCst pairing on the wake bitmap
-        // misses a wake under maximum contention.
+        // multiple parked producers per batch. A missed wake here is
+        // a hang the watchdog reports, not a stall.
         async_mpmc_stress_iters(2_000, 16, 500);
     }
 

@@ -169,6 +169,44 @@ impl WakeSet {
         }
     }
 
+    /// Wakes the parked waiter for which `wants` holds, or falls back
+    /// to [`wake_one`](Self::wake_one) when none does.
+    ///
+    /// For releases that only a specific waiter can use. Round-robin
+    /// serves one waiter per release, so a release delivered to a
+    /// waiter that cannot use it is spent: the woken one re-parks and
+    /// the one it was for is not woken again until something else
+    /// releases. When nothing else does, that is a deadlock with a
+    /// free slot in the ring.
+    ///
+    /// The predicate is read under no lock, so a waiter can announce
+    /// a want, be passed over here, and then park — but its own
+    /// re-check after arming sees the release, which is the same
+    /// handshake that protects the untargeted path.
+    #[inline]
+    pub fn wake_one_wanting(&self, wants: impl Fn(usize) -> bool) {
+        fence(Ordering::SeqCst);
+        let mut bits = self.wake.load(Ordering::SeqCst);
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            let mask = 1u64 << bit;
+            bits &= !mask;
+            if !wants(bit as usize) {
+                continue;
+            }
+            let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
+            if prev & mask == 0 {
+                continue;
+            }
+            self.cursor
+                .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
+            if self.parkers[bit as usize].wake() {
+                return;
+            }
+        }
+        self.wake_one_published();
+    }
+
     /// Wakes up to `n` parked waiters. Used by drain-style operations
     /// that free `n` slots in one batch and want to release roughly
     /// `n` parkers at once. Caps at the number of currently parked
@@ -457,8 +495,9 @@ mod tests {
     /// - `w` arms bit 0 and parks.
     /// - `p1` clears bit 0, taking ownership of the wake, and is
     ///   descheduled before it claims the handle.
-    /// - `w`'s `PARK_BACKSTOP` expires independently. It re-arms: a
-    ///   fresh handle, and bit 0 set again.
+    /// - `w` wakes for an unrelated reason (a spurious unpark, or the
+    ///   1 ms backstop the ring had at the time) and re-arms: a fresh
+    ///   handle, and bit 0 set again.
     /// - `p1` resumes and claims that handle. Bit 0 is now set with
     ///   no handle behind it.
     /// - `p2` publishes work and wakes. It picks bit 0, clears it,
@@ -482,6 +521,66 @@ mod tests {
             !set.is_armed(ParkSlot::Leased(1)),
             "the wake must reach slot 1, the only slot with a waiter behind it"
         );
+    }
+
+    /// The routing the mpmc producer side needs: a release only one
+    /// parked waiter can use must reach that waiter, whatever the
+    /// round-robin cursor would have picked.
+    #[test]
+    fn a_targeted_wake_reaches_the_waiter_that_wants_it() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1, 2]);
+        // Cursor would pick slot 0 next.
+        set.cursor.store(0, Ordering::Relaxed);
+
+        set.wake_one_wanting(|slot| slot == 2);
+
+        assert!(set.is_armed(ParkSlot::Leased(0)));
+        assert!(set.is_armed(ParkSlot::Leased(1)));
+        assert!(
+            !set.is_armed(ParkSlot::Leased(2)),
+            "the wake must reach the one waiter that wanted it"
+        );
+        assert_eq!(set.parked_bits(), 0b011);
+    }
+
+    #[test]
+    fn a_targeted_wake_with_no_taker_falls_back_to_round_robin() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        set.cursor.store(1, Ordering::Relaxed);
+
+        set.wake_one_wanting(|_| false);
+
+        assert!(
+            !set.is_armed(ParkSlot::Leased(1)),
+            "nobody wanted it, so the cursor's pick is served"
+        );
+        assert!(set.is_armed(ParkSlot::Leased(0)));
+    }
+
+    #[test]
+    fn a_targeted_wake_on_an_empty_set_wakes_nobody() {
+        let set = WakeSet::new();
+        set.wake_one_wanting(|_| true);
+        assert_eq!(set.parked_bits(), 0);
+    }
+
+    /// A wanting slot whose handle is already claimed is a bit with
+    /// nobody behind it; the wake must move on to the next taker.
+    #[test]
+    fn a_targeted_wake_skips_a_wanting_slot_whose_handle_is_claimed() {
+        let set = WakeSet::new();
+        set.arm_all(&[0, 1]);
+        assert!(set.parkers[0].wake());
+
+        set.wake_one_wanting(|_| true);
+
+        assert!(
+            !set.is_armed(ParkSlot::Leased(1)),
+            "slot 0 advertised a waiter that was not there"
+        );
+        assert_eq!(set.parked_bits(), 0);
     }
 
     /// The same defect on the batch path: `wake_n(1)` must deliver

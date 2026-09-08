@@ -1,7 +1,9 @@
 //! What ended a bounded park.
 //!
-//! A waiter that wakes from [`park_bounded`](super::park_registry::ParkSlot::park_bounded)
-//! needs to know whether a peer released it or the clock did. The
+//! A waiter whose [`park`](super::park_registry::ParkSlot::park) has
+//! returned needs to know whether a peer released it or something else
+//! did — a spurious unpark, a slotless re-check interval, or the timed
+//! park the ring used before the lost-wake defect was found. The
 //! obvious test is whether its park handle is still armed, since a
 //! waker claims the handle out of the slot to unpark it. That test is
 //! too coarse, and the gap is what this type closes.
@@ -48,7 +50,7 @@ use super::park::WakeSet;
 use super::park_registry::ParkSlot;
 use std::sync::atomic::Ordering;
 
-/// How a waiter's bounded park came to an end.
+/// How a waiter's park came to an end.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WakeDelivery {
     /// A peer claimed the handle and issued the unpark.

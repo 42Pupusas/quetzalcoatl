@@ -459,19 +459,92 @@ Two 2000-iteration campaigns with the grace in place:
 Every park that matched the residual's signature received its wake
 inside the grace — 13 of 13. `waiting` is zero in both.
 
-**What this does and does not establish.** The sole-waiter rescues
-seen in 4000 iterations are all accounted for by benign timing: the
-work arrived after the park returned, or the wake was in flight when
-the clock fired. No park in this campaign was left asleep on work with
-no wake coming. That is the evidence `PARK_BACKSTOP` was waiting for,
-for this harness on this host, and it is stated as such. It is not a
-proof for other shapes: the harness is 2×2 on a 16-slot ring, and the
-grace-catch counter reads 4–9 per 2000 on this box, so a host that
-deschedules publishers for longer than 5 ms between publish and wake
-would need a longer grace before its `waiting` count meant anything.
-The instrument stays, the counters stay gated, and the harness prints
-rather than asserts — a non-zero `waiting` in a future campaign is the
-signal, and it now has one benign explanation fewer to hide behind.
+**That conclusion was wrong.** The paragraph that stood here read the
+grace result as "every rescue was a late wake, the bound can go". The
+bound was removed and the same campaign hung at iteration 241 with
+all four threads parked. The instrument had measured exactly what it
+said — a wake *did* arrive within 5 ms — but the wake it caught was
+the *other* producer's timeout-and-futile-wake cycle bouncing a wake
+back, not a publisher a few instructions behind the clock. With the
+bound gone there is no cycle, and the routing defect below is a hang.
+The lesson is the one already written under "Position-targeted
+wakes": a benign explanation that fits the numbers is not the same as
+the mechanism, and a timeout on the path being measured makes the two
+indistinguishable.
+
+### The deadlock, and the routing that fixes it
+
+Removing `PARK_BACKSTOP` turned the residual into a reproducible hang:
+2000-iteration campaigns stalled at iterations 241, 50 and 37. The
+harness dumps the ring on a stall, and the decoded snapshots all
+showed the same shape. From the third:
+
+```text
+claim = 4441
+slot 9:  ready = Claimed(4409)   done = 4425   → free for position 4425
+every other slot: consumed through 4440, free for its next round
+producer_park = 0x6   consumer_park = 0x6
+awaited = [(1, None), (2, Some((4425, 1)))]
+```
+
+The producer at park slot 2 holds position 4425 in its batch. Slot 9
+is free for 4425. The producer is parked anyway, and the other
+producer is parked on a refill that needs `done[claim & 15]`, which is
+the same slot. Both consumers are parked because nothing is published.
+Nobody will ever publish 4425, and no further release will ever
+happen.
+
+This is the mechanism the audit had already proved and set aside
+("Position-targeted wakes: built, measured, rejected"). A release of
+slot 9 issued one `wake_one`. Round-robin served the other producer,
+which could not use position 4425, re-checked, and re-parked. The
+producer that reserved 4425 was never woken, because nothing else ever
+released. Under the 1 ms bound, that producer woke itself and found
+its slot — a "rescue" — which is what the counters had been reporting
+all along.
+
+The fix is the routing that was built and rejected at `72b221f`, and
+the rejection was the error: it was measured by futile-wake counts
+under a bound that hid the very hang the routing prevents.
+[`AwaitedBatch`](src/mpmc/awaited_batch.rs) publishes a parked
+producer's `(batch_start, batch_unused)` beside its park slot, and
+`WakeSet::wake_one_wanting` walks the parked bitmap for a slot whose
+announcement contains the freed position before falling back to
+round-robin. Every release site routes: `pop`, `SlotReader::drop`,
+`drain` (now per item rather than `wake_n` at the end — a batch of
+round-robin wakes could spend every one on producers that cannot use
+them), and `BatchAbandon`.
+
+The first version treated a producer waiting to *refill* as a taker
+for every release. That hung at iteration 50 with the refilling
+producer served first, unable to refill, and re-parked — the same
+deadlock with the roles swapped. A refill needs the slot at the claim
+cursor specifically, which a release elsewhere does nothing for, so a
+refilling producer announces nothing and is served only by the
+fallback.
+
+Pinned deterministically by
+`a_release_wakes_the_producer_that_reserved_the_position`: two
+producers parked on different positions, the round-robin cursor
+pointed at the wrong one, one release. Under round-robin the test
+hangs; it polls rather than joins so a regression fails instead of
+stalling.
+
+**Result.** 2000 iterations of `block_stress_diagnostic` with no bound
+on the park: complete, no stall. `unwoken_timeouts` fell from ~100 per
+2000 to 23, all of them spurious unparks or `Shared` re-checks since
+there is no timeout. The one sole-waiter rescue in the campaign was
+`late` — work arrived after the park returned — which is not a lost
+wake. Every ignored mpmc matrix test, the heavy and counter-free
+suites, and both async stress shapes pass. `blocking_mpmc` median
+moved from ~1.3 ms to ~0.77 ms on the same host, since a producer no
+longer sleeps a full millisecond for a slot that freed microseconds
+after it parked.
+
+`PARK_BACKSTOP` is gone. A parked mpmc waiter sleeps until a peer
+wakes it. The instrument stays: with no timeout, `unwoken_timeouts`
+should stay near zero and a non-zero `waiting_sole_waiter_rescues` is
+a lost wake, not a latency artefact.
 
 ## Checks completed on HEAD
 
@@ -496,7 +569,7 @@ Ignored stress tests, package verification, and a complete feature/build matrix 
 6. **Decide whether `PARK_BACKSTOP` can go.** One lost-wake defect is found and fixed (see "The lost wake, found"): `wake_one` and `wake_n` consumed wakes on bits whose handles had already been claimed, waking nobody. Three deterministic unit tests cover it. What remains is to establish whether it was the *only* one — run `block_stress_diagnostic` under `backstop-metrics` for thousands of iterations across the matrix, and drop the bound only on a sustained zero rescue count. Note the defect needed a backstop timeout to arm itself, so its removal may change the rate of anything left rather than leaving it fixed. Loom cannot help here: see `common::park_handshake_model`.
 7. **Consumer blind futile wakes: resolved as far as the residual goes.** The scan-budget fix was off by one on its first attempt and did nothing; the corrected accounting (one examination per lost CAS) engaged, and `blind` sole-waiter rescues read zero in every bracketed campaign since. The blind *futile* count is still non-zero (21–36 per 2000) and still has the documented false-positive mode; it is a rate for comparing policies, not a defect count, and is no longer on the path to the backstop decision.
 
-8. **`PARK_BACKSTOP`: the residual is explained for this harness.** See "The residual, bracketed and explained". Two 2000-iteration campaigns with the timing bracket and the late-wake grace show `waiting=0`; every park matching a lost wake's signature received its wake within 5 ms. Before removing the bound: (a) run the same campaign on the rest of the ignored mpmc matrix, not just 2×2/cap-16, with the async saturated stress included; (b) run it on at least one other host; (c) decide what to do about the `Shared` park slot, which polls on the same 1 ms interval by construction and is unaffected by the bound. If all of those read `waiting=0`, remove the bound with the instrument left in place so a regression is a non-zero counter rather than a hang. If the bound is removed, `wake_one`'s stale-bit defect (fixed) is the kind of thing that used to need a timeout to arm itself — re-run the campaign after removal, since the rate of anything left may change.
+8. **`PARK_BACKSTOP` is removed; the deadlock it hid is fixed.** See "The deadlock, and the routing that fixes it". Remaining: (a) run the unbounded campaign on another host, since one box proves one scheduler; (b) the `Shared` park slot still polls at 1 ms by construction — a ring with more than 64 live producers or consumers on one side has waiters no wake can reach, and that is now the only timed park in mpmc; (c) `wake_one_wanting` is a linear walk of the parked bitmap with an announcement load per set bit — fine at 2–8 parked producers, unmeasured at 64.
 
 9. Extend the Loom models past the leaf primitives to the ring publication and slot-reuse protocols, which no current model covers. Blocked on loom 0.7.2 being unable to decide the park handshake — it reports deadlocks for a protocol containing no crate code at all, as `common::park_handshake_model` documents and calibrates. Reduce that to a minimal repro and file it upstream.
 10. Agree a release budget for steady-state throughput and tail latency. Preserve correctness guarantees; optimize measured overhead rather than reverting required ordering or claim validation.

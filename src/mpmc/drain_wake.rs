@@ -5,18 +5,18 @@ use super::Config;
 
 /// Owns the obligation to wake producers after a drain has freed slots.
 ///
-/// A drain releases each slot inside its loop, but wakes once at the
-/// end: `wake_n(count)` releases as many parked producers as there are
-/// freed slots, where a `wake_one` per item would cost a syscall each.
-/// That leaves a window in which the ring has space and the producers do
-/// not know, and unwinding through it — a panicking drain callback —
-/// skips the wake entirely.
+/// A drain releases each slot inside its loop. The blocking-side wake
+/// is routed at release time, because each freed position belongs to
+/// one specific reserved batch and a batch of wakes handed out
+/// round-robin at the end could spend every one of them on producers
+/// that cannot use them. The async notification has no position to
+/// route by and is issued once for the whole drain.
 ///
-/// Blocking producers survive that on the `PARK_BACKSTOP` timeout in
-/// `push_block`, which merely turns the bug into a stall. An async
-/// producer has no such backstop: its waker is never invoked and the
-/// task is never rescheduled. Waking from the destructor closes the
-/// window, since it runs on the unwind path as well as the normal one.
+/// That leaves a window in which the ring has space and async
+/// producers do not know, and unwinding through it — a panicking drain
+/// callback — skips the notification entirely, so the task is never
+/// rescheduled. Notifying from the destructor closes the window, since
+/// it runs on the unwind path as well as the normal one.
 pub(super) struct DrainWake<'a, T, C: Config> {
     ring: &'a RingBuffer<T, C>,
     released: usize,
@@ -27,11 +27,13 @@ impl<'a, T, C: Config> DrainWake<'a, T, C> {
         Self { ring, released: 0 }
     }
 
-    /// Records that a slot has been handed back to the producers.
+    /// Records that the slot for `pos` has been handed back to the
+    /// producers, and wakes the one that reserved it.
     ///
     /// Call *after* the slot is released but *before* the user
     /// callback, so an unwind through the callback still wakes.
-    pub(super) const fn released(&mut self) {
+    pub(super) fn released(&mut self, pos: usize) {
+        self.ring.wake_producer_for(pos);
         self.released += 1;
     }
 }
@@ -41,7 +43,6 @@ impl<T, C: Config> Drop for DrainWake<'_, T, C> {
         if self.released == 0 {
             return;
         }
-        self.ring.producer_park.wake_n(self.released);
         self.ring.notify_producers_n(self.released);
     }
 }

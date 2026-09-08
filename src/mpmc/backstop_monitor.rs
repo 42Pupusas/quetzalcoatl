@@ -1,22 +1,30 @@
-//! Instrumentation for the [`PARK_BACKSTOP`](super::PARK_BACKSTOP)
-//! timeout.
+//! Instrumentation for the mpmc park path.
 //!
-//! The backstop exists because a residual missed wake was observed under
-//! saturated stress and never explained. A timeout that never rescues
-//! anyone costs nothing and is evidence the bound can go; one that does
-//! rescue someone is a reproduction of the bug it guards against.
+//! Until the lost-wake defect in `WakeSet::wake_one` was found, every
+//! mpmc park was bounded by a 1 ms `PARK_BACKSTOP`, and these counters
+//! were built to decide whether it could go. A timeout that never
+//! rescued anyone cost nothing and was evidence the bound was
+//! unnecessary; one that did was a reproduction of the bug it guarded
+//! against. Silently, the backstop could not tell those apart — a lost
+//! wake became a millisecond of latency and nothing else.
 //!
-//! Silently, the backstop cannot tell those apart — a lost wake becomes
-//! a millisecond of latency and nothing else. These counters make the
-//! difference observable.
+//! The bound is gone. The counters stay, because they are the only
+//! instrument that can see a lost wake short of a hang, and the
+//! ignored stress harness prints them. What changes without the
+//! timeout is *when* a park can return unwoken: only on a spurious
+//! unpark, or on the slotless re-check interval. A rescue is
+//! therefore no longer common enough to need the round-robin and
+//! timing splits to interpret — but the splits still apply, and a
+//! non-zero `waiting_sole_waiter_rescues` remains the one reading
+//! that only a lost wake can produce.
 //!
 //! # What the counts mean
 //!
 //! A waiter's park handle is claimed by whoever wakes it, so a handle
-//! still armed after the park returns proves no peer delivered a wake:
-//! the sleep ended on the timeout. That is an *unwoken timeout*, and it
-//! is routine — a waiter with genuinely nothing to do times out and
-//! re-parks for as long as the ring stays quiet.
+//! still armed after the park returns proves no peer delivered a wake.
+//! That is an *unwoken timeout* (the name predates the bound's
+//! removal), and a slotless waiter produces one per re-check interval
+//! by construction.
 //!
 //! The diagnostic count is a *rescue*: an unwoken timeout whose very
 //! next re-check found work. The waiter was waiting for something that
@@ -484,14 +492,14 @@ impl Default for BackstopMonitor {
 }
 
 /// How long a park that looks like the residual waits for a wake
-/// that may be a few instructions behind the clock.
+/// that may be a few instructions behind whatever ended the park.
 ///
 /// A publisher stores the item, then loads the wake bitmap and
-/// unparks. A timeout firing between those two steps finds the
-/// item present and the bit untouched — the residual's exact
-/// signature — with the wake nanoseconds away. The grace is long
-/// enough to cover a publisher descheduled inside that window on a
-/// loaded box; a wake that has not arrived by then was not coming.
+/// unparks. A park returning between those two steps finds the item
+/// present and the bit untouched — the residual's exact signature —
+/// with the wake nanoseconds away. The grace is long enough to cover
+/// a publisher descheduled inside that window on a loaded box; a
+/// wake that has not arrived by then was not coming.
 #[cfg(feature = "backstop-metrics")]
 pub const LATE_WAKE_GRACE: std::time::Duration = std::time::Duration::from_millis(5);
 
@@ -551,10 +559,10 @@ impl BackstopWatch {
     /// Records how the park that just returned ended, reading the
     /// waiter's state out of `set` itself.
     ///
-    /// `work_visible` is consulted only when the park ended on the
-    /// timeout: it is the return-time half of the timing bracket, and
-    /// a delivered wake has no rescue to time. Keeping it a closure
-    /// spares the woken path a scan of the ring.
+    /// `work_visible` is consulted only when the park ended without a
+    /// peer's wake: it is the return-time half of the timing bracket,
+    /// and a delivered wake has no rescue to time. Keeping it a
+    /// closure spares the woken path a scan of the ring.
     ///
     /// Sampling here rather than at the call site keeps
     /// [`WakeDelivery`] out of the uninstrumented build, where the

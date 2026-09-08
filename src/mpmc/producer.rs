@@ -17,7 +17,6 @@ use crate::common::park_registry::ParkSlot;
 /// falling back to bitmap scan.
 const PRIMARY_SHORT_SPIN: u32 = 4;
 
-use super::PARK_BACKSTOP;
 
 /// Cloneable producer for an MPMC ring.
 ///
@@ -35,7 +34,7 @@ pub struct Producer<T, C: Config = DefaultConfig> {
     /// Original batch size (≤ `C::PRODUCER_BATCH`); diagnostic.
     batch_size: Cell<u32>,
     /// Park slot leased for this producer's lifetime, returned on drop.
-    park_slot: ParkSlot,
+    pub(super) park_slot: ParkSlot,
 }
 
 impl<T, C: Config> Clone for Producer<T, C> {
@@ -194,6 +193,19 @@ impl<T, C: Config> Producer<T, C> {
         q.consumed.free(claim, q.capacity.get()).is_some() || q.done_slot(claim).is_free_for(claim)
     }
 
+    /// Publishes what this producer is waiting for, so a consumer
+    /// releasing one of its positions can wake it specifically.
+    ///
+    /// Must precede `arm`: a release that happens after the arm reads
+    /// the announcement, and one that happens before it is caught by
+    /// the re-check that follows the arm.
+    #[inline]
+    fn announce_awaited(&self) {
+        if let Some(index) = self.park_slot.index() {
+            self.queue.awaited[index].announce(self.batch_start.get(), self.batch_unused.get());
+        }
+    }
+
     /// Pushes a value. Returns `Err(val)` if the ring is full from
     /// this producer's perspective (approximate — based on the
     /// `consumed` watermark, which lags real consumer progress).
@@ -269,6 +281,7 @@ impl<T, C: Config> Producer<T, C> {
                 continue;
             }
 
+            self.announce_awaited();
             self.queue.producer_park.arm(park_slot);
             // See pop_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
@@ -283,12 +296,11 @@ impl<T, C: Config> Producer<T, C> {
                 return self.reserve();
             }
 
-            // Bounded park — see push_block.
             watch.about_to_park(
                 self.queue.producer_park.others_parked(park_slot),
                 self.has_free_slot(),
             );
-            park_slot.park_bounded(PARK_BACKSTOP);
+            park_slot.park();
             watch.parked_at(&self.queue.producer_park, park_slot, || self.has_free_slot());
             self.queue.producer_park.disarm(park_slot);
         }
@@ -329,6 +341,7 @@ impl<T, C: Config> Producer<T, C> {
             // `producer_park.wake.load` after `done.store(Release)`:
             // either we succeed in the re-check below, or the consumer
             // sees our bit and unparks us.
+            self.announce_awaited();
             q.producer_park.arm(slot);
             // Fence: see park_until_slot_free for the rationale.
             std::sync::atomic::fence(Ordering::SeqCst);
@@ -346,15 +359,8 @@ impl<T, C: Config> Producer<T, C> {
                 return Err(val);
             }
 
-            // Bounded park as a final-line backstop: round-robin in
-            // WakeSet removes the wake-bit starvation and the SeqCst
-            // pairing on `wake` closes the Dekker race, but a rare
-            // residual hang was observed (cap=16 stress, ~3% of
-            // 5000-item runs). Exclusive slot leasing is the likelier
-            // cause and is now fixed, though not proven to be the only
-            // one, so the bound stays until it is.
             watch.about_to_park(q.producer_park.others_parked(slot), self.has_free_slot());
-            slot.park_bounded(PARK_BACKSTOP);
+            slot.park();
             watch.parked_at(&q.producer_park, slot, || self.has_free_slot());
             q.producer_park.disarm(slot);
         }
