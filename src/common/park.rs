@@ -20,10 +20,16 @@ use super::atomics::{fence, AtomicU64};
 use std::sync::atomic::Ordering;
 
 use super::park_overflow::ParkOverflow;
-use super::park_registry::ParkSlot;
 use super::thread_parker::ThreadParker;
 use super::wake_interest::WakeInterest;
 use super::AlignedBuf;
+
+/// Re-exported so external callers can name the argument type of
+/// [`WakeSet::arm`], [`WakeSet::disarm`], [`WakeSet::arm_handle`],
+/// [`WakeSet::is_armed`], and [`WakeSet::others_parked`] — all public
+/// methods on a public struct whose parameter type must itself be
+/// reachable, or no downstream crate can call them at all.
+pub use super::park_registry::ParkSlot;
 
 /// Park-slot count.
 ///

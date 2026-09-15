@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1]
+
+**`ParkSlot` is now reachable outside the crate.** `park::WakeSet::arm`,
+`disarm`, `arm_handle`, `is_armed`, and `others_parked` are public
+methods on a public struct, but their `ParkSlot` parameter lived in
+`common::park_registry`, which was never re-exported — `common` itself
+is `pub(crate)`. A downstream crate could see the methods but could not
+name the type needed to call any of them, so 0.15.0's blocking
+primitives were unusable from outside quetzalcoatl despite being the
+intended building block for external ring-buffer adapters (io_uring
+queues, etc.). `park::ParkSlot` is now a public re-export alongside
+`park::WakeSet`. No other change.
+
 ## [0.15.0] - 2026-09-08
 
 A minor bump with no public API change. The version moves because the
