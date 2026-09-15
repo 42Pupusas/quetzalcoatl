@@ -29,7 +29,15 @@ use super::AlignedBuf;
 /// [`WakeSet::is_armed`], and [`WakeSet::others_parked`] — all public
 /// methods on a public struct whose parameter type must itself be
 /// reachable, or no downstream crate can call them at all.
-pub use super::park_registry::ParkSlot;
+///
+/// [`ParkRegistry`] is re-exported alongside it: a caller that leases
+/// its own park slot by hand (e.g. a monotonic counter masked to
+/// `PARK_MASK` on every clone) reintroduces the exact aliasing hazard
+/// this module exists to close — two live waiters sharing one bit lose
+/// a wakeup rather than merely receiving a spurious one. `ParkRegistry`
+/// is the only correct way to hand out slots that never alias while
+/// live, and every ring in this crate already uses it internally.
+pub use super::park_registry::{ParkRegistry, ParkSlot};
 
 /// Park-slot count.
 ///
