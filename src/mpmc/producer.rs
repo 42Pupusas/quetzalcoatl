@@ -81,9 +81,18 @@ impl<T, C: Config> Producer<T, C> {
     fn refill_batch(&self, q: &RingBuffer<T, C>) -> Option<(usize, u32)> {
         let (start, batch) = loop {
             let claim = q.claim.load(Ordering::Relaxed);
+            // Once the consumers are gone a batch reserved ahead of its
+            // slots can never be handed back (`BatchAbandon` leaves it
+            // reserved), so only a position that is free right now is
+            // taken.
+            let estimate = if q.consumer_closed.is_closed() {
+                None
+            } else {
+                q.consumed.free(claim, q.capacity.get())
+            };
             // No estimate means the watermark accounts for the whole
             // ring; it lags, so check the slot itself before giving up.
-            let free = match q.consumed.free(claim, q.capacity.get()) {
+            let free = match estimate {
                 Some(free) => free,
                 None if q.done_slot(claim).is_free_for(claim) => 1,
                 None => return None,
@@ -92,8 +101,11 @@ impl<T, C: Config> Producer<T, C> {
             // Taking the batch only if `claim` has not moved keeps the
             // cursor within `free` of the watermark: a blind add would
             // let every racing producer take a batch against the same
-            // snapshot. `REFILL_CAS = false` opts into the blind add.
-            if !C::REFILL_CAS {
+            // snapshot. `REFILL_CAS = false` opts into the blind add,
+            // but never for the single position taken after a free
+            // check: that check is about `claim` as read, so the take
+            // must fail if `claim` has moved.
+            if !C::REFILL_CAS && estimate.is_some() {
                 break (q.claim.fetch_add(batch, Ordering::Relaxed), batch);
             }
             if q.claim

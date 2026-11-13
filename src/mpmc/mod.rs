@@ -1795,6 +1795,94 @@ mod tests {
         h.join().expect("the producer drop must not wait forever");
     }
 
+    /// A batch reserved ahead of its slots cannot be handed back once the
+    /// consumers are gone, so a refill then takes the one free position.
+    fn claim_after_one_push_without_consumers<C: Config>() -> usize {
+        let (p, c) = RingBuffer::<u64, C>::new(Capacity::exact(64)).split();
+        drop(c);
+        p.push(1).unwrap();
+        p.queue.debug_snapshot().0
+    }
+
+    #[test]
+    fn a_refill_after_the_consumers_left_takes_one_position() {
+        assert_eq!(
+            claim_after_one_push_without_consumers::<Cfg<32, 128, 64, true>>(),
+            1
+        );
+        assert_eq!(
+            claim_after_one_push_without_consumers::<Cfg<32, 128, 64, false>>(),
+            1
+        );
+    }
+
+    /// Producers keep pushing while the consumers walk away mid-stream.
+    /// Every producer must finish and every value must be dropped exactly
+    /// once, whether a consumer or the ring's teardown took it.
+    fn consumers_leave_under_load<C: Config>() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let pushed = Arc::new(AtomicUsize::new(0));
+        let (p, c) = RingBuffer::<DropCounter, C>::new(Capacity::exact(64)).split();
+        let producers: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                let dropped = dropped.clone();
+                let pushed = pushed.clone();
+                std::thread::spawn(move || {
+                    while p
+                        .push_block(DropCounter {
+                            counter: dropped.clone(),
+                        })
+                        .is_ok()
+                    {
+                        pushed.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        drop(p);
+        let consumers: Vec<_> = (0..3)
+            .map(|_| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        drop(c.pop());
+                    }
+                })
+            })
+            .collect();
+        drop(c);
+        for handle in consumers.into_iter().chain(producers) {
+            handle.join().unwrap();
+        }
+        // Each producer ends on one refused push, whose value is dropped too.
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            pushed.load(Ordering::Relaxed) + 4
+        );
+    }
+
+    #[test]
+    #[ignore = "stress test: repeats a contended shutdown"]
+    fn consumers_leaving_under_load_strand_no_producer_or_value() {
+        for _ in 0..200 {
+            consumers_leave_under_load::<Cfg<32, 128, 64, true>>();
+            consumers_leave_under_load::<Cfg<32, 128, 64, false>>();
+            consumers_leave_under_load::<Cfg<1, 128, 64, true>>();
+            consumers_leave_under_load::<Cfg<1, 128, 64, false>>();
+        }
+    }
+
+    #[test]
+    fn a_refill_with_the_consumers_present_takes_a_whole_batch() {
+        let (p, _c) = RingBuffer::<u64, Cfg<32, 128, 64, true>>::new(Capacity::exact(64)).split();
+        p.push(1).unwrap();
+        assert_eq!(p.queue.debug_snapshot().0, 32);
+    }
+
     #[test]
     fn pop_ref_drop_releases_slot_for_reuse() {
         let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
