@@ -188,10 +188,10 @@ inductive Step (g : Geometry) (limit batchMax : Nat) : Ring g → Ring g → Pro
       index < g.period →
       (s.view index).phase (s.view index).doneRound = .claimed →
       Step g limit batchMax s (s.updateSlot index SlotModel.releaseCurrent)
-  /-- `refill_batch`: `consumed.free(claim)` is `Some`, and the batch is
-  `min(PRODUCER_BATCH, free)`. -/
+  /-- `refill_batch` with the consumers still there: `consumed.free(claim)` is `Some`, and
+  the batch is `min(PRODUCER_BATCH, free)`. -/
   | decideFreeKnown {s : Ring g} (k batch : Nat) :
-      k < limit → (s.producers k).idle → (s.producers k).pending = .none →
+      k < limit → s.closed = false → (s.producers k).idle → (s.producers k).pending = .none →
       s.claim < s.watermark + g.period →
       1 ≤ batch → batch ≤ batchMax → s.claim + batch ≤ s.watermark + g.period →
       Step g limit batchMax s
