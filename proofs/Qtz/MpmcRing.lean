@@ -78,11 +78,14 @@ theorem slotGeom_wraps (g : Geometry) (index : Nat) : (g.slotGeom index).wraps =
 
 end Geometry
 
-/-- A refill a producer has decided on but not yet committed. `seen` is the `claim` the
-decision read, which the `compare_exchange` compares against. -/
+/-- A refill a producer has decided on but not yet committed. A free-known batch keeps no
+snapshot of `claim`: the model commits it whether or not `claim` has moved, which covers
+the `compare_exchange` (it only ever commits a subset of these runs) and the blind
+`fetch_add` of `REFILL_CAS = false`. The fallback takes the position its free check was about,
+so it keeps the `claim` it read, which the `compare_exchange` compares against. -/
 inductive Pending where
   | none
-  | freeKnown (seen batch : Nat)
+  | freeKnown (batch : Nat)
   | fallback (seen : Nat)
   deriving DecidableEq
 
@@ -155,6 +158,9 @@ def reserveBatch (s : Ring g) (k count : Nat) : Ring g :=
     who := fun position =>
       if s.claim ≤ position ∧ position < s.claim + count then k else s.who position }
 
+def setPending (s : Ring g) (k : Nat) (pending : Pending) : Ring g :=
+  s.updateProducer k { s.producers k with pending := pending }
+
 def afterClaim (s : Ring g) (index : Nat) : Ring g := s.updateSlot index SlotModel.claimCurrent
 
 def afterRelease (s : Ring g) (index : Nat) : Ring g := s.updateSlot index SlotModel.releaseCurrent
@@ -182,71 +188,68 @@ def afterAbandon (s : Ring g) (k bit : Nat) : Ring g :=
 def afterOrphan (s : Ring g) (k bit : Nat) : Ring g :=
   s.updateProducer k ((s.producers k).withoutBit bit)
 
-/-- One step of the ring with at most `limit` producers and batches of at most `batchMax`. -/
-inductive Step (g : Geometry) (limit batchMax : Nat) : Ring g → Ring g → Prop
+/-- One step of the ring with at most `limit` producers. -/
+inductive Step (g : Geometry) (limit : Nat) : Ring g → Ring g → Prop
   /-- The last consumer is dropped. -/
-  | close {s : Ring g} : Step g limit batchMax s { s with closed := true }
+  | close {s : Ring g} : Step g limit s { s with closed := true }
   /-- `ReadyWord::claim`, by a consumer. -/
   | consumerClaim {s : Ring g} (index : Nat) (position : BitVec g.width) :
       index < g.period →
       decodeReady g.capacityWord (s.view index).readyWord (g.slotGeom index).slotWord =
         .published position →
-      Step g limit batchMax s (s.afterClaim index)
+      Step g limit s (s.afterClaim index)
   /-- `DoneWord::release`, by the consumer that claimed. -/
   | consumerRelease {s : Ring g} (index : Nat) :
       index < g.period →
       (s.view index).phase (s.view index).doneRound = .claimed →
-      Step g limit batchMax s (s.afterRelease index)
+      Step g limit s (s.afterRelease index)
   /-- `refill_batch` with the consumers still there: `consumed.free(claim)` is `Some`, and
   the batch is `min(PRODUCER_BATCH, free)`, which is at most one lap. -/
   | decideFreeKnown {s : Ring g} (k batch : Nat) :
       k < limit → s.closed = false → (s.producers k).idle → (s.producers k).pending = .none →
-      1 ≤ batch → batch ≤ batchMax → batch ≤ g.period →
-      Step g limit batchMax s
-        (s.updateProducer k { s.producers k with pending := .freeKnown s.claim batch })
+      1 ≤ batch → batch ≤ g.period →
+      Step g limit s (s.setPending k (.freeKnown batch))
   /-- `refill_batch`: no estimate, and `claim`'s slot is free for it. -/
   | decideFallback {s : Ring g} (k : Nat) :
       k < limit → (s.producers k).idle → (s.producers k).pending = .none →
       s.doneMatches s.claim →
-      Step g limit batchMax s
-        (s.updateProducer k { s.producers k with pending := .fallback s.claim })
+      Step g limit s (s.setPending k (.fallback s.claim))
   /-- A lost `compare_exchange`: the refill starts over. -/
   | retry {s : Ring g} (k : Nat) :
       k < limit →
-      Step g limit batchMax s (s.updateProducer k { s.producers k with pending := .none })
-  | commitFreeKnown {s : Ring g} (k seen batch : Nat) :
-      k < limit → (s.producers k).pending = .freeKnown seen batch → seen = s.claim →
-      Step g limit batchMax s (s.reserveBatch k batch)
+      Step g limit s (s.setPending k .none)
+  | commitFreeKnown {s : Ring g} (k batch : Nat) :
+      k < limit → (s.producers k).pending = .freeKnown batch →
+      Step g limit s (s.reserveBatch k batch)
   | commitFallback {s : Ring g} (k seen : Nat) :
       k < limit → (s.producers k).pending = .fallback seen → seen = s.claim →
-      Step g limit batchMax s (s.reserveBatch k 1)
+      Step g limit s (s.reserveBatch k 1)
   /-- `acquire_slot` finds a batch position whose `done` is free for it. -/
   | acquire {s : Ring g} (k bit : Nat) :
       k < limit → (s.producers k).unused bit = true → (s.producers k).writing = none →
       s.doneMatches ((s.producers k).start + bit) →
-      Step g limit batchMax s (s.afterAcquire k bit)
+      Step g limit s (s.afterAcquire k bit)
   | publish {s : Ring g} (k bit : Nat) :
       k < limit → (s.producers k).writing = some bit →
-      Step g limit batchMax s (s.afterPublish k bit)
+      Step g limit s (s.afterPublish k bit)
   /-- A `SlotWriter` or `WrittenSlot` dropped without committing returns its bit. -/
   | unwrite {s : Ring g} (k bit : Nat) :
       k < limit → (s.producers k).writing = some bit →
-      Step g limit batchMax s (s.afterUnwrite k bit)
+      Step g limit s (s.afterUnwrite k bit)
   /-- `BatchAbandon::release` finds `done` free for the position and gives it up. -/
   | abandonOne {s : Ring g} (k bit : Nat) :
       k < limit → (s.producers k).unused bit = true →
       s.doneMatches ((s.producers k).start + bit) →
-      Step g limit batchMax s (s.afterAbandon k bit)
+      Step g limit s (s.afterAbandon k bit)
   /-- `BatchAbandon::release` finds the consumers gone and returns with the position
   still reserved. -/
   | orphanOne {s : Ring g} (k bit : Nat) :
       k < limit → (s.producers k).unused bit = true → s.closed = true →
-      Step g limit batchMax s (s.afterOrphan k bit)
+      Step g limit s (s.afterOrphan k bit)
 
-inductive Reachable (limit batchMax : Nat) : Ring g → Prop
-  | initial : Reachable limit batchMax (Ring.initial g)
-  | step {s t : Ring g} : Reachable limit batchMax s → Step g limit batchMax s t →
-      Reachable limit batchMax t
+inductive Reachable (limit : Nat) : Ring g → Prop
+  | initial : Reachable limit (Ring.initial g)
+  | step {s t : Ring g} : Reachable limit s → Step g limit s t → Reachable limit t
 
 end Ring
 

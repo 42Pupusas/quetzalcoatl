@@ -6,14 +6,24 @@ The invariant of the mpmc ring model, and the counting argument behind it.
 A position is *owned* while it is reserved or being written: its producer has not yet
 published it or given it up. The ghost `who` names the producer that reserved each position.
 
-How far reservations run ahead of a slot's `done` word rests on one fact, `one_owned`: a
-producer owns at most one position of any slot, orphans included. A batch is at most one lap,
-and a producer takes a free-known batch only when it owns nothing (`pending_free`). In a
-closed ring a producer may own orphans, so a single-position fallback instead needs its slot to
-have nothing outstanding (`pending_fallback`).
+The ring never reserves a round a `done` word could mistake for an earlier one, because the
+rounds reserved above a slot's `done` round belong to different producers (`lead_le`). That
+rests on `one_owned`: a producer owns at most one position of any slot, orphans included. A
+batch is at most one lap, and a producer takes a free-known batch only when it owns nothing
+(`pending_free`). In a closed ring a producer may own orphans, so a single-position fallback
+instead needs its slot's `done` round to be the fallback's own (`pending_fallback`).
 -/
 
 namespace Qtz
+
+/-- A round whose position a producer still owns: reserved, or being written. -/
+def Phase.owned : Phase → Bool
+  | .reserved | .writing => true
+  | _ => false
+
+theorem Phase.ne_unreserved_of_owned {phase : Phase} (owned : phase.owned = true) :
+    phase ≠ .unreserved := by
+  intro same; subst same; exact absurd owned (by decide)
 
 namespace Ring
 
@@ -38,9 +48,11 @@ structure Inv (limit : Nat) (s : Ring g) : Prop where
   writing_held : ∀ position, s.phaseAt position = .writing →
     ∃ bit, (s.producers (s.who position)).writing = some bit ∧
       (s.producers (s.who position)).start + bit = position
-  pending_free : ∀ k seen batch, (s.producers k).pending = .freeKnown seen batch →
+  pending_idle : ∀ k, (s.producers k).pending ≠ .none → (s.producers k).idle
+  pending_free : ∀ k batch, (s.producers k).pending = .freeKnown batch →
     1 ≤ batch ∧ batch ≤ g.period ∧
       ∀ position, s.who position = k → (s.phaseAt position).owned = false
+  fallback_seen_le : ∀ k seen, (s.producers k).pending = .fallback seen → seen ≤ s.claim
   pending_fallback : ∀ k seen, (s.producers k).pending = .fallback seen → seen = s.claim →
     s.doneRoundAt seen = seen / g.period
 
@@ -89,52 +101,29 @@ theorem Inv.reserved_between (inv : Inv limit s) {index round : Nat} (below : in
   generalize (s.view index).phase round = phase at *
   cases phase <;> simp_all
 
-/-- The core count. Rounds `done + 1` up to the last reserved one are each reserved by a
-different producer, and none by `skipped` if that producer owns nothing. Dropping the
-`skipped` producer leaves `limit - 1` owners. -/
-theorem Inv.lead_le (inv : Inv limit s) {index : Nat} (below : index < g.period)
-    (skipped : Nat) (skipped_below : skipped < limit) (owns_nothing : ∀ position, s.who position = skipped →
-      (s.phaseAt position).owned = false) :
-    roundsBelow g.period s.claim index ≤ (s.view index).doneRound + limit := by
+/-- The core count. Rounds `done + 1` up to the last reserved one are reserved by
+different producers, so there are at most `limit` of them. -/
+theorem Inv.lead_le (inv : Inv limit s) {index : Nat} (below : index < g.period) :
+    roundsBelow g.period s.claim index ≤ (s.view index).doneRound + limit + 1 := by
   have done_le := inv.done_le_rounds_below below
-  by_cases few : roundsBelow g.period s.claim index ≤ (s.view index).doneRound + 1
-  · omega
-  · let done := (s.view index).doneRound
-    let owner : Nat → Nat := fun offset =>
-      s.who (index + (done + 1 + offset) * g.period)
-    let squeezed : Nat → Nat := fun offset =>
-      if skipped < owner offset then owner offset - 1 else owner offset
-    have reserved : ∀ offset, offset < roundsBelow g.period s.claim index - done - 1 →
-        s.phaseAt (index + (done + 1 + offset) * g.period) = .reserved := fun offset small => by
-      rw [phaseAt_position s below]
-      exact inv.reserved_between below (by omega) (by omega)
-    have different_owner : ∀ offset, offset < roundsBelow g.period s.claim index - done - 1 →
-        owner offset ≠ skipped := fun offset small same => by
-      have := owns_nothing _ same
-      rw [reserved offset small] at this
-      exact absurd this (by decide)
-    have fits := pigeonhole (roundsBelow g.period s.claim index - done - 1) (limit - 1) squeezed
-      (fun offset small => by
-        have owner_below : owner offset < limit :=
-          inv.who_below _ ((lt_roundsBelow_iff below _).1 (by omega))
-        have owner_different : owner offset ≠ skipped := different_owner offset small
-        show (if skipped < owner offset then owner offset - 1 else owner offset) < limit - 1
-        split <;> omega)
-      (fun first second first_small second_small same => by
-        have first_different := different_owner first first_small
-        have second_different := different_owner second second_small
-        have same_owner : owner first = owner second := by
-          change (if skipped < owner first then owner first - 1 else owner first) =
-            (if skipped < owner second then owner second - 1 else owner second) at same
-          split at same <;> split at same <;> omega
-        have equal := inv.one_owned _ _
-          (by rw [position_mod _ below, position_mod _ below]) same_owner
-          (by rw [reserved first first_small]; rfl) (by rw [reserved second second_small]; rfl)
-        have rounds : (done + 1 + first) * g.period = (done + 1 + second) * g.period := by omega
-        have := Nat.eq_of_mul_eq_mul_right (Nat.pos_of_ne_zero fun zero => by
-          have := g.period_positive; omega) rounds
-        omega)
-    omega
+  let done := (s.view index).doneRound
+  have reserved : ∀ offset, offset < roundsBelow g.period s.claim index - done - 1 →
+      s.phaseAt (index + (done + 1 + offset) * g.period) = .reserved := fun offset small => by
+    rw [phaseAt_position s below]
+    exact inv.reserved_between below (by omega) (by omega)
+  have fits := pigeonhole (roundsBelow g.period s.claim index - done - 1) limit
+    (fun offset => s.who (index + (done + 1 + offset) * g.period))
+    (fun offset small =>
+      inv.who_below _ ((lt_roundsBelow_iff below _).1 (by omega)))
+    (fun first second first_small second_small same => by
+      have equal := inv.one_owned _ _
+        (by rw [position_mod _ below, position_mod _ below]) same
+        (by rw [reserved first first_small]; rfl) (by rw [reserved second second_small]; rfl)
+      have rounds : (done + 1 + first) * g.period = (done + 1 + second) * g.period := by omega
+      have := Nat.eq_of_mul_eq_mul_right (Nat.pos_of_ne_zero fun zero => by
+        have := g.period_positive; omega) rounds
+      omega)
+  omega
 
 end Ring
 

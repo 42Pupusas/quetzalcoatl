@@ -10,11 +10,6 @@ position in `[claim, claim + count)`.
 
 namespace Qtz
 
-/-- A round whose position a producer still owns: reserved, or being written. -/
-def Phase.owned : Phase → Bool
-  | .reserved | .writing => true
-  | _ => false
-
 namespace Ring
 
 variable {g : Geometry}
