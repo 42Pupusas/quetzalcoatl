@@ -23,3 +23,4 @@ import Qtz.ConsumedTally
 import Qtz.MpscClaim
 import Qtz.MpscSlotWord
 import Qtz.MpscRing
+import Qtz.MpscJoin
