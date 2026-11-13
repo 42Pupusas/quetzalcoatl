@@ -16,4 +16,12 @@ theorem capacity_in_lower_half_of_position_space {width capacity : Nat}
   rw [Nat.add_sub_cancel_left] at capacity_at_most_max
   omega
 
+/-- A power-of-two capacity within `Capacity::MAX` has its logarithm below the word width,
+which is the `log_below_width` field of `Geometry`. -/
+theorem log_lt_width_of_capacity {width log : Nat} (width_at_least_three : 3 ≤ width)
+    (capacity_at_most_max : 2 ^ log ≤ maxCapacity width) : log < width := by
+  unfold maxCapacity at capacity_at_most_max
+  have := (Nat.pow_le_pow_iff_right (by omega : 1 < 2)).1 capacity_at_most_max
+  omega
+
 end Qtz

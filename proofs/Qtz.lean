@@ -19,3 +19,4 @@ import Qtz.MpmcRingMove
 import Qtz.MpmcRingConsume
 import Qtz.MpmcRingProduce
 import Qtz.MpmcRingSafe
+import Qtz.ConsumedTally
