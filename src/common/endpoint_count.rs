@@ -51,6 +51,21 @@ impl EndpointCount {
         self.live.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Registers a newly cloned handle unless `limit` handles are
+    /// already live, reporting whether it was registered.
+    ///
+    /// A rejected clone leaves the count untouched, so it cannot make a
+    /// concurrent [`release`](Self::release) miss being the last.
+    #[inline]
+    #[must_use]
+    pub fn try_register(&self, limit: usize) -> bool {
+        self.live
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                (live < limit).then(|| live + 1)
+            })
+            .is_ok()
+    }
+
     /// Retires a dropping handle, reporting whether it was the last.
     ///
     /// A `true` obliges the caller to close its side and wake the
@@ -90,6 +105,46 @@ mod tests {
     #[test]
     fn a_fresh_count_holds_the_single_split_endpoint() {
         assert_eq!(EndpointCount::new().live(), 1);
+    }
+
+    #[test]
+    fn registering_stops_at_the_limit() {
+        let count = EndpointCount::new();
+        assert!(count.try_register(3));
+        assert!(count.try_register(3));
+        assert!(!count.try_register(3));
+        assert_eq!(count.live(), 3);
+    }
+
+    #[test]
+    fn a_limit_of_one_admits_no_clone() {
+        let count = EndpointCount::new();
+        assert!(!count.try_register(1));
+        assert!(count.release());
+    }
+
+    #[test]
+    fn a_released_handle_frees_room_under_the_limit() {
+        let count = EndpointCount::new();
+        assert!(count.try_register(2));
+        assert!(!count.try_register(2));
+        assert!(!count.release());
+        assert!(count.try_register(2));
+    }
+
+    #[test]
+    fn concurrent_registrations_never_pass_the_limit() {
+        let count = Arc::new(EndpointCount::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let count = Arc::clone(&count);
+            handles.push(std::thread::spawn(move || {
+                (0..64).filter(|_| count.try_register(100)).count()
+            }));
+        }
+        let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(admitted, 99);
+        assert_eq!(count.live(), 100);
     }
 
     #[test]

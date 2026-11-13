@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target can reach it in practice. The proofs in `proofs/` state the
   bound as a hypothesis.
 
+- **mpmc bounds its live producers by the capacity.** A slot's `done`
+  word names a round only modulo `2^usize::BITS / capacity`, so a
+  producer can tell its round from the slot's current one only while
+  they are fewer than that apart. Each producer holds at most one
+  position per slot, in a batch of at most 32, so the rounds reserved
+  ahead of one slot stay inside that window while `32 * producers` is
+  below it. `Producer::clone` now panics once
+  `usize::MAX / capacity / 32` producers are live, and
+  `RingBuffer::new` panics when that is zero, which refuses capacities
+  above `2^(usize::BITS - 6)`. No allocation reaches that on a 64-bit
+  target, and on a 32-bit one it is 2^26 slots. Below it the limit is
+  at least 2^16 producers for a capacity of 1024 on either width.
+- **The `ConsumedWatermark` documentation said it counts releases.** It
+  counts claims, as the code always did; the `done` word, not the
+  watermark, protects a slot from reuse.
+
 ### Fixed
 - **A panicking slot initializer leaked the ring's allocation and every
   slot already built.** The `Vec` that now builds the buffer drops them

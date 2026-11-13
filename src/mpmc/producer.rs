@@ -37,8 +37,17 @@ pub struct Producer<T, C: Config = DefaultConfig> {
 }
 
 impl<T, C: Config> Clone for Producer<T, C> {
+    /// # Panics
+    ///
+    /// Panics if the ring already has as many live producers as its
+    /// capacity allows: `usize::MAX / capacity / 32`.
     fn clone(&self) -> Self {
-        self.queue.producer_count.register();
+        assert!(
+            self.queue
+                .producer_count
+                .try_register(self.queue.producer_limit()),
+            "mpmc producer limit reached for this capacity"
+        );
         Self {
             queue: Arc::clone(&self.queue),
             batch_start: Cell::new(0),

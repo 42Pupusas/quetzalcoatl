@@ -175,6 +175,9 @@ impl<T, C: Config> RingBuffer<T, C> {
     /// Panics if `capacity.get() < 4`. The per-slot tri-state
     /// encoding aliases at smaller capacities.
     ///
+    /// Also panics if the capacity leaves no room for a producer:
+    /// `usize::MAX / capacity / 32` must be at least 1.
+    ///
     /// `C`'s tunables are validated at monomorphization via
     /// [`ConfigBounds`]: `PRODUCER_BATCH` must be in `1..=32`,
     /// the others must be `>= 1`.
@@ -184,6 +187,10 @@ impl<T, C: Config> RingBuffer<T, C> {
         let () = ConfigBounds::<C>::VALIDATE;
         let cap = capacity.get();
         assert!(cap >= 4, "mpmc requires capacity >= 4");
+        assert!(
+            Self::producer_limit_for(capacity) >= 1,
+            "mpmc capacity leaves no room for a producer"
+        );
         let data = AlignedBuf::new_with(cap, || UnsafeCell::new(MaybeUninit::uninit()));
         let mut ridx = 0usize;
         let ready = AlignedBuf::new_with(cap, || {
@@ -223,6 +230,25 @@ impl<T, C: Config> RingBuffer<T, C> {
             backstop: backstop_monitor::BackstopMonitor::new(),
             _config: std::marker::PhantomData,
         }
+    }
+
+    /// The most producer handles that may be live at once.
+    ///
+    /// A slot's `done` word names a round only modulo
+    /// `wraps = 2^usize::BITS / capacity`, so a producer can tell its
+    /// round from the slot's current one only while they are fewer than
+    /// `wraps` apart. Each producer holds at most one position per slot
+    /// in a batch of at most `u32::BITS` positions, so the rounds
+    /// reserved ahead of a slot stay below `wraps` while
+    /// `u32::BITS * producers < wraps`.
+    pub(crate) const fn producer_limit_for(capacity: Capacity) -> usize {
+        // `usize::MAX / cap` is `wraps - 1` because `cap` is a power of two.
+        usize::MAX / capacity.get() / u32::BITS as usize
+    }
+
+    /// [`producer_limit_for`](Self::producer_limit_for) this ring's capacity.
+    pub(crate) const fn producer_limit(&self) -> usize {
+        Self::producer_limit_for(self.capacity)
     }
 
     /// Starts watching one waiter's park loop for backstop rescues.
@@ -455,6 +481,33 @@ mod tests {
     #[should_panic(expected = "mpmc requires capacity >= 4")]
     fn rejects_small_capacity() {
         let _ = RingBuffer::<u8>::new(Capacity::exact(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "mpmc capacity leaves no room for a producer")]
+    fn rejects_a_capacity_that_leaves_no_room_for_a_producer() {
+        let _ = RingBuffer::<u8>::new(Capacity::exact(Capacity::MAX));
+    }
+
+    #[test]
+    fn the_producer_limit_keeps_a_batch_per_producer_inside_the_round_window() {
+        let wraps = |cap: usize| (usize::MAX / cap) + 1;
+        for log in 2..usize::BITS - 3 {
+            let capacity = Capacity::exact(1 << log);
+            let limit = RingBuffer::<u8>::producer_limit_for(capacity);
+            let window = wraps(capacity.get());
+            assert!(u32::BITS as usize * limit < window, "log {log}");
+            assert!(
+                u32::BITS as usize * (limit + 1) >= window,
+                "log {log}: limit is not the largest"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_capacities_allow_a_huge_number_of_producers() {
+        let limit = RingBuffer::<u8>::producer_limit_for(Capacity::exact(1 << 10));
+        assert!(limit >= 1 << 16);
     }
 
     /// A counter that never fires proves nothing unless it *can* fire.

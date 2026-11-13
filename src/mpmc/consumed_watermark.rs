@@ -5,17 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::common::CachePadded;
 
-/// A lower bound on the number of positions consumers have released.
+/// A lower bound on the number of positions consumers have claimed.
 ///
 /// Producers subtract it from the claim cursor to bound how many
 /// positions they may reserve. The value lags real consumer progress,
 /// because each consumer batches its pops privately before publishing
 /// them (see [`ConsumedTally`]).
 ///
-/// Lagging is safe in one direction only: an understated watermark
-/// overstates how full the ring is, so a producer reserves less than it
-/// could and falls back to a per-slot check. Overstating it would let a
-/// producer reserve a position whose previous occupant is still live.
+/// It counts claims, not releases: a consumer records a pop when it
+/// wins the slot, before it reads the value and releases `done`. So a
+/// position counted here may still be live, and the watermark does not
+/// protect a slot from reuse. That is the job of the `done` word, which
+/// a producer checks before every write. The watermark only throttles
+/// how many positions are reserved, and an understated one reserves
+/// less than it could and falls back to a per-slot check.
 pub(super) struct ConsumedWatermark(CachePadded<AtomicUsize>);
 
 impl ConsumedWatermark {
