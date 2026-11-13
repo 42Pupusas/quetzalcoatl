@@ -1,0 +1,5 @@
+name = "qtz_proofs"
+defaultTargets = ["Qtz"]
+
+[[lean_lib]]
+name = "Qtz"
