@@ -45,11 +45,17 @@ theorem claim_room_of_fresh {width tail head capacity : Nat} (head_le_tail : hea
     tail - head < capacity :=
   claim_room_of_cached (Nat.le_refl _) head_le_tail capacity_fits (by omega) room
 
-/-- Without that bound the test is unsound: a producer whose cache is a word lap and two
-positions behind sees room in a full ring. Four-bit words, capacity four, cached head 0,
-true head 14, tail 18. -/
-theorem stale_cache_sees_room_in_a_full_ring :
-    wrappedRoom (width := 4) 18 0 4 = true ∧ 18 - 14 = 4 := by
-  decide
+/-- Without that bound the test is unsound at every width: a producer whose cached head is a
+full word lap behind the tail sees room, however full the ring is. The ring here is exactly
+full (`tail - head = capacity`) and the cache is no later than the head. -/
+theorem stale_cache_sees_room_in_a_full_ring {width capacity : Nat} (capacity_positive : 0 < capacity)
+    (capacity_fits : capacity < 2 ^ width) (cached : Nat) :
+    wrappedRoom (width := width) (cached + 2 ^ width) cached capacity = true ∧
+      cached ≤ cached + 2 ^ width - capacity := by
+  refine ⟨?_, by omega⟩
+  rw [wrappedRoom_iff (by omega) capacity_fits]
+  have : cached + 2 ^ width - cached = 2 ^ width := by omega
+  rw [this, Nat.mod_self]
+  exact capacity_positive
 
 end Qtz
