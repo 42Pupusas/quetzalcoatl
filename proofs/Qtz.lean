@@ -20,3 +20,6 @@ import Qtz.MpmcRingConsume
 import Qtz.MpmcRingProduce
 import Qtz.MpmcRingSafe
 import Qtz.ConsumedTally
+import Qtz.MpscClaim
+import Qtz.MpscSlotWord
+import Qtz.MpscRing
