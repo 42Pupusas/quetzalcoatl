@@ -79,17 +79,33 @@ impl<T, C: Config> Producer<T, C> {
     /// if the watermark says full and a per-slot check confirms it.
     #[inline]
     fn refill_batch(&self, q: &RingBuffer<T, C>) -> Option<(usize, u32)> {
-        let claim = q.claim.load(Ordering::Relaxed);
-        // No estimate means the watermark accounts for the whole ring;
-        // it lags, so check the slot itself before giving up.
-        let free = match q.consumed.free(claim, q.capacity.get()) {
-            Some(free) => free,
-            None if q.done_slot(claim).is_free_for(claim) => 1,
-            None => return None,
+        let (start, batch) = loop {
+            let claim = q.claim.load(Ordering::Relaxed);
+            // No estimate means the watermark accounts for the whole
+            // ring; it lags, so check the slot itself before giving up.
+            let free = match q.consumed.free(claim, q.capacity.get()) {
+                Some(free) => free,
+                None if q.done_slot(claim).is_free_for(claim) => 1,
+                None => return None,
+            };
+            let batch = C::PRODUCER_BATCH.min(free);
+            // Taking the batch only if `claim` has not moved keeps the
+            // cursor within `free` of the watermark: a blind add would
+            // let every racing producer take a batch against the same
+            // snapshot.
+            if q.claim
+                .compare_exchange_weak(
+                    claim,
+                    claim.wrapping_add(batch),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break (claim, batch);
+            }
+            std::hint::spin_loop();
         };
-        let batch = C::PRODUCER_BATCH.min(free);
-
-        let start = q.claim.fetch_add(batch, Ordering::Relaxed);
         let unused = if batch >= 32 {
             u32::MAX
         } else {
