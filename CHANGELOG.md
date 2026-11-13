@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written alloc/dealloc/drop loop and its `unsafe` are gone.
 - The repository resolves dependencies with a 3-day
   `global-min-publish-age` cooldown (`.cargo/config.toml`).
+- **`Capacity` is now at most `Capacity::MAX`, `2^(usize::BITS - 3)`.**
+  `Capacity::exact` and `Capacity::at_least` panic above it. The
+  position comparisons and `ConsumerFloor::permits` read a wrapped
+  distance as signed and are only correct while twice the capacity is
+  below half the position space; a capacity of `2^(usize::BITS - 1)`
+  passed the old power-of-two check and broke that. Only a 32-bit
+  target can reach it in practice. The proofs in `proofs/` state the
+  bound as a hypothesis.
 
 ### Fixed
 - **A panicking slot initializer leaked the ring's allocation and every
