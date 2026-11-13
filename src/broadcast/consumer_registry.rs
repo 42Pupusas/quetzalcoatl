@@ -1,6 +1,7 @@
 //! The fixed-size table of subscribed consumers and their heads.
 
 use super::consumer_floor::ConsumerFloor;
+use crate::common::position_order::PositionOrder;
 use crate::common::CachePadded;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -124,16 +125,22 @@ impl ConsumerRegistry {
     /// producer may see the slot freed and overwrite it.
     #[inline]
     pub(super) fn publish_head_past(&self, index: usize, head: usize) {
-        self.slots[index].head.store(head + 1, Ordering::Release);
+        self.slots[index]
+            .head
+            .store(head.wrapping_add(1), Ordering::Release);
     }
 
     /// The slowest subscribed consumer's position.
+    ///
+    /// Compared in position order, not numerically: consumers that
+    /// straddle the `usize` rollover are at most a capacity apart, and
+    /// the numerically smaller head is then the one that is ahead.
     #[inline]
     pub(super) fn floor(&self) -> ConsumerFloor {
         self.slots
             .iter()
             .filter_map(ConsumerSlot::subscribed_head)
-            .min()
+            .reduce(PositionOrder::earliest)
             .map_or(ConsumerFloor::NoConsumers, ConsumerFloor::At)
     }
 
@@ -223,6 +230,16 @@ mod tests {
         registry.publish_head_past(fast, 9);
         registry.publish_head_past(slow, 2);
         assert_eq!(registry.floor(), ConsumerFloor::At(3));
+    }
+
+    #[test]
+    fn the_floor_is_the_earliest_position_across_the_rollover() {
+        let registry = ConsumerRegistry::new(2);
+        let behind = registry.subscribe_first();
+        let ahead = registry.subscribe_at(0);
+        registry.publish_head_past(behind, usize::MAX - 2);
+        registry.publish_head_past(ahead, 1);
+        assert_eq!(registry.floor(), ConsumerFloor::At(usize::MAX - 1));
     }
 
     #[test]

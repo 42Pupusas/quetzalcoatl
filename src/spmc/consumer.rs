@@ -40,13 +40,7 @@ const BATCH_SIZE: usize = 4;
 impl<T> Clone for Consumer<T> {
     fn clone(&self) -> Self {
         self.queue.consumer_count_live.register();
-        Self {
-            queue: Arc::clone(&self.queue),
-            cached_tail: Cell::new(0),
-            batch_next: Cell::new(0),
-            batch_end: Cell::new(0),
-            park_slot: self.queue.consumer_slots.lease(),
-        }
+        Self::new_with(Arc::clone(&self.queue), self.queue.consumer_slots.lease())
     }
 }
 
@@ -57,13 +51,7 @@ unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Consumer<
 impl<T> Consumer<T> {
     pub(super) fn new(queue: Arc<RingBuffer<T>>) -> Self {
         let park_slot = queue.consumer_slots.lease();
-        Self {
-            queue,
-            cached_tail: Cell::new(0),
-            batch_next: Cell::new(0),
-            batch_end: Cell::new(0),
-            park_slot,
-        }
+        Self::new_with(queue, park_slot)
     }
 }
 
@@ -89,10 +77,15 @@ impl<'a, T> Consumer<T, &'a RingBuffer<T>> {
 }
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
-    pub(super) const fn new_with(queue: R, park_slot: ParkSlot) -> Self {
+    /// The tail cache starts at the current head, which shows no
+    /// backlog and so sends the first claim to the real tail. Seeding
+    /// it with zero showed a consumer created in the last lap before
+    /// the position rollover a backlog that had not been published.
+    pub(super) fn new_with(queue: R, park_slot: ParkSlot) -> Self {
+        let head = queue.cursors.head().load(Ordering::Relaxed);
         Self {
             queue,
-            cached_tail: Cell::new(0),
+            cached_tail: Cell::new(head),
             batch_next: Cell::new(0),
             batch_end: Cell::new(0),
             park_slot,
@@ -107,13 +100,43 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     #[inline]
     fn claim_slot(&self) -> Option<(*const MaybeUninit<T>, &DoneWord, usize)> {
         let next = self.batch_next.get();
-        let end = self.batch_end.get();
-        if next < end {
-            self.batch_next.set(next + 1);
+        if next != self.batch_end.get() {
+            self.batch_next.set(next.wrapping_add(1));
             return Some(self.bind_pos(next));
         }
 
         self.claim_batch()
+    }
+
+    /// How many positions the cached tail shows ahead of `head`.
+    ///
+    /// Peers advance `head` past a tail this consumer cached earlier,
+    /// and the gap then wraps to more than the ring holds. That reads
+    /// as no backlog, so the caller goes to the real tail.
+    #[inline]
+    fn cached_backlog(&self, head: usize) -> usize {
+        let backlog = self.cached_tail.get().wrapping_sub(head);
+        if backlog > self.ring().capacity.get() {
+            0
+        } else {
+            backlog
+        }
+    }
+
+    /// Reloads the tail and returns how far it is ahead of `head`.
+    ///
+    /// The gap is compared as a signed distance, so it stays correct
+    /// when the tail has rolled over `usize` and `head` has not.
+    #[inline]
+    fn refreshed_backlog(&self, head: usize) -> usize {
+        let tail = self.ring().cursors.tail().load(Ordering::Acquire);
+        self.cached_tail.set(tail);
+        let backlog = tail.wrapping_sub(head);
+        if backlog.cast_signed() < 0 {
+            0
+        } else {
+            backlog
+        }
     }
 
     #[cold]
@@ -124,16 +147,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let mut backoff = Backoff::new();
         loop {
             let head = q.cursors.head().load(Ordering::Relaxed);
-            let mut tail = self.cached_tail.get();
-            if head >= tail {
-                tail = q.cursors.tail().load(Ordering::Acquire);
-                self.cached_tail.set(tail);
-                if head >= tail {
+            let mut avail = self.cached_backlog(head);
+            if avail == 0 {
+                avail = self.refreshed_backlog(head);
+                if avail == 0 {
                     if q.closed.is_closed() {
-                        let tail2 = q.cursors.tail().load(Ordering::Acquire);
-                        self.cached_tail.set(tail2);
-                        let head2 = q.cursors.head().load(Ordering::Relaxed);
-                        if head2 >= tail2 {
+                        // The tail is final once the ring is closed,
+                        // so an empty reading against it is conclusive.
+                        let head = q.cursors.head().load(Ordering::Relaxed);
+                        if self.refreshed_backlog(head) == 0 {
                             return None;
                         }
                         continue;
@@ -142,15 +164,14 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
                 }
             }
 
-            let avail = tail - head;
             let take = avail.min(BATCH_SIZE);
-            let new_head = head + take;
+            let new_head = head.wrapping_add(take);
             if q.cursors
                 .head()
                 .compare_exchange_weak(head, new_head, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                self.batch_next.set(head + 1);
+                self.batch_next.set(head.wrapping_add(1));
                 self.batch_end.set(new_head);
                 return Some(self.bind_pos(head));
             }
@@ -160,17 +181,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     #[inline]
     fn has_item(&self) -> bool {
-        if self.batch_next.get() < self.batch_end.get() {
+        if self.batch_next.get() != self.batch_end.get() {
             return true;
         }
-        let q = self.ring();
-        let head = q.cursors.head().load(Ordering::Relaxed);
-        if head < self.cached_tail.get() {
-            return true;
-        }
-        let tail = q.cursors.tail().load(Ordering::Acquire);
-        self.cached_tail.set(tail);
-        head < tail
+        let head = self.ring().cursors.head().load(Ordering::Relaxed);
+        self.cached_backlog(head) != 0 || self.refreshed_backlog(head) != 0
     }
 
     #[inline]
@@ -439,13 +454,14 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
         // SAFETY: the consumer's handle keeps the ring alive for the
         // whole of this destructor, and `park_slot` is ours, unreleased.
         let _close = unsafe { ConsumerClose::new(std::ptr::from_ref(q), self.park_slot) };
-        let next = self.batch_next.get();
         let end = self.batch_end.get();
-        for pos in next..end {
+        let mut pos = self.batch_next.get();
+        while pos != end {
             unsafe {
                 q.data_slot(pos).get().cast::<T>().drop_in_place();
             }
             q.done_slot(pos).release(pos, q.capacity);
+            pos = pos.wrapping_add(1);
         }
     }
 }

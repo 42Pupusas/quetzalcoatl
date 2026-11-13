@@ -93,7 +93,8 @@ impl ReadyWord {
     /// both directions need the drain to close the Dekker race against
     /// the peer's parking sequence.
     pub(super) fn publish(&self, pos: usize) {
-        self.0.store(pos + Self::PUBLISHED, Ordering::SeqCst);
+        self.0
+            .store(pos.wrapping_add(Self::PUBLISHED), Ordering::SeqCst);
     }
 
     /// Takes exclusive ownership of the value published at `round_pos`.
@@ -103,8 +104,8 @@ impl ReadyWord {
     pub(super) fn claim(&self, round_pos: usize) -> bool {
         self.0
             .compare_exchange(
-                round_pos + Self::PUBLISHED,
-                round_pos + Self::CLAIMED,
+                round_pos.wrapping_add(Self::PUBLISHED),
+                round_pos.wrapping_add(Self::CLAIMED),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )
@@ -117,7 +118,8 @@ impl ReadyWord {
     /// paired with a `done` release it says "this round is finished and
     /// left no value", which is exactly what teardown needs to hear.
     pub(super) fn abandon(&self, pos: usize) {
-        self.0.store(pos + Self::CLAIMED, Ordering::Release);
+        self.0
+            .store(pos.wrapping_add(Self::CLAIMED), Ordering::Release);
     }
 
     /// The raw word, for diagnostics.
@@ -201,6 +203,23 @@ mod tests {
                 ReadyState::Published(round_pos),
                 "round {round}"
             );
+        }
+    }
+
+    /// `round_pos + 1` overflowed in a debug build at the last
+    /// position, where the word itself wraps to a small value.
+    #[test]
+    fn the_last_positions_publish_claim_and_abandon_without_overflow() {
+        let capacity = cap();
+        for round_pos in [usize::MAX - 7, usize::MAX - 1, usize::MAX - 7 - 8] {
+            let slot = capacity.index_of(round_pos);
+            let word = ReadyWord::free_at(slot);
+            word.publish(round_pos);
+            assert_eq!(word.state(slot, capacity), ReadyState::Published(round_pos));
+            assert!(word.claim(round_pos));
+            assert_eq!(word.state(slot, capacity), ReadyState::Claimed(round_pos));
+            word.abandon(round_pos);
+            assert_eq!(word.state(slot, capacity), ReadyState::Claimed(round_pos));
         }
     }
 

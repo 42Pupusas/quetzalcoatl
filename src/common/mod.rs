@@ -8,6 +8,7 @@
 pub mod aligned_buf;
 pub mod atomics;
 pub mod backoff;
+pub mod cache_line_alloc;
 pub mod cache_padded;
 pub mod close_state;
 pub mod cursors;
@@ -25,6 +26,7 @@ pub mod park_probe;
 #[cfg(feature = "async")]
 pub mod park_registration;
 pub mod park_registry;
+pub mod position_order;
 #[cfg(test)]
 pub mod probe_budget;
 #[cfg(test)]

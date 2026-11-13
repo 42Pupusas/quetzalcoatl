@@ -33,7 +33,7 @@
 //! at each of the six sites that do it.
 
 use super::CachePadded;
-use std::ops::Range;
+use crate::capacity::Capacity;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A ring's producer and consumer positions, each on its own cache line.
@@ -124,10 +124,19 @@ impl Cursors {
     ///
     /// Takes `&mut self`, which is the whole point: every handle is
     /// gone, so the cursors are read without atomics and cannot move
-    /// while the caller walks the range.
+    /// while the caller walks the positions.
+    ///
+    /// The positions are counted from `head` rather than ranged over,
+    /// because a range from `head` to a `tail` that has rolled over
+    /// `usize` is empty and would leave the values undropped. A gap
+    /// above the capacity is no backlog a ring can hold, so it yields
+    /// nothing rather than a walk over slots that hold no value.
     #[inline]
-    pub fn occupied(&mut self) -> Range<usize> {
-        *self.head.0.get_mut()..*self.tail.0.get_mut()
+    pub fn occupied(&mut self, capacity: Capacity) -> impl Iterator<Item = usize> {
+        let head = *self.head.0.get_mut();
+        let gap = self.tail.0.get_mut().wrapping_sub(head);
+        let len = if gap > capacity.get() { 0 } else { gap };
+        (0..len).map(move |offset| head.wrapping_add(offset))
     }
 }
 
@@ -140,6 +149,7 @@ impl Default for Cursors {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::Cursors;
+    use crate::capacity::Capacity;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -183,7 +193,23 @@ mod tests {
         let mut cursors = Cursors::new();
         cursors.publish_head(2);
         cursors.tail().store(5, Ordering::Relaxed);
-        assert_eq!(cursors.occupied().collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(
+            cursors.occupied(Capacity::exact(4)).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+    }
+
+    /// A range from `head` to a rolled-over `tail` is empty, which
+    /// left these values undropped at teardown.
+    #[test]
+    fn the_occupied_positions_continue_across_the_rollover() {
+        let mut cursors = Cursors::new();
+        cursors.publish_head(usize::MAX - 1);
+        cursors.tail().store(1, Ordering::Relaxed);
+        assert_eq!(
+            cursors.occupied(Capacity::exact(4)).collect::<Vec<_>>(),
+            vec![usize::MAX - 1, usize::MAX, 0]
+        );
     }
 
     #[test]
@@ -191,7 +217,7 @@ mod tests {
         let mut cursors = Cursors::new();
         cursors.publish_head(5);
         cursors.tail().store(5, Ordering::Relaxed);
-        assert!(cursors.occupied().next().is_none());
+        assert!(cursors.occupied(Capacity::exact(4)).next().is_none());
     }
 
     #[test]
@@ -199,7 +225,7 @@ mod tests {
         let mut cursors = Cursors::new();
         cursors.publish_head(9);
         cursors.tail().store(4, Ordering::Relaxed);
-        assert!(cursors.occupied().next().is_none());
+        assert!(cursors.occupied(Capacity::exact(4)).next().is_none());
     }
 
     #[test]

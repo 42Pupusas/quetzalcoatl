@@ -43,7 +43,7 @@ impl<T> Drop for SlotRelease<'_, T> {
         // SeqCst: see Consumer::pop. The `xchg` drains the store buffer,
         // publishing the sequence store above before the bitmap load
         // inside `wake_one_published`.
-        self.ring.cursors.publish_head(self.head + 1);
+        self.ring.cursors.publish_head(self.head.wrapping_add(1));
         self.ring.producer_park.wake_one_published();
         self.ring.notify_producers();
     }

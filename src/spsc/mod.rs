@@ -98,7 +98,7 @@ impl<T> Drop for RingBuffer<T> {
         // Handles are all gone (we hold `&mut self`), so the cursors can
         // be read non-atomically, and everything between them is an
         // initialized value nobody consumed.
-        for pos in self.cursors.occupied() {
+        for pos in self.cursors.occupied(self.capacity) {
             // SAFETY: the producer published `pos < tail` and the
             // consumer never advanced `head` past it, so the slot holds
             // an initialized value. `&mut self` rules out concurrency.

@@ -15,22 +15,17 @@ use super::slot_state::SequenceWord;
 /// a slot that is still being written. Reusing that slot would hand two
 /// producers the same storage.
 ///
-/// The test is local: the slot backing `pos` holds position
-/// `pos - cap`, and an unresolved claim there means its occupant is
-/// still being written.
-pub(super) struct SlotReuse {
-    cap: usize,
-}
+/// The test is local: an unresolved claim on the slot means its
+/// occupant is still being written. A slot never used has no claim, so
+/// the first lap needs no special case. Testing `pos < cap` for it
+/// instead would hold again after `pos` rolled over `usize`, and skip
+/// the check for a slot that does have a claim outstanding.
+pub(super) struct SlotReuse;
 
 impl SlotReuse {
-    pub(super) const fn new(cap: usize) -> Self {
-        Self { cap }
-    }
-
-    /// Whether the previous occupant of the slot backing `pos` has
-    /// resolved. Positions in the first lap have no previous occupant.
-    pub(super) fn prior_occupant_resolved(&self, pos: usize, sequence: &SequenceWord) -> bool {
-        pos < self.cap || !sequence.is_claim_in_progress()
+    /// Whether the previous occupant of the slot has resolved.
+    pub(super) fn prior_occupant_resolved(sequence: &SequenceWord) -> bool {
+        !sequence.is_claim_in_progress()
     }
 }
 
@@ -39,31 +34,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_lap_has_no_prior_occupant() {
-        let reuse = SlotReuse::new(4);
-        let seq = SequenceWord::vacant();
-        assert!(reuse.prior_occupant_resolved(0, &seq));
-        assert!(reuse.prior_occupant_resolved(3, &seq));
+    fn a_slot_never_used_has_no_prior_occupant() {
+        assert!(SlotReuse::prior_occupant_resolved(
+            &SequenceWord::unwritten()
+        ));
     }
 
     #[test]
     fn outstanding_reservation_blocks_reuse() {
-        let reuse = SlotReuse::new(4);
-        let seq = SequenceWord::vacant();
-        assert!(!reuse.prior_occupant_resolved(4, &seq));
-        assert!(!reuse.prior_occupant_resolved(400, &seq));
+        let seq = SequenceWord::unwritten();
+        seq.claim();
+        assert!(!SlotReuse::prior_occupant_resolved(&seq));
     }
 
     #[test]
     fn published_or_abandoned_occupant_permits_reuse() {
-        let reuse = SlotReuse::new(4);
-
-        let published = SequenceWord::vacant();
+        let published = SequenceWord::unwritten();
         published.publish(0);
-        assert!(reuse.prior_occupant_resolved(4, &published));
+        assert!(SlotReuse::prior_occupant_resolved(&published));
 
-        let abandoned = SequenceWord::vacant();
+        let abandoned = SequenceWord::unwritten();
         abandoned.abandon(0);
-        assert!(reuse.prior_occupant_resolved(4, &abandoned));
+        assert!(SlotReuse::prior_occupant_resolved(&abandoned));
     }
 }

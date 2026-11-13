@@ -1,6 +1,9 @@
 //! Batched release of consumed MPSC positions.
 
+use std::mem::MaybeUninit;
+
 use super::RingBuffer;
+use crate::common::{SeqSlot, SlotSnapshot};
 
 /// Owns the obligation to publish a drain's head cursor and to wake the
 /// producers it freed.
@@ -27,7 +30,14 @@ pub(super) struct BatchRelease<'a, T> {
 }
 
 impl<'a, T> BatchRelease<'a, T> {
-    pub(super) const fn new(ring: &'a RingBuffer<T>, head: usize) -> Self {
+    /// Opens a batch at `head`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the ring's only consumer for as long as the
+    /// batch lives, and `head` its current head. [`take`](Self::take)
+    /// moves values out of the slots on the strength of that.
+    pub(super) const unsafe fn new(ring: &'a RingBuffer<T>, head: usize) -> Self {
         Self {
             ring,
             head,
@@ -36,31 +46,59 @@ impl<'a, T> BatchRelease<'a, T> {
         }
     }
 
-    pub(super) const fn position(&self) -> usize {
-        self.head
-    }
-
     pub(super) const fn delivered(&self) -> usize {
         self.delivered
     }
 
-    /// Records a position released without delivering a value: the slot
-    /// held an abandoned reservation.
-    ///
-    /// Call after the slot's sequence has been handed to the next round.
-    pub(super) const fn skip(&mut self) {
-        self.head += 1;
-        self.released += 1;
+    /// The position the batch has advanced to.
+    pub(super) const fn head(&self) -> usize {
+        self.head
     }
 
-    /// Records a position whose value has been moved out.
+    /// Releases every abandoned position at the head and reports the
+    /// first one that is not. `None` when that position has nothing
+    /// published; otherwise its slot and the pointer to its value.
     ///
-    /// Call *after* the move but *before* the user callback, so an
-    /// unwind through the callback still publishes it.
-    pub(super) const fn take(&mut self) {
-        self.head += 1;
-        self.released += 1;
+    /// The only place an abandoned reservation is recognised and
+    /// stepped over. Skipping one frees a slot exactly as consuming a
+    /// value does, so each is counted in `released`.
+    #[inline]
+    pub(super) fn settle(&mut self) -> Option<(&'a SeqSlot<T>, *const MaybeUninit<T>)> {
+        loop {
+            let slot = self.ring.slot(self.head);
+            match slot.classify(self.head) {
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Tombstoned => self.release(slot),
+                SlotSnapshot::Ready(data) => return Some((slot, data)),
+            }
+        }
+    }
+
+    /// Moves the next value out of the ring, releasing any abandoned
+    /// positions ahead of it. `None` once the next position has nothing
+    /// published.
+    ///
+    /// A returned value is already counted, so an unwind through the
+    /// caller's callback still publishes its position.
+    #[inline]
+    pub(super) fn take(&mut self) -> Option<T> {
+        let (slot, data) = self.settle()?;
+        // SAFETY: the slot is published at `head`, so it holds an
+        // initialized `T`, and `new`'s contract makes this the only
+        // reader.
+        let value = unsafe { (*data).assume_init_read() };
+        self.release(slot);
         self.delivered += 1;
+        Some(value)
+    }
+
+    /// Hands `slot`, the one at the batch's head, to its next lap and
+    /// steps past it.
+    #[inline]
+    fn release(&mut self, slot: &SeqSlot<T>) {
+        slot.sequence.release(self.head, self.ring.capacity);
+        self.head = self.head.wrapping_add(1);
+        self.released += 1;
     }
 }
 

@@ -84,7 +84,6 @@ impl<T> Producer<T> {
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &SequenceWord, usize)> {
         let mut backoff = Backoff::new();
-        let reuse = SlotReuse::new(self.queue.capacity.get());
         let mut current_tail = self.queue.tail.load(Ordering::Relaxed);
         let pos = loop {
             if !self.permits_with_refresh(current_tail) {
@@ -93,13 +92,12 @@ impl<T> Producer<T> {
             // The consumer floor speaks for consumer progress only. A
             // peer's outstanding reservation on the aliasing slot is
             // producer-owned storage that no consumer head can release.
-            if !reuse.prior_occupant_resolved(current_tail, &self.queue.slot(current_tail).sequence)
-            {
+            if !SlotReuse::prior_occupant_resolved(&self.queue.slot(current_tail).sequence) {
                 return None;
             }
             match self.queue.tail.compare_exchange_weak(
                 current_tail,
-                current_tail + 1,
+                current_tail.wrapping_add(1),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {

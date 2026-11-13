@@ -14,7 +14,7 @@ use crate::common::park_registration::{ParkSite, ParkedFuture};
 use crate::common::park_registry::ParkSlot;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
-use crate::common::{SlotSequence, SlotSnapshot};
+use crate::common::{SeqSlot, SlotSequence};
 
 /// The consumer side of an MPSC ring buffer.
 ///
@@ -39,107 +39,72 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         &self.queue
     }
 
+    /// The value at the head, with its position and slot, after
+    /// releasing any abandoned positions in the way.
+    ///
+    /// Skipping an abandoned position frees a slot exactly as consuming
+    /// a value does, so the batch that skips publishes `head` and wakes
+    /// the producers when it drops, before this returns. Leaving the
+    /// wake out stranded the capacity until an unrelated pop happened
+    /// to come along.
+    #[inline]
+    fn head_value(&self) -> Option<(usize, &SeqSlot<T>, *const MaybeUninit<T>)> {
+        let ring = self.ring();
+        // SAFETY: this is the ring's only consumer, and every caller is
+        // reached through `&mut self`. `settle` moves nothing out.
+        let mut batch =
+            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
+        let (slot, data_ptr) = batch.settle()?;
+        Some((batch.head(), slot, data_ptr))
+    }
+
     /// Whether a value sits at the head, releasing any abandoned
     /// positions in the way.
     ///
     /// A tombstone is not an item. Reporting it as one made
     /// `pop_ref_block` claim, find nothing, and return `None` from a
-    /// blocking read while producers were still live. Skipping it here
-    /// also hands its slot back — a release published through the
-    /// shared ring rather than through this handle.
+    /// blocking read while producers were still live.
     #[inline]
     fn ready_for_claim(&self) -> bool {
-        loop {
-            let head = self.ring().cursors.head().load(Ordering::Relaxed);
-            match self.ring().slot(head).classify(head) {
-                SlotSnapshot::Ready(_) => return true,
-                SlotSnapshot::Tombstoned => self.release_tombstone(head),
-                SlotSnapshot::NotReady => return false,
-            }
-        }
-    }
-
-    /// Releases the tombstoned slot at `head` and advances past it.
-    ///
-    /// Skipping a tombstone frees a slot exactly as consuming a value
-    /// does, so it publishes `head` and wakes a producer. Leaving the
-    /// wake out stranded the capacity until an unrelated pop happened to
-    /// come along.
-    #[inline]
-    fn release_tombstone(&self, head: usize) {
-        let ring = self.ring();
-        ring.slot(head).sequence.release(head, ring.capacity);
-        // SeqCst: as in `pop`, the store buffer must drain before the
-        // wake path loads the park bitmap.
-        ring.cursors.publish_head(head + 1);
-        ring.producer_park.wake_one_published();
-        ring.notify_producers();
+        self.head_value().is_some()
     }
 
     #[inline]
     #[must_use]
     pub fn pop(&mut self) -> Option<T> {
-        loop {
-            let head = self.ring().cursors.head().load(Ordering::Relaxed);
+        let (head, slot, data_ptr) = self.head_value()?;
 
-            let slot = self.ring().slot(head);
+        // SAFETY: the slot is published at `head`, so it is initialized
+        // and synchronized via the Acquire load that classified it.
+        let val = unsafe { (*data_ptr).assume_init_read() };
 
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    self.release_tombstone(head);
-                    continue;
-                }
-                SlotSnapshot::NotReady => return None,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
+        slot.sequence.release(head, self.ring().capacity);
 
-            // SAFETY: classify() returned Ready, meaning this slot is
-            // initialized and synchronized via the Acquire load inside it.
-            let val = unsafe { (*data_ptr).assume_init_read() };
+        // SeqCst (not Release): `xchg` drains the store buffer,
+        // publishing this store and the `sequence` store above before
+        // the bitmap load inside `wake_one_published`. That makes
+        // `wake_one`'s leading fence redundant, so we pay one barrier
+        // per pop instead of two. Same idiom as `mpmc::Consumer::pop`.
+        self.ring().cursors.publish_head(head.wrapping_add(1));
 
-            slot.sequence.release(head, self.ring().capacity);
+        self.ring().producer_park.wake_one_published();
+        self.ring().notify_producers();
 
-            // SeqCst (not Release): `xchg` drains the store buffer,
-            // publishing this store and the `sequence` store above
-            // before the bitmap load inside `wake_one_published`.
-            // That makes `wake_one`'s leading fence redundant, so we
-            // pay one barrier per pop instead of two. Same idiom as
-            // `mpmc::Consumer::pop`.
-            self.ring().cursors.publish_head(head + 1);
-
-            self.ring().producer_park.wake_one_published();
-            self.ring().notify_producers();
-
-            return Some(val);
-        }
+        Some(val)
     }
 
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
-        loop {
-            let head = self.ring().cursors.head().load(Ordering::Relaxed);
+        let (head, slot, data_ptr) = self.head_value()?;
+        let seq_ptr = &raw const slot.sequence;
 
-            let slot = self.ring().slot(head);
-
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    self.release_tombstone(head);
-                    continue;
-                }
-                SlotSnapshot::NotReady => return None,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
-
-            let seq_ptr = &raw const slot.sequence;
-
-            return Some(SlotReader {
-                data_ptr,
-                seq_ptr,
-                consumer: self,
-                head,
-            });
-        }
+        Some(SlotReader {
+            data_ptr,
+            seq_ptr,
+            consumer: self,
+            head,
+        })
     }
 
     /// Drains all currently available items, calling `f` for each.
@@ -153,31 +118,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// cursor is published while unwinding.
     pub fn drain(&mut self, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut batch = BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed));
-
-        loop {
-            let head = batch.position();
-            let slot = ring.slot(head);
-
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    slot.sequence.release(head, ring.capacity);
-                    batch.skip();
-                    continue;
-                }
-                SlotSnapshot::NotReady => break,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
-
-            // SAFETY: classify() returned Ready.
-            let val = unsafe { (*data_ptr).assume_init_read() };
-
-            slot.sequence.release(head, ring.capacity);
-
-            batch.take();
+        // SAFETY: `&mut self` is the ring's only consumer, and stays
+        // borrowed for as long as the batch lives.
+        let mut batch =
+            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
+        while let Some(val) = batch.take() {
             f(val);
         }
-
         batch.delivered()
     }
 
@@ -189,31 +136,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// [`drain`](Self::drain).
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
-        let mut batch = BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed));
-
+        // SAFETY: as in `drain`.
+        let mut batch =
+            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
         while batch.delivered() < limit {
-            let head = batch.position();
-            let slot = ring.slot(head);
-
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    slot.sequence.release(head, ring.capacity);
-                    batch.skip();
-                    continue;
-                }
-                SlotSnapshot::NotReady => break,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
-
-            // SAFETY: classify() returned Ready.
-            let val = unsafe { (*data_ptr).assume_init_read() };
-
-            slot.sequence.release(head, ring.capacity);
-
-            batch.take();
+            let Some(val) = batch.take() else { break };
             f(val);
         }
-
         batch.delivered()
     }
 
@@ -367,7 +296,7 @@ pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T
 impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, R> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: The slot was checked seq == head * 2 + 1 (Acquire) in pop_ref.
+        // SAFETY: pop_ref classified the slot as Ready at `head` (Acquire).
         unsafe { (*self.data_ptr).assume_init_ref() }
     }
 }

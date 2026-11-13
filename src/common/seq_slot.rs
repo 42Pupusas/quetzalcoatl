@@ -72,7 +72,6 @@ pub enum SlotSnapshot<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::slot_sequence::TOMBSTONE;
     use crate::common::BorrowedDropCounter;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -113,11 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstoned_slot_reads_as_tombstoned_at_every_position() {
-        let slot = SeqSlot::<u32>::free_at(0);
-        slot.sequence.tombstone();
-        for pos in [0usize, 1, 2, 63, 4096] {
-            assert!(slot.classify(pos).is_tombstoned());
+    fn a_tombstoned_slot_reads_as_tombstoned_only_at_its_own_position() {
+        let slot = SeqSlot::<u32>::free_at(2);
+        slot.sequence.tombstone(2);
+        assert!(slot.classify(2).is_tombstoned());
+        for pos in [0usize, 1, 3, 63, 4096] {
+            assert!(slot.classify(pos).is_not_ready());
         }
     }
 
@@ -170,22 +170,7 @@ mod tests {
     #[test]
     fn dropping_a_tombstoned_slot_drops_nothing() {
         let mut slot = SeqSlot::<BorrowedDropCounter<'_>>::free_at(3);
-        slot.sequence.tombstone();
+        slot.sequence.tombstone(3);
         slot.drop_value_at(3);
-    }
-
-    /// The one position whose published word *is* [`TOMBSTONE`], which
-    /// is why the encoding rests on reachability rather than on the
-    /// arithmetic being injective.
-    #[test]
-    fn the_tombstone_collides_only_with_a_position_no_ring_can_reach() {
-        let colliding = TOMBSTONE / 2;
-        assert_eq!(colliding * 2 + 1, TOMBSTONE);
-
-        let mut slot = SeqSlot::<u32>::free_at(0);
-        slot.sequence.tombstone();
-        assert!(slot.sequence.holds_value_at(colliding));
-        assert!(!slot.sequence.holds_value_at(colliding - 1));
-        assert_eq!(colliding, usize::MAX / 2);
     }
 }

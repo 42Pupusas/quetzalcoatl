@@ -20,6 +20,7 @@ use crate::common::SlotSequence;
 /// the tombstone is published from this type's own `Drop`.
 pub(super) struct ReservationRelease<'a, T> {
     seq: &'a SlotSequence,
+    pos: usize,
     queue: &'a RingBuffer<T>,
 }
 
@@ -28,14 +29,14 @@ impl<'a, T> ReservationRelease<'a, T> {
     ///
     /// Construct this *before* any code that might panic — the value's
     /// destructor, in particular.
-    pub(super) const fn new(seq: &'a SlotSequence, queue: &'a RingBuffer<T>) -> Self {
-        Self { seq, queue }
+    pub(super) const fn new(seq: &'a SlotSequence, pos: usize, queue: &'a RingBuffer<T>) -> Self {
+        Self { seq, pos, queue }
     }
 }
 
 impl<T> Drop for ReservationRelease<'_, T> {
     fn drop(&mut self) {
-        self.seq.tombstone();
+        self.seq.tombstone(self.pos);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();

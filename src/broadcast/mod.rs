@@ -163,7 +163,7 @@ impl<T> RingBuffer<T> {
         let cap = capacity.get();
         let buf = AlignedBuf::new_with(cap, || BroadcastSlot {
             data: UnsafeCell::new(MaybeUninit::uninit()),
-            sequence: SequenceWord::vacant(),
+            sequence: SequenceWord::unwritten(),
         });
         Self {
             buf,
@@ -288,23 +288,14 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        // Determine the range of slots that may contain initialized data.
-        // `tail` is the total number of items ever pushed. A slot at
-        // position `pos` was last written by push number `pos`, so the
-        // most recent `min(tail, cap)` slots may hold live data.
+        // Every slot is asked, not a range derived from `tail`: once
+        // `tail` has rolled over `usize`, a range from zero misses the
+        // slots still holding values from before it.
         //
-        // We use the per-slot sequence number to decide: only a
-        // published marker owns a value. Vacant means never written or
-        // cleared by a later claim; abandoned means the reservation
-        // resolved without one.
-        //
-        // The start of the range is `tail - min(tail, cap)` to avoid
-        // scanning the entire buffer, and the wrapping_sub handles the
-        // (astronomically unlikely) usize wraparound case.
-        let tail = *self.tail.0.get_mut();
-        let start = tail.wrapping_sub(tail.min(self.capacity.get()));
-        for pos in start..tail {
-            let slot = &mut self.buf[self.capacity.index_of(pos)];
+        // Only a published marker owns a value. Vacant means cleared by
+        // a later claim, abandoned means the reservation resolved
+        // without one, and unwritten means never used.
+        for slot in self.buf.iter_mut() {
             if slot.sequence.state_mut().holds_value() {
                 // SAFETY: a published marker means data was initialized
                 // by a producer and not cleared by a subsequent
@@ -334,6 +325,20 @@ mod tests {
         let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(1), 4).split();
         assert!(producer.push(42).is_ok());
         assert_eq!(consumer.pop(), Some(42));
+    }
+
+    #[test]
+    fn repro_value_past_half_the_position_space() {
+        let ring = RingBuffer::<u32>::new(Capacity::exact(4), 4);
+        ring.tail.store(usize::MAX / 2 + 1, Ordering::Relaxed);
+        for slot in ring.buf.iter() {
+            slot.sequence.abandon(0);
+        }
+        let (producer, first) = ring.split();
+        let mut consumer = first.clone();
+        drop(first);
+        producer.push(7).unwrap();
+        assert_eq!(consumer.pop(), Some(7));
     }
 
     #[test]

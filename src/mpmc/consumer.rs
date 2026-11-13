@@ -13,6 +13,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::position_order::PositionOrder;
 
 /// Cloneable consumer for an MPMC ring.
 ///
@@ -84,7 +85,7 @@ impl<T, C: Config> Consumer<T, C> {
         let q = &*self.queue;
         let start = self.next_scan.get();
         for offset in 0..q.capacity.get() {
-            if q.ready_state(start + offset).is_published() {
+            if q.ready_state(start.wrapping_add(offset)).is_published() {
                 return true;
             }
         }
@@ -118,7 +119,8 @@ impl<T, C: Config> Consumer<T, C> {
                 if q.ready_slot(scan).claim(round_pos) {
                     // Advance scan past the consumed slot, keeping
                     // it monotonic in case we claimed a future slot.
-                    self.next_scan.set((round_pos + 1).max(start_scan + 1));
+                    self.next_scan
+                        .set(round_pos.wrapping_add(1).latest(start_scan.wrapping_add(1)));
 
                     self.consumed.record(&q.consumed, C::CONSUMED_FLUSH);
 
@@ -154,7 +156,7 @@ impl<T, C: Config> Consumer<T, C> {
         // producer committed the value before publishing.
         let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
         q.done_slot(pos).release(round_pos, q.capacity);
-        q.wake_producer_for(round_pos + q.capacity.get());
+        q.wake_producer_for(round_pos.wrapping_add(q.capacity.get()));
         q.notify_producers();
         Some(val)
     }
@@ -221,7 +223,7 @@ impl<T, C: Config> Consumer<T, C> {
             // (pos, round_pos). Producer committed before publishing.
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
-            wake.released(round_pos + q.capacity.get());
+            wake.released(round_pos.wrapping_add(q.capacity.get()));
             count += 1;
             f(val);
         }
@@ -243,7 +245,7 @@ impl<T, C: Config> Consumer<T, C> {
             let q = &*self.queue;
             let val = unsafe { q.data_slot(pos).get().cast::<T>().read() };
             q.done_slot(pos).release(round_pos, q.capacity);
-            wake.released(round_pos + q.capacity.get());
+            wake.released(round_pos.wrapping_add(q.capacity.get()));
             count += 1;
             f(val);
         }

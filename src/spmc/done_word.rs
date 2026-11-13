@@ -48,7 +48,8 @@ impl DoneWord {
     /// Hands the slot to the producer one lap ahead of `pos`.
     #[inline]
     pub(super) fn release(&self, pos: usize, capacity: Capacity) {
-        self.0.store(pos + capacity.get(), Ordering::Release);
+        self.0
+            .store(pos.wrapping_add(capacity.get()), Ordering::Release);
     }
 
     /// Whether the slot still owes its value a destructor at teardown.
@@ -57,7 +58,7 @@ impl DoneWord {
     /// its consumer already released it; teardown asks this to avoid
     /// dropping a value twice.
     pub(super) fn holds_unconsumed_value_at(&mut self, pos: usize, capacity: Capacity) -> bool {
-        *self.0.get_mut() != pos + capacity.get()
+        *self.0.get_mut() != pos.wrapping_add(capacity.get())
     }
 }
 
@@ -107,6 +108,16 @@ mod tests {
             assert!(word.is_free_for(pos), "lap {lap}");
             word.release(pos, capacity);
         }
+    }
+
+    #[test]
+    fn a_release_at_the_top_of_the_position_space_frees_the_wrapped_lap() {
+        let capacity = cap();
+        let pos = usize::MAX - 2;
+        let mut word = DoneWord::released_for(pos);
+        word.release(pos, capacity);
+        assert!(word.is_free_for(pos.wrapping_add(capacity.get())));
+        assert!(!word.holds_unconsumed_value_at(pos, capacity));
     }
 
     #[test]

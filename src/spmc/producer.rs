@@ -80,7 +80,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             Some((data_ptr, pos)) => {
                 // SAFETY: We are the sole producer and the slot is free.
                 unsafe { (*data_ptr).write(val) };
-                self.write_pos.set(pos + 1);
+                self.write_pos.set(pos.wrapping_add(1));
                 self.ring()
                     .cursors
                     .tail()
@@ -285,7 +285,7 @@ impl<'a, T> SlotWriter<'a, T> {
     /// [`slot_mut`](Self::slot_mut).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.write_pos.set(self.pos + 1);
+        self.write_pos.set(self.pos.wrapping_add(1));
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
         #[cfg(feature = "async")]
@@ -334,7 +334,7 @@ impl<T> WrittenSlot<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.value.commit();
-        self.write_pos.set(self.pos + 1);
+        self.write_pos.set(self.pos.wrapping_add(1));
         self.tail.store(self.write_pos.get(), Ordering::Release);
         self.queue.consumer_park.wake_one();
         #[cfg(feature = "async")]

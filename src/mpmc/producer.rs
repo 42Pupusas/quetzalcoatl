@@ -119,7 +119,7 @@ impl<T, C: Config> Producer<T, C> {
         };
 
         let primary_bit = unused.trailing_zeros();
-        let primary_pos = start + primary_bit as usize;
+        let primary_pos = start.wrapping_add(primary_bit as usize);
         let mut bit = primary_bit;
         let mut pos = primary_pos;
 
@@ -161,7 +161,7 @@ impl<T, C: Config> Producer<T, C> {
         let mut bits = unused;
         while bits != 0 {
             let b = bits.trailing_zeros();
-            let p = start + b as usize;
+            let p = start.wrapping_add(b as usize);
             if self.queue.done_slot(p).is_free_for(p) {
                 return Some((b, p));
             }

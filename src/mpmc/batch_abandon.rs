@@ -37,7 +37,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
         let mut bits = unused;
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
-            self.release(start + bit);
+            self.release(start.wrapping_add(bit));
             bits &= bits - 1;
         }
     }
@@ -64,7 +64,7 @@ impl<'a, T, C: Config> BatchAbandon<'a, T, C> {
         }
         q.ready_slot(pos).abandon(pos);
         q.done_slot(pos).release(pos, q.capacity);
-        q.wake_producer_for(pos + q.capacity.get());
+        q.wake_producer_for(pos.wrapping_add(q.capacity.get()));
         q.notify_producers();
     }
 }

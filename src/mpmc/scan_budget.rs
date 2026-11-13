@@ -58,6 +58,8 @@
 //! whole lap to `2 * capacity` examinations and leaves no slot
 //! unlooked-at.
 
+use crate::common::position_order::PositionOrder;
+
 /// Tracks one lap of a consumer's scan: where to look next, and how
 /// much of the lap is left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +87,7 @@ impl ScanBudget {
         Self {
             position: start,
             floor: start,
-            end: start + capacity,
+            end: start.wrapping_add(capacity),
             spent: 0,
             probe_limit: capacity,
             cas_skip: clamped,
@@ -100,7 +102,7 @@ impl ScanBudget {
     /// Advances one position, charging one against the lap.
     pub(super) const fn step(&mut self) {
         self.record();
-        self.position += 1;
+        self.position = self.position.wrapping_add(1);
         self.resume_sweep_when_probes_are_spent();
     }
 
@@ -109,7 +111,7 @@ impl ScanBudget {
     /// was waiting on.
     const fn record(&mut self) {
         if self.position == self.floor {
-            self.floor += 1;
+            self.floor = self.floor.wrapping_add(1);
         }
         self.spent += 1;
     }
@@ -140,11 +142,12 @@ impl ScanBudget {
     /// that can still be holding unexamined work.
     pub(super) const fn skip_contended(&mut self) {
         self.record();
-        if self.probes_are_spent() {
-            self.position += 1;
+        let stride = if self.probes_are_spent() {
+            1
         } else {
-            self.position += self.cas_skip;
-        }
+            self.cas_skip
+        };
+        self.position = self.position.wrapping_add(stride);
         self.resume_sweep_when_probes_are_spent();
     }
 
@@ -153,8 +156,8 @@ impl ScanBudget {
     /// The lap ends when every position in it has been examined, not
     /// when a count of moves runs out. A jump that flies over slots
     /// therefore cannot end the lap on their behalf.
-    pub(super) const fn exhausted(&self) -> bool {
-        self.floor >= self.end
+    pub(super) fn exhausted(&self) -> bool {
+        !self.end.is_after(self.floor)
     }
 }
 
@@ -382,6 +385,22 @@ mod tests {
             budget.step();
         }
         assert!(budget.exhausted(), "a full pass ends the lap");
+    }
+
+    /// `start + capacity` overflowed here, and a plain `>=` on the
+    /// floor would have called the lap over before it began.
+    #[test]
+    fn a_lap_that_straddles_the_position_rollover_examines_every_slot() {
+        for start in [usize::MAX - 7, usize::MAX - 15, usize::MAX] {
+            let mut budget = ScanBudget::new(start, 16, 128);
+            let mut examined = 0;
+            while !budget.exhausted() {
+                examined += 1;
+                assert!(examined <= 16, "an uncontended lap is one pass");
+                budget.step();
+            }
+            assert_eq!(examined, 16);
+        }
     }
 
     #[test]

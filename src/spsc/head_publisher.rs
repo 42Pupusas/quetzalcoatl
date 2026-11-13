@@ -43,7 +43,7 @@ impl<'a, T> HeadPublisher<'a, T> {
     /// Call this *after* the value has been moved out but *before* any
     /// code that might panic.
     pub(super) const fn advance(&mut self) {
-        self.head += 1;
+        self.head = self.head.wrapping_add(1);
         self.advanced = true;
     }
 }

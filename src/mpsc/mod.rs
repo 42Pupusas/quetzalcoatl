@@ -282,7 +282,7 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        for pos in self.cursors.occupied() {
+        for pos in self.cursors.occupied(self.capacity) {
             self.buf[self.capacity.index_of(pos)].drop_value_at(pos);
         }
     }
@@ -803,6 +803,30 @@ mod tests {
         // Consumer should see 1, skip tombstone, see 3
         assert_eq!(consumer.pop(), Some(1));
         assert_eq!(consumer.pop(), Some(3));
+        assert_eq!(consumer.pop(), None);
+    }
+
+    /// `usize::MAX / 2` is the position whose published word equalled
+    /// the old positionless tombstone sentinel, so its value was skipped
+    /// as abandoned and never delivered. On a 32-bit target that is
+    /// position 2^31 - 1, about two billion pushes in.
+    #[test]
+    fn a_value_at_the_former_sentinel_position_is_delivered() {
+        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let start = usize::MAX / 2 - 1;
+        ring.cursors.publish_head(start);
+        ring.cursors
+            .tail()
+            .store(start, std::sync::atomic::Ordering::Relaxed);
+        let (producer, mut consumer) = ring.split();
+
+        for value in 0..3 {
+            producer.push(value).unwrap();
+        }
+
+        assert_eq!(consumer.pop(), Some(0));
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
         assert_eq!(consumer.pop(), None);
     }
 

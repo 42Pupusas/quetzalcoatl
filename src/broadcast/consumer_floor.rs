@@ -12,8 +12,9 @@
 /// code reported `tail` as the floor once the registry emptied.
 /// Computing `pos - floor` by wrapping subtraction then yielded a huge
 /// value that was always `>= cap`, so the producer's "is my slot free
-/// yet" spin never terminated. [`permits`](Self::permits) tests that
-/// ordering before subtracting.
+/// yet" spin never terminated. [`permits`](Self::permits) reads the
+/// difference as signed, so a floor ahead is a negative distance, and
+/// stays right when the positions straddle the `usize` rollover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsumerFloor {
     /// No consumers are registered, so no position can be validated.
@@ -33,10 +34,25 @@ impl ConsumerFloor {
     pub(crate) const fn permits(self, pos: usize, cap: usize) -> bool {
         match self {
             Self::NoConsumers => false,
-            // `head >= pos` means no consumer is behind us, so the
-            // previous occupant of our slot is already read. Testing it
-            // first also keeps the subtraction from wrapping.
-            Self::At(head) => head >= pos || pos - head < cap,
+            // A negative distance means no consumer is behind us, so
+            // the previous occupant of our slot is already read.
+            Self::At(head) => pos.wrapping_sub(head).cast_signed() < cap.cast_signed(),
+        }
+    }
+
+    /// Whether the slot backing `pos` is within one capacity above this
+    /// floor, for a floor that may be stale.
+    ///
+    /// A stale floor is only ever behind the true one, so this can
+    /// refuse a write the true floor would allow but never the
+    /// reverse. [`permits`](Self::permits) cannot be used on it: a
+    /// floor left more than half the position space behind reads as
+    /// ahead of `pos` there, and would permit a write over unread
+    /// slots.
+    pub(crate) const fn permits_from_stale(self, pos: usize, cap: usize) -> bool {
+        match self {
+            Self::NoConsumers => false,
+            Self::At(head) => pos.wrapping_sub(head) < cap,
         }
     }
 
@@ -88,5 +104,27 @@ mod tests {
         let tail = 42usize;
         assert_eq!(tail - ConsumerFloor::NoConsumers.position_or_tail(tail), 0);
         assert_eq!(ConsumerFloor::At(40).position_or_tail(tail), 40);
+    }
+
+    #[test]
+    fn a_stale_floor_far_behind_does_not_read_as_ahead() {
+        let pos = usize::MAX / 2 + 10;
+        assert!(!ConsumerFloor::At(0).permits_from_stale(pos, 4));
+        assert!(ConsumerFloor::At(pos - 3).permits_from_stale(pos, 4));
+        assert!(!ConsumerFloor::At(pos - 4).permits_from_stale(pos, 4));
+        assert!(!ConsumerFloor::NoConsumers.permits_from_stale(pos, 4));
+    }
+
+    #[test]
+    fn the_window_is_the_same_across_the_position_rollover() {
+        let head = usize::MAX - 1;
+        assert!(ConsumerFloor::At(head).permits(head.wrapping_add(3), 4));
+        assert!(!ConsumerFloor::At(head).permits(head.wrapping_add(4), 4));
+    }
+
+    #[test]
+    fn a_floor_ahead_across_the_rollover_permits() {
+        assert!(ConsumerFloor::At(2).permits(usize::MAX, 4));
+        assert!(ConsumerFloor::At(usize::MAX).permits(usize::MAX - 5, 4));
     }
 }

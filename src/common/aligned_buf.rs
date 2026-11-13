@@ -6,88 +6,38 @@
 //! it crosses; an arbitrary start offsets every slot against the lines
 //! and splits some of them across two.
 //!
-//! Zero-sized element types allocate nothing: the pointer is dangling
-//! but well-aligned, and every offset from it is the same address.
+//! Zero-sized element types allocate nothing, as with any `Vec`.
 
-use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
-use std::ptr::NonNull;
+use super::cache_line_alloc::CacheLineAlloc;
 
 /// An owned, cache-line-aligned array of `len` initialized elements.
 pub struct AlignedBuf<T> {
-    ptr: NonNull<T>,
-    len: usize,
+    slots: Box<[T], CacheLineAlloc>,
 }
 
 impl<T> AlignedBuf<T> {
-    fn layout(len: usize) -> Layout {
-        let size = std::mem::size_of::<T>()
-            .checked_mul(len)
-            .expect("capacity overflow");
-        let align = std::mem::align_of::<T>().max(64);
-        Layout::from_size_align(size, align).expect("invalid layout")
-    }
-
-    pub fn new_with(len: usize, mut init: impl FnMut() -> T) -> Self {
+    pub fn new_with(len: usize, init: impl FnMut() -> T) -> Self {
         assert!(len > 0);
-
-        let ptr = if std::mem::size_of::<T>() == 0 {
-            NonNull::dangling()
-        } else {
-            let layout = Self::layout(len);
-            // SAFETY: layout has non-zero size (size_of::<T>() > 0 checked above)
-            let raw = unsafe { alloc(layout).cast::<T>() };
-            let Some(ptr) = NonNull::new(raw) else {
-                handle_alloc_error(layout);
-            };
-            ptr
-        };
-
-        for i in 0..len {
-            // SAFETY: For ZSTs, pointer arithmetic is a no-op (size 0 strides).
-            // For non-ZSTs, ptr points to a valid allocation of len elements.
-            unsafe { ptr.as_ptr().add(i).write(init()) };
+        let mut slots = Vec::with_capacity_in(len, CacheLineAlloc);
+        slots.extend(std::iter::repeat_with(init).take(len));
+        Self {
+            slots: slots.into_boxed_slice(),
         }
-        Self { ptr, len }
     }
 }
 
 impl<T> std::ops::Deref for AlignedBuf<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        // SAFETY: ptr points to a valid allocation of `len` elements (or is
-        // dangling for ZSTs). No mutable aliases exist (&self borrow).
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        &self.slots
     }
 }
 
 impl<T> std::ops::DerefMut for AlignedBuf<T> {
     fn deref_mut(&mut self) -> &mut [T] {
-        // SAFETY: ptr points to a valid allocation of `len` elements (or is
-        // dangling for ZSTs). &mut self guarantees exclusive access.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        &mut self.slots
     }
 }
-
-impl<T> Drop for AlignedBuf<T> {
-    fn drop(&mut self) {
-        // SAFETY: All `len` elements are initialized (written in new_with).
-        // &mut self guarantees exclusive access. For non-ZSTs the layout
-        // matches the one used in new_with's alloc call.
-        unsafe {
-            for i in 0..self.len {
-                std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
-            }
-            if std::mem::size_of::<T>() > 0 {
-                dealloc(self.ptr.as_ptr().cast::<u8>(), Self::layout(self.len));
-            }
-        }
-    }
-}
-
-// SAFETY: AlignedBuf is just an owning pointer to a heap allocation.
-// Send/Sync follow from T's bounds, same as Box<[T]>.
-unsafe impl<T: Send> Send for AlignedBuf<T> {}
-unsafe impl<T: Sync> Sync for AlignedBuf<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -152,6 +102,25 @@ mod tests {
     #[test]
     fn a_zero_sized_element_type_really_is_zero_sized() {
         assert_eq!(std::mem::size_of::<ZeroSized>(), 0);
+    }
+
+    /// The hand-rolled buffer this replaced leaked both the allocation
+    /// and the elements already built when `init` panicked.
+    #[test]
+    fn a_panicking_initializer_drops_what_it_already_built() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut built = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            AlignedBuf::new_with(4, || {
+                built += 1;
+                assert!(built < 3, "third element refuses");
+                DropCounter {
+                    counter: counter.clone(),
+                }
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
     #[test]

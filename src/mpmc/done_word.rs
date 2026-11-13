@@ -41,7 +41,8 @@ impl DoneWord {
     /// would be equivalent; putting it on the store keeps the pairing
     /// local to the call site.
     pub(super) fn release(&self, round_pos: usize, capacity: Capacity) {
-        self.0.store(round_pos + capacity.get(), Ordering::SeqCst);
+        self.0
+            .store(round_pos.wrapping_add(capacity.get()), Ordering::SeqCst);
     }
 
     /// Whether the consumer that claimed `round_pos` released the slot.
@@ -51,7 +52,7 @@ impl DoneWord {
     /// the window in which the value is being read out. Teardown asks
     /// this to decide whether it still owes the value a destructor.
     pub(super) fn was_released_after(&mut self, round_pos: usize, capacity: Capacity) -> bool {
-        *self.0.get_mut() == round_pos + capacity.get()
+        *self.0.get_mut() == round_pos.wrapping_add(capacity.get())
     }
 
     /// The raw word, for diagnostics.
@@ -123,6 +124,15 @@ mod tests {
         let mut word = DoneWord::released_for(4);
         word.release(4, capacity);
         assert!(!word.was_released_after(4 + capacity.get(), capacity));
+    }
+
+    #[test]
+    fn a_release_at_the_top_of_the_position_space_frees_the_wrapped_lap() {
+        let capacity = cap();
+        let pos = usize::MAX - 2;
+        let word = DoneWord::released_for(capacity.index_of(pos));
+        word.release(pos, capacity);
+        assert!(word.is_free_for(pos.wrapping_add(capacity.get())));
     }
 
     #[test]

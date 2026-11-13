@@ -76,7 +76,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         // SeqCst: pairs with the producer's SeqCst arm in `push_block`
         // to close the missed-wakeup race, and lets `wake_producer`
         // skip its fence; subsumes the Release semantics for slot reuse.
-        self.ring().cursors.publish_head(head + 1);
+        self.ring().cursors.publish_head(head.wrapping_add(1));
 
         self.ring().wake_producer();
         #[cfg(feature = "async")]

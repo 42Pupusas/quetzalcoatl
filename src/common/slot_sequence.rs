@@ -2,16 +2,28 @@
 //!
 //! A slot must answer "is there a value here for position `pos`?" in
 //! one atomic load, for a position that keeps growing while the storage
-//! wraps. The word encodes both the state and the lap it belongs to:
+//! wraps. The word encodes both the state and the position it belongs
+//! to:
 //!
 //! | word          | state                                    |
 //! |---------------|------------------------------------------|
-//! | `pos * 2`     | free, and `pos` is the next lap to use it |
-//! | `pos * 2 + 1` | holds the value published at `pos`        |
-//! | [`TOMBSTONE`] | reserved at some lap, then abandoned      |
+//! | `pos * 4`     | free, and `pos` is the next lap to use it |
+//! | `pos * 4 + 1` | holds the value published at `pos`        |
+//! | `pos * 4 + 2` | reserved at `pos`, then abandoned         |
 //!
-//! The doubling keeps free and published apart at capacity 1, where
+//! Scaling by four keeps the three states of one position below the
+//! free word of the next, which matters at capacity 1, where
 //! consecutive positions share the only slot.
+//!
+//! Every word names its position, so none is set aside as a sentinel.
+//! The abandoned marker used to be a bare `usize::MAX`, which is also
+//! what `pos * 2 + 1` gave for position `usize::MAX / 2`: the value
+//! published there was skipped as abandoned and never delivered. On a
+//! 32-bit target that is push number 2^31.
+//!
+//! The arithmetic wraps. Two words are equal only when both position
+//! and state are, for positions fewer than `2^(usize::BITS - 2)` apart.
+//! That bounds the capacity, not the number of pushes.
 //!
 //! Every writer reaches this word through a method here. That is the
 //! point of the type: the release transition alone was written out as
@@ -26,23 +38,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::SlotSnapshot;
 use crate::capacity::Capacity;
 
-/// Marks a slot reserved but never committed, at any position.
-///
-/// `usize::MAX` cannot collide with a real `pos * 2 + 1`: reaching it
-/// would take 2^63 pushes.
-pub const TOMBSTONE: usize = usize::MAX;
-
 /// The publication state of one slot, as a single atomic word.
 pub struct SlotSequence {
     word: AtomicUsize,
 }
 
 impl SlotSequence {
+    const FREE: usize = 0;
+    const PUBLISHED: usize = 1;
+    const ABANDONED: usize = 2;
+
+    const fn encode(pos: usize, state: usize) -> usize {
+        pos.wrapping_mul(4).wrapping_add(state)
+    }
+
     /// A word for a slot that is free and awaiting position `pos`.
     #[must_use]
     pub const fn free_at(pos: usize) -> Self {
         Self {
-            word: AtomicUsize::new(pos * 2),
+            word: AtomicUsize::new(Self::encode(pos, Self::FREE)),
         }
     }
 
@@ -53,14 +67,17 @@ impl SlotSequence {
     /// this word.
     #[inline]
     pub fn publish(&self, pos: usize) {
-        self.word.store(pos * 2 + 1, Ordering::Release);
+        self.word
+            .store(Self::encode(pos, Self::PUBLISHED), Ordering::Release);
     }
 
-    /// Marks a reservation abandoned, so consumers skip the position
-    /// instead of waiting for a value that will never arrive.
+    /// Marks the reservation at `pos` abandoned, so the consumer skips
+    /// the position instead of waiting for a value that will never
+    /// arrive.
     #[inline]
-    pub fn tombstone(&self) {
-        self.word.store(TOMBSTONE, Ordering::Release);
+    pub fn tombstone(&self, pos: usize) {
+        self.word
+            .store(Self::encode(pos, Self::ABANDONED), Ordering::Release);
     }
 
     /// Hands the slot back to the producers after position `head` has
@@ -75,8 +92,9 @@ impl SlotSequence {
     /// store that lets a producer overwrite it.
     #[inline]
     pub fn release(&self, head: usize, capacity: Capacity) {
+        let next_lap = head.wrapping_add(capacity.get());
         self.word
-            .store((head + capacity.get()) * 2, Ordering::Release);
+            .store(Self::encode(next_lap, Self::FREE), Ordering::Release);
     }
 
     /// Classifies this word against `pos`, pairing it with the storage
@@ -88,10 +106,10 @@ impl SlotSequence {
         pos: usize,
     ) -> SlotSnapshot<*const MaybeUninit<T>> {
         let word = self.word.load(Ordering::Acquire);
-        if word == TOMBSTONE {
-            SlotSnapshot::Tombstoned
-        } else if word == pos * 2 + 1 {
+        if word == Self::encode(pos, Self::PUBLISHED) {
             SlotSnapshot::Ready(data.get().cast_const())
+        } else if word == Self::encode(pos, Self::ABANDONED) {
+            SlotSnapshot::Tombstoned
         } else {
             SlotSnapshot::NotReady
         }
@@ -103,7 +121,7 @@ impl SlotSequence {
     /// which has exclusive access and needs no atomic load.
     #[must_use]
     pub fn holds_value_at(&mut self, pos: usize) -> bool {
-        *self.word.get_mut() == pos * 2 + 1
+        *self.word.get_mut() == Self::encode(pos, Self::PUBLISHED)
     }
 }
 
@@ -120,7 +138,7 @@ mod tests {
         for pos in [0usize, 1, 7, 4096] {
             let mut seq = SlotSequence::free_at(pos);
             assert!(!seq.holds_value_at(pos), "free must not read as published");
-            assert_eq!(word_of(&seq), pos * 2);
+            assert_eq!(word_of(&seq), pos * 4);
         }
     }
 
@@ -158,27 +176,50 @@ mod tests {
         let capacity = Capacity::exact(4);
         let seq = SlotSequence::free_at(0);
         seq.release(0, capacity);
-        assert_eq!(word_of(&seq), 4 * 2);
+        assert_eq!(word_of(&seq), word_of(&SlotSequence::free_at(4)));
         assert_ne!(word_of(&seq), word_of(&SlotSequence::free_at(0)));
     }
 
     #[test]
     fn a_tombstone_is_not_a_published_value_at_any_position() {
         let mut seq = SlotSequence::free_at(3);
-        seq.tombstone();
+        seq.tombstone(3);
         for pos in [0usize, 3, 4, 4096] {
             assert!(!seq.holds_value_at(pos));
         }
     }
 
+    /// Each window is checked on its own: words are distinct only for
+    /// positions fewer than `2^(usize::BITS - 2)` apart. The windows
+    /// cover the origin, the positions where `pos * 4` wraps, and the
+    /// one whose published word the old sentinel collided with.
     #[test]
-    fn the_free_and_published_words_never_collide() {
-        let mut seen = std::collections::HashSet::new();
-        for pos in 0..64usize {
-            assert!(seen.insert(pos * 2), "free word repeated at {pos}");
-            assert!(seen.insert(pos * 2 + 1), "published word repeated at {pos}");
+    fn no_two_words_collide_within_a_window() {
+        for start in [0, usize::MAX / 4 - 32, usize::MAX / 2 - 32] {
+            let mut seen = std::collections::HashSet::new();
+            for pos in start..start + 64 {
+                for state in [
+                    SlotSequence::FREE,
+                    SlotSequence::PUBLISHED,
+                    SlotSequence::ABANDONED,
+                ] {
+                    assert!(
+                        seen.insert(SlotSequence::encode(pos, state)),
+                        "word repeated at {pos}, state {state}"
+                    );
+                }
+            }
         }
-        assert!(!seen.contains(&TOMBSTONE));
+    }
+
+    #[test]
+    fn a_value_published_where_the_sentinel_used_to_sit_reads_as_ready() {
+        let pos = usize::MAX / 2;
+        let data = UnsafeCell::new(MaybeUninit::new(7u32));
+        let mut seq = SlotSequence::free_at(pos);
+        seq.publish(pos);
+        assert!(matches!(seq.classify(&data, pos), SlotSnapshot::Ready(_)));
+        assert!(seq.holds_value_at(pos));
     }
 
     #[test]
@@ -198,12 +239,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_reports_a_tombstone_at_every_position() {
+    fn classify_reports_a_tombstone_only_at_its_own_position() {
         let data = UnsafeCell::new(MaybeUninit::new(7u32));
         let seq = SlotSequence::free_at(5);
-        seq.tombstone();
-        for pos in [0usize, 5, 6, 4096] {
-            assert!(matches!(seq.classify(&data, pos), SlotSnapshot::Tombstoned));
+        seq.tombstone(5);
+        assert!(matches!(seq.classify(&data, 5), SlotSnapshot::Tombstoned));
+        for pos in [0usize, 4, 6, 4096] {
+            assert!(matches!(seq.classify(&data, pos), SlotSnapshot::NotReady));
         }
     }
 

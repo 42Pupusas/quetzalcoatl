@@ -27,8 +27,8 @@ use std::task::Poll;
 /// `Producer` is [`Send`] but not [`Sync`] (due to internal [`Cell`]s).
 pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     pub(super) queue: R,
-    write_pos: Cell<usize>,
-    cached_head: Cell<usize>,
+    pub(super) write_pos: Cell<usize>,
+    pub(super) cached_head: Cell<usize>,
 }
 
 // No Clone impl — SPSC enforces a single producer.
@@ -75,11 +75,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     fn try_claim(&self) -> Option<usize> {
         let pos = self.write_pos.get();
 
-        if pos - self.cached_head.get() >= self.ring().capacity.get() {
+        if pos.wrapping_sub(self.cached_head.get()) >= self.ring().capacity.get() {
             let head = self.ring().cursors.head().load(Ordering::Acquire);
             self.cached_head.set(head);
 
-            if pos - head >= self.ring().capacity.get() {
+            if pos.wrapping_sub(head) >= self.ring().capacity.get() {
                 return None;
             }
         }
@@ -94,12 +94,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     #[inline]
     fn has_space(&self) -> bool {
         let pos = self.write_pos.get();
-        if pos - self.cached_head.get() < self.ring().capacity.get() {
+        if pos.wrapping_sub(self.cached_head.get()) < self.ring().capacity.get() {
             return true;
         }
         let head = self.ring().cursors.head().load(Ordering::Acquire);
         self.cached_head.set(head);
-        pos - head < self.ring().capacity.get()
+        pos.wrapping_sub(head) < self.ring().capacity.get()
     }
 
     /// Pushes a value into the ring buffer.
@@ -116,7 +116,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             self.ring().slot(pos).get().write(MaybeUninit::new(val));
         }
 
-        self.write_pos.set(pos + 1);
+        let next = pos.wrapping_add(1);
+        self.write_pos.set(next);
 
         // SeqCst: stronger than Release on two grounds. (1) Release alone
         // ensures the data write above is visible to the consumer through
@@ -126,7 +127,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         // `wake_consumer` (and unpark), or the consumer's post-arm re-check
         // observes the new `tail` (and skips parking). Being SeqCst is also
         // what lets `wake_consumer` skip the store-buffer fence.
-        self.ring().cursors.tail().store(pos + 1, Ordering::SeqCst);
+        self.ring().cursors.tail().store(next, Ordering::SeqCst);
 
         self.ring().wake_consumer();
         #[cfg(feature = "async")]
@@ -376,11 +377,12 @@ impl<'a, T> SlotWriter<'a, T> {
     /// uninitialized memory (undefined behavior).
     #[inline]
     pub unsafe fn commit_unchecked(self) {
-        self.write_pos.set(self.pos + 1);
+        let next = self.pos.wrapping_add(1);
+        self.write_pos.set(next);
         // SeqCst: see Producer::push for the full explanation. Pairs with
         // the consumer's SeqCst `parked.store(true)` to close the missed-
         // wakeup race; subsumes the Release semantics for data publication.
-        self.tail.store(self.pos + 1, Ordering::SeqCst);
+        self.tail.store(next, Ordering::SeqCst);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -426,10 +428,11 @@ impl<T> WrittenSlot<'_, T> {
     #[inline]
     pub fn commit(mut self) {
         self.value.commit();
-        self.write_pos.set(self.pos + 1);
+        let next = self.pos.wrapping_add(1);
+        self.write_pos.set(next);
         // SeqCst: see Producer::push. Pairs with the consumer's SeqCst
         // `parked.store(true)` to close the missed-wakeup race.
-        self.tail.store(self.pos + 1, Ordering::SeqCst);
+        self.tail.store(next, Ordering::SeqCst);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();

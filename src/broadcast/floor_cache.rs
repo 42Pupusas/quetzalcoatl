@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::common::position_order::PositionOrder;
 use crate::common::CachePadded;
 
 use super::consumer_floor::ConsumerFloor;
@@ -10,9 +11,11 @@ use super::consumer_floor::ConsumerFloor;
 /// The shared L2 cache of the consumer floor.
 ///
 /// Any producer that completes a full registry scan republishes the
-/// result here, so its peers can skip their own scan. Updates go through
-/// `fetch_max`, which makes the value monotonic: a producer holding an
-/// older floor cannot drag the cache backwards.
+/// result here, so its peers can skip their own scan. Updates keep the
+/// later position, which makes the value monotonic: a producer holding
+/// an older floor cannot drag the cache backwards. "Later" is in
+/// position order, so it holds across the `usize` rollover, where a
+/// numeric maximum would pick the stale value.
 ///
 /// The value is always `<=` the true floor. Staleness therefore only
 /// costs a redundant scan; it never permits a write it should refuse,
@@ -33,10 +36,14 @@ impl SharedFloor {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Publishes `head`, keeping the highest floor seen by any producer.
+    /// Publishes `head`, keeping the latest floor seen by any producer.
     #[inline]
     pub(super) fn publish(&self, head: usize) {
-        self.0.fetch_max(head, Ordering::Release);
+        let _ = self
+            .0
+            .try_update(Ordering::Release, Ordering::Relaxed, |cached| {
+                head.is_after(cached).then_some(head)
+            });
     }
 }
 
@@ -73,6 +80,11 @@ impl FloorCache {
     /// consumers", so a cache seeded at 0 would otherwise permit the
     /// first `cap` positions with no consumer having ever existed.
     /// `scan` supplies the authoritative floor for the final level.
+    ///
+    /// The caches answer with the strict window only. A floor that
+    /// leads `pos` is a rare case, and a cached one cannot be told from
+    /// a floor left half the position space behind, so it is left to
+    /// the scan.
     #[inline]
     pub(super) fn permits(
         &self,
@@ -83,12 +95,12 @@ impl FloorCache {
         scan: impl FnOnce() -> ConsumerFloor,
     ) -> bool {
         if any_subscribed {
-            if self.cached().permits(pos, cap) {
+            if self.cached().permits_from_stale(pos, cap) {
                 return true;
             }
             let published = shared.get();
             self.private.set(published);
-            if ConsumerFloor::At(published).permits(pos, cap) {
+            if ConsumerFloor::At(published).permits_from_stale(pos, cap) {
                 return true;
             }
         }
@@ -139,6 +151,16 @@ mod tests {
     }
 
     #[test]
+    fn a_floor_past_the_rollover_is_later_than_one_before_it() {
+        let shared = SharedFloor::new();
+        shared.publish(usize::MAX - 1);
+        shared.publish(2);
+        assert_eq!(shared.get(), 2);
+        shared.publish(usize::MAX - 1);
+        assert_eq!(shared.get(), 2);
+    }
+
+    #[test]
     fn the_shared_floor_keeps_its_own_cache_line() {
         assert_eq!(std::mem::align_of::<SharedFloor>(), 64);
     }
@@ -176,6 +198,16 @@ mod tests {
         assert!(cache.permits(9, 4, true, &shared, || ConsumerFloor::At(8)));
         assert_eq!(cache.cached(), ConsumerFloor::At(8));
         assert_eq!(shared.get(), 8);
+    }
+
+    /// A cache left more than half the position space behind reads as
+    /// ahead of `pos` under a signed distance, and would permit it.
+    #[test]
+    fn a_cache_left_half_the_position_space_behind_defers_to_the_scan() {
+        let cache = FloorCache::new();
+        let shared = SharedFloor::new();
+        let pos = usize::MAX / 2 + 10;
+        assert!(!cache.permits(pos, 4, true, &shared, || ConsumerFloor::At(pos - 100)));
     }
 
     #[test]

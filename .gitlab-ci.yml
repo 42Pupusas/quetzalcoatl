@@ -48,8 +48,8 @@ msrv:
   extends: .on_host
   allow_failure: true
   script:
-    - rustup toolchain install 1.88 --profile minimal --no-self-update
-    - cargo +1.88 check --all-targets --all-features
+    - rustup toolchain install 1.100 --profile minimal --no-self-update
+    - cargo +1.100 check --all-targets --all-features
 
 # `rustfmt` and `clippy` ship as rustup components, not with the
 # compiler, so a runner whose toolchain was installed with

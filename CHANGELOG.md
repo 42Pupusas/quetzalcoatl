@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MSRV is now 1.100.** `AlignedBuf` is built on the now-stable
+  `Allocator` API: a `CacheLineAlloc` raises every block to 64-byte
+  alignment, and the buffer is a `Box<[T], CacheLineAlloc>`. The
+  hand-written alloc/dealloc/drop loop and its `unsafe` are gone.
+- The repository resolves dependencies with a 3-day
+  `global-min-publish-age` cooldown (`.cargo/config.toml`).
+
+### Fixed
+- **A panicking slot initializer leaked the ring's allocation and every
+  slot already built.** The `Vec` that now builds the buffer drops them
+  on unwind.
+- **mpsc lost the value published at position `usize::MAX / 2`.** The
+  abandoned-reservation marker was a bare `usize::MAX`, which is also
+  the published word `pos * 2 + 1` for that position, so the consumer
+  skipped the value as abandoned and never dropped it. On a 32-bit
+  target that is push number 2^31. The marker now names its position
+  (`pos * 4 + 2`) and the word arithmetic wraps, so no word is a
+  sentinel.
+- **broadcast aliased its slot words at half the position space.**
+  `abandoned_word(usize::MAX / 2)` was `0`, the vacant word, so an
+  abandoned reservation there read as a claim in progress and blocked
+  producers; `decode` also dropped the top bit of the position. Words
+  are now `pos * 4 + state` with wrapping arithmetic and are compared,
+  not decoded. A slot never written has its own word, which replaces
+  the `pos < cap` first-lap test: that held again once `pos` rolled
+  over, and skipped the check for a slot with a claim outstanding.
+  `RingBuffer::drop` now asks every slot instead of a range derived
+  from `tail`, which missed live values after the rollover.
+- **Position comparisons broke across the `usize` rollover.** These
+  read a position just past the rollover as far behind one just before
+  it: the broadcast consumer floor (`ConsumerFloor::permits`, the
+  registry minimum, the shared floor's `fetch_max`), the mpmc consumer's
+  `next_scan`, and `ScanBudget`'s lap end. They now order positions by
+  signed wrapping distance (`PositionOrder`). The broadcast floor caches
+  answer with the strict window only, since a signed distance cannot
+  tell a stale floor from one half the position space behind.
+  Position and word additions in mpmc and broadcast wrap instead of
+  overflowing, which panicked in debug builds.
+
+### Internal
+- mpsc: the skip over an abandoned position is recognised in one
+  place, `BatchRelease::settle`. `Consumer::head_value` uses it, which
+  removes the second copy of the release-publish-wake sequence; `drain`
+  and `drain_up_to` already went through it via `take`.
+
 ## [0.15.1]
 
 **`ParkSlot` is now reachable outside the crate.** `park::WakeSet::arm`,

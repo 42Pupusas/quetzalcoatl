@@ -17,8 +17,8 @@ pub(super) struct SequenceWord(AtomicUsize);
 
 impl SequenceWord {
     /// A word for a slot that has never been written.
-    pub(super) const fn vacant() -> Self {
-        Self(AtomicUsize::new(SlotState::VACANT))
+    pub(super) const fn unwritten() -> Self {
+        Self(AtomicUsize::new(SlotState::UNWRITTEN))
     }
 
     /// Publishes the value written at `pos`, making it readable.
@@ -59,6 +59,11 @@ impl SequenceWord {
     }
 
     /// Whether a producer's reservation on this slot is still unresolved.
+    ///
+    /// A slot never written has no reservation, so it is not one. That
+    /// is what lets a producer tell a first-lap slot from a reused one
+    /// by the slot alone: the position says nothing once it has rolled
+    /// over `usize`.
     #[inline]
     pub(super) fn is_claim_in_progress(&self) -> bool {
         self.0.load(Ordering::Acquire) == SlotState::VACANT
@@ -91,49 +96,75 @@ impl SequenceWord {
 /// every call, so the consumer advances forever instead of reporting an
 /// empty ring.
 ///
-/// The parity of the word carries the distinction:
+/// The low two bits carry the state and the rest the position:
 ///
 /// | word            | state              |
 /// |-----------------|--------------------|
 /// | `0`             | [`Vacant`]         |
-/// | `pos * 2 + 1`   | [`Published`]      |
-/// | `pos * 2 + 2`   | [`Abandoned`]      |
+/// | `pos * 4 + 1`   | [`Published`]      |
+/// | `pos * 4 + 2`   | [`Abandoned`]      |
+/// | `3`             | [`Unwritten`]      |
+///
+/// `pos * 4 + 3` is never produced by a position, so `3` cannot be
+/// mistaken for a resolved word.
+///
+/// The multiplication wraps, so the top bits of a position are lost
+/// and the word cannot be decoded back to one. A consumer instead
+/// compares the word it loaded with the word it expects for its own
+/// position. Two positions collide only when they differ by a multiple
+/// of `2^(usize::BITS - 2)`, far beyond the capacity that separates a
+/// slot's occupants.
+///
+/// A published or abandoned word always has a nonzero state, so
+/// neither can equal [`VACANT`](Self::VACANT) at any position. The
+/// earlier `pos * 2 + 2` met zero at `pos == usize::MAX / 2`, which
+/// is push number 2^31 on a 32-bit target.
 ///
 /// [`Vacant`]: Self::Vacant
 /// [`Published`]: Self::Published
 /// [`Abandoned`]: Self::Abandoned
+/// [`Unwritten`]: Self::Unwritten
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum SlotState {
-    /// Never written, or claimed by a producer that has not yet
-    /// published or abandoned it.
+    /// Claimed by a producer that has not yet published or abandoned
+    /// it.
     Vacant,
-    /// Holds the value published at this position.
-    Published(usize),
-    /// A reservation at this position was dropped without a commit.
-    Abandoned(usize),
+    /// Never claimed. Holds no value and has no reservation.
+    Unwritten,
+    /// Holds a value published at some position.
+    Published,
+    /// A reservation at some position was dropped without a commit.
+    Abandoned,
 }
 
 impl SlotState {
     /// The word stored by a claim, before the producer resolves it.
     pub(super) const VACANT: usize = 0;
+    const PUBLISHED: usize = 1;
+    const ABANDONED: usize = 2;
+    const UNWRITTEN: usize = 3;
+    const STATE_MASK: usize = 3;
+
+    const fn encode(pos: usize, state: usize) -> usize {
+        pos.wrapping_mul(4).wrapping_add(state)
+    }
 
     /// The word published by a commit at `pos`.
     pub(super) const fn published_word(pos: usize) -> usize {
-        pos * 2 + 1
+        Self::encode(pos, Self::PUBLISHED)
     }
 
     /// The word stored when a reservation at `pos` is abandoned.
     pub(super) const fn abandoned_word(pos: usize) -> usize {
-        pos * 2 + 2
+        Self::encode(pos, Self::ABANDONED)
     }
 
     pub(super) const fn decode(word: usize) -> Self {
-        if word == Self::VACANT {
-            Self::Vacant
-        } else if word % 2 == 1 {
-            Self::Published((word - 1) / 2)
-        } else {
-            Self::Abandoned((word - 2) / 2)
+        match word & Self::STATE_MASK {
+            0 => Self::Vacant,
+            Self::PUBLISHED => Self::Published,
+            Self::ABANDONED => Self::Abandoned,
+            _ => Self::Unwritten,
         }
     }
 
@@ -142,7 +173,7 @@ impl SlotState {
     /// Only a published value does. `RingBuffer::drop` and the producer's
     /// overwrite path both use this to decide whether to run `T::drop`.
     pub(super) const fn holds_value(self) -> bool {
-        matches!(self, Self::Published(_))
+        matches!(self, Self::Published)
     }
 
     /// Classifies the slot at `pos` for a consumer reading that position.
@@ -155,10 +186,13 @@ impl SlotState {
         data: &UnsafeCell<MaybeUninit<T>>,
         pos: usize,
     ) -> SlotSnapshot<*const MaybeUninit<T>> {
-        match Self::decode(sequence.load(Ordering::Acquire)) {
-            Self::Published(at) if at == pos => SlotSnapshot::Ready(data.get().cast_const()),
-            Self::Abandoned(at) if at == pos => SlotSnapshot::Tombstoned,
-            _ => SlotSnapshot::NotReady,
+        let word = sequence.load(Ordering::Acquire);
+        if word == Self::published_word(pos) {
+            SlotSnapshot::Ready(data.get().cast_const())
+        } else if word == Self::abandoned_word(pos) {
+            SlotSnapshot::Tombstoned
+        } else {
+            SlotSnapshot::NotReady
         }
     }
 }
@@ -168,44 +202,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fresh_word_reads_as_vacant() {
-        let mut word = SequenceWord::vacant();
-        assert_eq!(word.state_mut(), SlotState::Vacant);
+    fn a_fresh_word_reads_as_unwritten() {
+        let mut word = SequenceWord::unwritten();
+        assert_eq!(word.state_mut(), SlotState::Unwritten);
+        assert!(!word.state_mut().holds_value());
     }
 
     #[test]
-    fn a_fresh_word_is_an_unresolved_claim() {
-        assert!(SequenceWord::vacant().is_claim_in_progress());
+    fn a_fresh_word_is_not_a_claim_in_progress() {
+        assert!(!SequenceWord::unwritten().is_claim_in_progress());
+    }
+
+    #[test]
+    fn a_claim_marks_the_slot_in_progress() {
+        let word = SequenceWord::unwritten();
+        word.claim();
+        assert!(word.is_claim_in_progress());
+    }
+
+    #[test]
+    fn no_position_produces_the_unwritten_word() {
+        for pos in [0usize, 1, usize::MAX / 4, usize::MAX / 2, usize::MAX] {
+            assert_eq!(
+                SlotState::decode(SlotState::published_word(pos)),
+                SlotState::Published
+            );
+            assert_ne!(SlotState::published_word(pos), SlotState::UNWRITTEN);
+            assert_ne!(SlotState::abandoned_word(pos), SlotState::UNWRITTEN);
+        }
     }
 
     #[test]
     fn publishing_and_abandoning_both_resolve_the_claim() {
-        let published = SequenceWord::vacant();
+        let published = SequenceWord::unwritten();
         published.publish(7);
         assert!(!published.is_claim_in_progress());
 
-        let abandoned = SequenceWord::vacant();
+        let abandoned = SequenceWord::unwritten();
         abandoned.abandon(7);
         assert!(!abandoned.is_claim_in_progress());
     }
 
     #[test]
     fn a_claim_reports_the_published_value_it_displaces() {
-        let word = SequenceWord::vacant();
+        let word = SequenceWord::unwritten();
         word.publish(3);
         assert!(word.claim_taking_previous().holds_value());
     }
 
     #[test]
     fn a_claim_over_an_abandoned_slot_owes_no_destructor() {
-        let word = SequenceWord::vacant();
+        let word = SequenceWord::unwritten();
         word.abandon(3);
         assert!(!word.claim_taking_previous().holds_value());
     }
 
     #[test]
     fn a_claim_leaves_the_slot_unresolved_again() {
-        let word = SequenceWord::vacant();
+        let word = SequenceWord::unwritten();
         word.publish(3);
         let _ = word.claim_taking_previous();
         assert!(word.is_claim_in_progress());
@@ -213,12 +267,12 @@ mod tests {
 
     #[test]
     fn the_teardown_state_agrees_with_what_was_published() {
-        let mut word = SequenceWord::vacant();
-        assert_eq!(word.state_mut(), SlotState::Vacant);
+        let mut word = SequenceWord::unwritten();
+        assert_eq!(word.state_mut(), SlotState::Unwritten);
         word.publish(9);
-        assert_eq!(word.state_mut(), SlotState::Published(9));
+        assert_eq!(word.state_mut(), SlotState::Published);
         word.abandon(9);
-        assert_eq!(word.state_mut(), SlotState::Abandoned(9));
+        assert_eq!(word.state_mut(), SlotState::Abandoned);
     }
 
     #[test]
@@ -234,18 +288,54 @@ mod tests {
     }
 
     #[test]
-    fn words_round_trip_through_decode() {
-        for pos in [0usize, 1, 2, 7, 4096] {
+    fn words_decode_to_their_state_at_every_position() {
+        for pos in [
+            0usize,
+            1,
+            2,
+            7,
+            4096,
+            usize::MAX / 4,
+            usize::MAX / 2,
+            usize::MAX,
+        ] {
             assert_eq!(
                 SlotState::decode(SlotState::published_word(pos)),
-                SlotState::Published(pos)
+                SlotState::Published
             );
             assert_eq!(
                 SlotState::decode(SlotState::abandoned_word(pos)),
-                SlotState::Abandoned(pos)
+                SlotState::Abandoned
             );
         }
         assert_eq!(SlotState::decode(SlotState::VACANT), SlotState::Vacant);
+    }
+
+    /// `pos * 2 + 2` was zero at `usize::MAX / 2`, so an abandoned
+    /// reservation there read as a claim in progress.
+    #[test]
+    fn no_resolved_word_equals_the_vacant_word() {
+        for pos in [
+            0usize,
+            usize::MAX / 4,
+            usize::MAX / 2,
+            usize::MAX - 1,
+            usize::MAX,
+        ] {
+            assert_ne!(SlotState::published_word(pos), SlotState::VACANT);
+            assert_ne!(SlotState::abandoned_word(pos), SlotState::VACANT);
+        }
+    }
+
+    #[test]
+    fn a_resolved_slot_is_not_a_claim_in_progress_past_half_the_position_space() {
+        let pos = usize::MAX / 2;
+        let abandoned = SequenceWord::unwritten();
+        abandoned.abandon(pos);
+        assert!(!abandoned.is_claim_in_progress());
+        let published = SequenceWord::unwritten();
+        published.publish(pos);
+        assert!(!published.is_claim_in_progress());
     }
 
     /// The encodings must not alias: a claim, a commit and an abandoned
@@ -266,16 +356,43 @@ mod tests {
     /// abandoned again at its next head.
     #[test]
     fn an_abandoned_marker_names_only_its_own_position() {
-        let word = SlotState::abandoned_word(0);
-        assert_eq!(SlotState::decode(word), SlotState::Abandoned(0));
-        assert_ne!(SlotState::decode(word), SlotState::Abandoned(1));
+        let data: UnsafeCell<MaybeUninit<u32>> = UnsafeCell::new(MaybeUninit::uninit());
+        let seq = AtomicUsize::new(SlotState::abandoned_word(0));
+        assert!(matches!(
+            SlotState::classify(&seq, &data, 0),
+            SlotSnapshot::Tombstoned
+        ));
+        assert!(matches!(
+            SlotState::classify(&seq, &data, 1),
+            SlotSnapshot::NotReady
+        ));
     }
 
     #[test]
     fn only_published_slots_hold_a_value() {
-        assert!(SlotState::Published(3).holds_value());
-        assert!(!SlotState::Abandoned(3).holds_value());
+        assert!(SlotState::Published.holds_value());
+        assert!(!SlotState::Abandoned.holds_value());
         assert!(!SlotState::Vacant.holds_value());
+    }
+
+    #[test]
+    fn classify_is_exact_past_half_the_position_space() {
+        let data: UnsafeCell<MaybeUninit<u32>> = UnsafeCell::new(MaybeUninit::uninit());
+        let pos = usize::MAX / 2;
+        let seq = AtomicUsize::new(SlotState::published_word(pos));
+        assert!(matches!(
+            SlotState::classify(&seq, &data, pos),
+            SlotSnapshot::Ready(_)
+        ));
+        seq.store(SlotState::abandoned_word(pos), Ordering::Release);
+        assert!(matches!(
+            SlotState::classify(&seq, &data, pos),
+            SlotSnapshot::Tombstoned
+        ));
+        assert!(matches!(
+            SlotState::classify(&seq, &data, pos - 1),
+            SlotSnapshot::NotReady
+        ));
     }
 
     #[test]

@@ -107,7 +107,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             match self.ring().cursors.tail().compare_exchange_weak(
                 current_tail,
-                current_tail + 1,
+                current_tail.wrapping_add(1),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -406,7 +406,7 @@ impl<'a, T> SlotWriter<'a, T> {
 
 impl<T> Drop for SlotWriter<'_, T> {
     fn drop(&mut self) {
-        self.slot_seq.tombstone();
+        self.slot_seq.tombstone(self.pos);
         self.queue.wake_consumer();
         #[cfg(feature = "async")]
         self.queue.wake_consumer_async();
@@ -455,7 +455,7 @@ impl<T> Drop for WrittenSlot<'_, T> {
         // past the release would leave the position claimed forever: the
         // consumer stops there waiting for a publication that never
         // comes.
-        let _release = ReservationRelease::new(self.slot_seq, self.queue);
+        let _release = ReservationRelease::new(self.slot_seq, self.pos, self.queue);
         self.value.drop_if_uncommitted();
     }
 }

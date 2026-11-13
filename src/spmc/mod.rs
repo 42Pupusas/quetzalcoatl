@@ -298,7 +298,7 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        for pos in self.cursors.occupied() {
+        for pos in self.cursors.occupied(self.capacity) {
             let s = self.capacity.index_of(pos);
             if self.done[s].holds_unconsumed_value_at(pos, self.capacity) {
                 // SAFETY: data is initialized and unconsumed.

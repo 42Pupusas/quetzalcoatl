@@ -1,0 +1,8 @@
+# Dependency cooldown (Cargo 1.100): resolution skips any version
+# published less than this long ago, which is the window in which most
+# malicious releases are caught and yanked. It applies only when this
+# repository resolves dependencies; downstream users resolve with their
+# own config. To take a fresh version on purpose:
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate> --precise <ver>
+[registry]
+global-min-publish-age = "3 days"

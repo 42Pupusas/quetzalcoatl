@@ -2,14 +2,14 @@
 name = "quetzalcoatl"
 version = "0.15.2"
 edition = "2021"
-# Bisected with `cargo +VERSION check --all-targets --all-features`, not
-# guessed: 1.87 fails on `const Cell::get` (const_cell, stable in 1.88),
-# and below that on `.addr()` (1.84) and `const fn` taking `&mut` (1.83).
+# Raised from 1.88 deliberately: 1.100 stabilizes the `Allocator` trait
+# and `Vec::with_capacity_in`, which `AlignedBuf` is built on, and
+# Cargo's `min-publish-age` dependency cooldown (.cargo/config.toml).
 #
-# It exists because `Duration::from_mins` (1.91) reached a published
-# crate and was caught by a CI runner, not here. Raising this is now a
-# decision rather than an accident.
-rust-version = "1.88"
+# The floor is checked by the `msrv` CI job, not assumed:
+# `Duration::from_mins` (1.91) once reached a published crate because
+# every build that saw it was newer than the declared version.
+rust-version = "1.100"
 authors = ["quetzalcoatl contributors"]
 description = "Lock-free ring buffers (SPSC, MPSC, SPMC, MPMC, and broadcast) for high-performance concurrent communication"
 license = "MIT"
@@ -115,6 +115,10 @@ harness = false
 
 [[bench]]
 name = "matched"
+harness = false
+
+[[bench]]
+name = "park"
 harness = false
 
 [dev-dependencies]
