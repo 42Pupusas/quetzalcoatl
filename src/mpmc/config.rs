@@ -13,11 +13,16 @@
 ///
 /// Bounds are checked at monomorphization via `const _ = assert!`.
 pub trait Config: 'static {
-    /// Positions reserved per FAA on `claim`. Caps the per-batch
+    /// Positions reserved per refill of `claim`. Caps the per-batch
     /// `u32` bitmap; must be in `1..=32`. Larger values reduce
     /// `claim`-line traffic at the cost of producer-progress
     /// imbalance (a slow producer holds more positions out of
     /// reach of others).
+    ///
+    /// A batch of 1 is not batching: every push refills, so every
+    /// push touches `claim`. With the default `REFILL_CAS` that costs
+    /// roughly 20-25% more on a large ring with several producers;
+    /// set `REFILL_CAS = false` if you need item-by-item reservation.
     const PRODUCER_BATCH: usize;
 
     /// On CAS-failure during `pop`, advance the scan cursor by
@@ -29,14 +34,20 @@ pub trait Config: 'static {
 
     /// Pops between flushes of each consumer's local count to the
     /// shared `consumed` watermark. Producers use the watermark
-    /// to bound their batch FAA, so a stale flush only forces
+    /// to bound their batch refill, so a stale flush only forces
     /// smaller producer batches (safe direction). Larger values
     /// reduce hot-line traffic on `consumed` at the cost of more
     /// pessimistic producer batching.
     const CONSUMED_FLUSH: usize;
 
-    /// Experiment switch: refill with `compare_exchange` (true) or the
-    /// blind `fetch_add` (false). Removed once the A/B is settled.
+    /// How a producer takes a batch from `claim`.
+    ///
+    /// `true` (default) advances the cursor with `compare_exchange`
+    /// against the watermark snapshot it checked, so the cursor never
+    /// runs past what the watermark allowed. `false` uses a blind
+    /// `fetch_add`: cheaper when every push refills (`PRODUCER_BATCH`
+    /// of 1), but racing producers can each take a batch against the
+    /// same snapshot and overshoot it.
     const REFILL_CAS: bool = true;
 }
 
@@ -66,14 +77,16 @@ impl Config for DefaultConfig {
 /// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
 /// ```
 ///
-/// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH>`.
+/// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH, REFILL_CAS>`;
+/// the last defaults to `true`.
 #[derive(Debug, Clone, Copy)]
-pub struct Cfg<const B: usize, const S: usize, const F: usize>;
+pub struct Cfg<const B: usize, const S: usize, const F: usize, const CAS: bool = true>;
 
-impl<const B: usize, const S: usize, const F: usize> Config for Cfg<B, S, F> {
+impl<const B: usize, const S: usize, const F: usize, const CAS: bool> Config for Cfg<B, S, F, CAS> {
     const PRODUCER_BATCH: usize = B;
     const CAS_FAIL_SKIP: usize = S;
     const CONSUMED_FLUSH: usize = F;
+    const REFILL_CAS: bool = CAS;
 }
 
 /// Compile-time-validated bounds for a [`Config`]. Forces a
@@ -109,6 +122,22 @@ mod tests {
         assert_eq!(DefaultConfig::PRODUCER_BATCH, 32);
         assert_eq!(DefaultConfig::CAS_FAIL_SKIP, 128);
         assert_eq!(DefaultConfig::CONSUMED_FLUSH, 64);
+        const { assert!(DefaultConfig::REFILL_CAS) };
+    }
+
+    #[test]
+    fn cfg_refills_with_compare_exchange_unless_told_otherwise() {
+        const { assert!(<Cfg<8, 64, 32> as Config>::REFILL_CAS) };
+        const { assert!(!<Cfg<1, 64, 32, false> as Config>::REFILL_CAS) };
+    }
+
+    #[test]
+    fn a_ring_with_blind_refill_still_delivers_in_order() {
+        let (p, c) = RingBuffer::<u64, Cfg<1, 64, 32, false>>::new(Capacity::exact(8)).split();
+        for v in 0..100u64 {
+            p.push(v).unwrap();
+            assert_eq!(c.pop(), Some(v));
+        }
     }
 
     #[test]

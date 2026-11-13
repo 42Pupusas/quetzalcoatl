@@ -6,7 +6,7 @@
 //! `fetch_add` time per round: below 1.0 means CAS is faster.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc::{Config, RingBuffer};
+use quetzalcoatl::mpmc::{Cfg, Config, RingBuffer};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,22 +16,8 @@ use std::time::{Duration, Instant};
 const ITEMS_PER_PRODUCER: u64 = 20_000;
 const ROUNDS: usize = 200;
 
-struct FetchAdd<const BATCH: usize>;
-struct CompareExchange<const BATCH: usize>;
-
-impl<const BATCH: usize> Config for FetchAdd<BATCH> {
-    const PRODUCER_BATCH: usize = BATCH;
-    const CAS_FAIL_SKIP: usize = 128;
-    const CONSUMED_FLUSH: usize = 64;
-    const REFILL_CAS: bool = false;
-}
-
-impl<const BATCH: usize> Config for CompareExchange<BATCH> {
-    const PRODUCER_BATCH: usize = BATCH;
-    const CAS_FAIL_SKIP: usize = 128;
-    const CONSUMED_FLUSH: usize = 64;
-    const REFILL_CAS: bool = true;
-}
+type FetchAdd<const BATCH: usize> = Cfg<BATCH, 128, 64, false>;
+type CompareExchange<const BATCH: usize> = Cfg<BATCH, 128, 64, true>;
 
 struct Shape {
     producers: usize,

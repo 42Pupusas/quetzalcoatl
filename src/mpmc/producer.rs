@@ -92,7 +92,7 @@ impl<T, C: Config> Producer<T, C> {
             // Taking the batch only if `claim` has not moved keeps the
             // cursor within `free` of the watermark: a blind add would
             // let every racing producer take a batch against the same
-            // snapshot.
+            // snapshot. `REFILL_CAS = false` opts into the blind add.
             if !C::REFILL_CAS {
                 break (q.claim.fetch_add(batch, Ordering::Relaxed), batch);
             }
