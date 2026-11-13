@@ -17,3 +17,5 @@ import Qtz.MpmcRingPreserve
 import Qtz.MpmcRingReserve
 import Qtz.MpmcRingMove
 import Qtz.MpmcRingConsume
+import Qtz.MpmcRingProduce
+import Qtz.MpmcRingSafe
