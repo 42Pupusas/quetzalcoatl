@@ -55,6 +55,11 @@ variable {g : Geometry}
 
 def initial (g : Geometry) : SlotModel g := ⟨0, 0, 0, fun _ => .unreserved⟩
 
+/-- The same slot data read under another geometry. The fields do not mention the
+geometry, so a ring can store its slots under one geometry and view each under its own. -/
+def retag (s : SlotModel g) (g' : Geometry) : SlotModel g' :=
+  ⟨s.doneRound, s.readyRound, s.readyState, s.phase⟩
+
 def setPhase (s : SlotModel g) (round : Nat) (phase : Phase) : Nat → Phase :=
   fun other => if other = round then phase else s.phase other
 
@@ -72,6 +77,9 @@ inductive Step : SlotModel g → SlotModel g → Prop
   | publish {s : SlotModel g} (round : Nat) :
       s.phase round = .writing →
       Step s { s with phase := s.setPhase round .published, readyRound := round, readyState := 1 }
+  | unwrite {s : SlotModel g} (round : Nat) :
+      s.phase round = .writing →
+      Step s { s with phase := s.setPhase round .reserved }
   | claim {s : SlotModel g} (position : BitVec g.width) :
       decodeReady g.capacityWord s.readyWord g.slotWord = .published position →
       Step s { s with phase := s.setPhase s.readyRound .claimed, readyState := 2 }
@@ -221,6 +229,35 @@ theorem Inv.step {s t : SlotModel g} (inv : Inv s) (step : Step s t) : Inv t := 
         refine ⟨at_done, ?_⟩
         rw [← at_done]; simp [set_at]
       · intro _; rfl
+    · intro r not_unreserved not_released
+      by_cases same : r = round
+      · subst same
+        exact inv.within_window r (by rw [writing]; decide) (by rw [writing]; decide)
+      · simp only [set_at, same, ite_false] at not_unreserved not_released
+        exact inv.within_window r not_unreserved not_released
+  | unwrite round writing =>
+    have at_done := inv.in_progress_is_current round (by rw [writing]; rfl)
+    refine ⟨inv.state_valid, ?_, ?_, ?_, ?_, ?_⟩
+    all_goals try dsimp only
+    · intro r below
+      by_cases same : r = round
+      · omega
+      · simp only [set_at, same, ite_false]; exact inv.below_done_released r below
+    · intro r released
+      by_cases same : r = round
+      · subst same; simp [set_at] at released
+      · simp only [set_at, same, ite_false] at released; exact inv.released_below_done r released
+    · intro r progress
+      by_cases same : r = round
+      · subst same; simp [set_at, Phase.inProgress] at progress
+      · simp only [set_at, same, ite_false] at progress; exact inv.in_progress_is_current r progress
+    · have published_unchanged : (s.setPhase round .reserved s.doneRound = .published) ↔
+          s.phase s.doneRound = .published := by
+        by_cases same : s.doneRound = round
+        · rw [same]; simp [set_at, writing]
+        · simp [set_at, same]
+      simp only [published_unchanged]
+      exact inv.published_iff_ready
     · intro r not_unreserved not_released
       by_cases same : r = round
       · subst same

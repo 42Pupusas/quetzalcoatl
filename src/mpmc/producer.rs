@@ -93,6 +93,9 @@ impl<T, C: Config> Producer<T, C> {
             // cursor within `free` of the watermark: a blind add would
             // let every racing producer take a batch against the same
             // snapshot.
+            if !C::REFILL_CAS {
+                break (q.claim.fetch_add(batch, Ordering::Relaxed), batch);
+            }
             if q.claim
                 .compare_exchange_weak(
                     claim,

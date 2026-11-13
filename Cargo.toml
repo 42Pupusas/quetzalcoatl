@@ -118,6 +118,10 @@ name = "matched"
 harness = false
 
 [[bench]]
+name = "claim_refill"
+harness = false
+
+[[bench]]
 name = "park"
 harness = false
 

@@ -34,6 +34,10 @@ pub trait Config: 'static {
     /// reduce hot-line traffic on `consumed` at the cost of more
     /// pessimistic producer batching.
     const CONSUMED_FLUSH: usize;
+
+    /// Experiment switch: refill with `compare_exchange` (true) or the
+    /// blind `fetch_add` (false). Removed once the A/B is settled.
+    const REFILL_CAS: bool = true;
 }
 
 /// Default tuning for [`RingBuffer`](super::RingBuffer).
