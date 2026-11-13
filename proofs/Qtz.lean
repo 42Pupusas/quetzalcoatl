@@ -15,3 +15,5 @@ import Qtz.MpmcRingInv
 import Qtz.MpmcRingStep
 import Qtz.MpmcRingPreserve
 import Qtz.MpmcRingReserve
+import Qtz.MpmcRingMove
+import Qtz.MpmcRingConsume
