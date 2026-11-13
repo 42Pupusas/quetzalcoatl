@@ -58,4 +58,21 @@ theorem stale_cache_sees_room_in_a_full_ring {width capacity : Nat} (capacity_po
   rw [this, Nat.mod_self]
   exact capacity_positive
 
+/-- No claim test that reads only the tail word and a producer-local snapshot can be sound.
+`test` receives the tail reduced to `width` bits and whatever the producer stored when it last
+looked (a head, a lap count, any other value). If it ever says room, it says room again once the
+tail is a whole lap further on and the ring is exactly full, because the producer saw nothing
+in between. A lap counter kept in the producer is part of `snapshot`, so it changes nothing.
+Lap bits stored in the tail word just make `width` larger, and the same lag defeats them one
+lap later. Only a wider tail, or a read of other shared state on every claim, can be sound. -/
+theorem no_local_test_is_sound {width capacity : Nat} {Snapshot : Type}
+    (capacity_fits : capacity < 2 ^ width) (test : Nat → Snapshot → Bool)
+    {tail cached : Nat} {snapshot : Snapshot} (cached_le_tail : cached ≤ tail)
+    (says_room : test (tail % 2 ^ width) snapshot = true) :
+    ∃ later_tail head, head ≤ later_tail ∧ later_tail - head = capacity ∧ cached ≤ head ∧
+      test (later_tail % 2 ^ width) snapshot = true := by
+  refine ⟨tail + 2 ^ width, tail + 2 ^ width - capacity, by omega, by omega, by omega, ?_⟩
+  rw [Nat.add_mod_right]
+  exact says_room
+
 end Qtz
