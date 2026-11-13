@@ -8,4 +8,7 @@ import Qtz.MpmcWords
 import Qtz.MpmcGeometry
 import Qtz.MpmcSlot
 import Qtz.Pigeonhole
+import Qtz.RoundCount
 import Qtz.MpmcRing
+import Qtz.MpmcRingEffects
+import Qtz.MpmcRingInv

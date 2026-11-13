@@ -39,6 +39,27 @@ theorem position_split (capacity position : Nat) :
   rw [Nat.mul_comm] at this
   omega
 
+theorem position_mod {period index : Nat} (round : Nat) (below : index < period) :
+    (index + round * period) % period = index := by
+  rw [Nat.add_mul_mod_self_right]
+  exact Nat.mod_eq_of_lt below
+
+theorem position_div {period index : Nat} (round : Nat) (below : index < period) :
+    (index + round * period) / period = round := by
+  have positive : 0 < period := by omega
+  rw [Nat.add_mul_div_right _ _ positive, Nat.div_eq_of_lt below, Nat.zero_add]
+
+theorem position_eq_iff {period index round position : Nat} (below : index < period) :
+    position = index + round * period ↔
+      position % period = index ∧ position / period = round := by
+  constructor
+  · rintro rfl
+    exact ⟨position_mod round below, position_div round below⟩
+  · rintro ⟨same_slot, same_round⟩
+    have split := position_split period position
+    rw [same_slot, same_round] at split
+    omega
+
 theorem same_slot_same_round {capacity first second : Nat}
     (same_slot : first % capacity = second % capacity)
     (same_round : first / capacity = second / capacity) : first = second := by
