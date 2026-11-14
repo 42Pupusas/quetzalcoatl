@@ -1,6 +1,6 @@
 //! The head/tail cursor pair that defines a ring's occupancy.
 //!
-//! Three rings — spsc, mpsc and spmc — track their contents as two
+//! Two rings — spsc and spmc — track their contents as two
 //! monotonically increasing positions: `tail`, the next position a
 //! producer will write, and `head`, the next position a consumer will
 //! read. Neither wraps; the mask is applied only when indexing storage,
@@ -9,15 +9,18 @@
 //! through.
 //!
 //! What this type owns is that subtraction and the invariant behind it,
-//! which was written out identically in all three rings. What it
-//! deliberately does not own is *publication*, because the three rings
-//! do not share one protocol:
+//! which was written out identically in each ring. What it
+//! deliberately does not own is *publication*, because the rings do
+//! not share one protocol:
 //!
 //! | ring | head | tail |
 //! |------|------|------|
 //! | spsc | one consumer, store  | one producer, store  |
-//! | mpsc | one consumer, store  | many producers, CAS  |
 //! | spmc | many consumers, CAS  | one producer, store  |
+//!
+//! mpsc does not use this type. Its producers cannot decide there is
+//! room from a head they read earlier, so it counts free slots in the
+//! word its claim exchanges (see `mpsc::claim_ledger`).
 //!
 //! A cursor written by exactly one thread can be stored; one written by
 //! several must be claimed with a compare-exchange. That is a property
@@ -26,11 +29,10 @@
 //! sites that can justify them, reached through [`Cursors::head`] and
 //! [`Cursors::tail`].
 //!
-//! The one publication that *is* uniform is the single-consumer head
-//! store: spsc and mpsc both release consumed slots with `SeqCst`, for
-//! the same reason in both, so it lives here as
+//! The single-consumer head store releases consumed slots with
+//! `SeqCst`, and lives here as
 //! [`publish_head`](Cursors::publish_head) rather than being restated
-//! at each of the six sites that do it.
+//! at each site that does it.
 
 use super::CachePadded;
 use crate::capacity::Capacity;

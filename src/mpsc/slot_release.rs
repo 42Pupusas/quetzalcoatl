@@ -40,10 +40,10 @@ impl<'a, T> SlotRelease<'a, T> {
 impl<T> Drop for SlotRelease<'_, T> {
     fn drop(&mut self) {
         self.seq.release(self.head, self.ring.capacity);
-        // SeqCst: see Consumer::pop. The `xchg` drains the store buffer,
-        // publishing the sequence store above before the bitmap load
-        // inside `wake_one_published`.
-        self.ring.cursors.publish_head(self.head.wrapping_add(1));
+        // See Consumer::pop. The locked addition drains the store
+        // buffer, publishing the sequence store above before the bitmap
+        // load inside `wake_one_published`.
+        self.ring.ledger.publish_head(self.head.wrapping_add(1));
         self.ring.producer_park.wake_one_published();
         self.ring.notify_producers();
     }

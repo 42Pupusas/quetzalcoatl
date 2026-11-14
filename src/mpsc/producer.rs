@@ -22,10 +22,24 @@ use crate::common::{SlotSequence, UncommittedSlot};
 ///
 /// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
 /// (when `R = Arc`) — each clone shares the same underlying buffer and
-/// claims slots through an atomic compare-and-exchange operation on the tail.
+/// claims slots through an atomic compare-and-exchange operation on the
+/// ring's claim word. A handle keeps no view of the ring between calls.
+///
+/// A handle is `Send` but not `Sync`: it owns one park slot, which holds
+/// one waiter. Give each thread its own clone.
+///
+/// ```compile_fail
+/// use quetzalcoatl::mpsc::Producer;
+///
+/// struct RequiresSync<T: Sync>(std::marker::PhantomData<T>);
+/// let _ = RequiresSync::<Producer<u32>>(std::marker::PhantomData);
+/// ```
 pub struct Producer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
     pub(super) queue: R,
-    pub(super) cached_head: std::cell::Cell<usize>,
+    /// Keeps the handle `!Sync`: two threads blocking through one
+    /// handle would arm the same park slot, and the second would
+    /// replace the first's wake handle.
+    not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
     /// Park slot leased for this producer's lifetime and returned on
     /// drop. Used by [`Producer::push_block`] to register on the wake
     /// bitmap.
@@ -36,25 +50,19 @@ impl<T> Clone for Producer<T> {
     fn clone(&self) -> Self {
         self.queue.producer_count.register();
         let park_slot = self.queue.producer_slots.lease();
-        Self {
-            queue: Arc::clone(&self.queue),
-            cached_head: std::cell::Cell::new(0),
-            park_slot,
-        }
+        Self::new_with(Arc::clone(&self.queue), park_slot)
     }
 }
 
-// SAFETY: Producer holds write access. The Cell fields are only
-// touched by a single thread at a time (no Sync). R is Send, and
-// RingBuffer is Sync.
+// SAFETY: Producer holds write access. R is Send, and RingBuffer is
+// Sync. The `not_sync` marker holds no data.
 unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Producer<T, R> {}
 
 impl<'a, T> Producer<T, &'a RingBuffer<T>> {
     /// Creates an additional producer handle for the same ring.
     ///
     /// The borrowed counterpart to `Clone`, which is only available when
-    /// `R = Arc`. The new handle gets its own park slot and cursor
-    /// cache.
+    /// `R = Arc`. The new handle gets its own park slot.
     ///
     /// This hangs off the producer rather than the ring because
     /// [`RingBuffer::split_borrowed`](super::RingBuffer::split_borrowed)
@@ -75,7 +83,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
     pub(super) const fn new_with(queue: R, park_slot: ParkSlot) -> Self {
         Self {
             queue,
-            cached_head: std::cell::Cell::new(0),
+            not_sync: std::marker::PhantomData,
             park_slot,
         }
     }
@@ -93,34 +101,9 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
     #[inline]
     fn claim_slot(&self) -> Option<(*mut MaybeUninit<T>, &SlotSequence, usize)> {
-        let mut current_tail = self.ring().cursors.tail().load(Ordering::Relaxed);
-        let mut backoff = Backoff::new();
-        loop {
-            if current_tail.wrapping_sub(self.cached_head.get()) >= self.ring().capacity.get() {
-                let head = self.ring().cursors.head().load(Ordering::Acquire);
-                self.cached_head.set(head);
-
-                if current_tail.wrapping_sub(head) >= self.ring().capacity.get() {
-                    return None;
-                }
-            }
-
-            match self.ring().cursors.tail().compare_exchange_weak(
-                current_tail,
-                current_tail.wrapping_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(pos) => {
-                    let slot = self.ring().slot(pos);
-                    return Some((slot.data.get(), &slot.sequence, pos));
-                }
-                Err(observed_tail) => {
-                    current_tail = observed_tail;
-                    backoff.spin();
-                }
-            }
-        }
+        let pos = self.ring().ledger.claim()?;
+        let slot = self.ring().slot(pos);
+        Some((slot.data.get(), &slot.sequence, pos))
     }
 
     /// Pushes a value into the ring buffer.
@@ -167,12 +150,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             }
 
             q.producer_park.arm(slot);
-            // Pairs with the SeqCst fence in WakeSet::wake_one. The
-            // re-check below reads `head`/`sequence` with Acquire from
-            // inside push(); a SeqCst RMW above does not place those
-            // loads in the total order, so without this fence the
-            // consumer can load the wake bitmap as 0 while we read a
-            // stale full ring, and both sides sleep.
+            // Orders the arm above before the loads in the re-check
+            // below. The one that decides the ring is full, of the
+            // pending credits, is SeqCst itself (see
+            // ClaimLedger::refill); the fence also covers the plain
+            // load of the claim word ahead of it.
             std::sync::atomic::fence(Ordering::SeqCst);
 
             // SeqCst: post-arm half of the close handshake.

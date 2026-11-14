@@ -38,11 +38,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `ConsumedWatermark` documentation said it counts releases.** It
   counts claims, as the code always did; the `done` word, not the
   watermark, protects a slot from reuse.
+- **mpsc capacity is at most 2^30.** `mpsc::RingBuffer::new` panics
+  above it, because the free-slot count shares a 64-bit word with the
+  claim position. On a 64-bit target the limit was `Capacity::MAX`,
+  2^61; on a 32-bit one it is unchanged.
+- **mpsc `len`, `is_empty` and `is_full` count from the claim.** A
+  position counts from the moment a producer claims it, as before, but
+  the value now comes from two separate loads and is an estimate while
+  other threads run. It never exceeds the capacity.
+- **An mpsc producer can wait on another producer.** When the ring's
+  ready credits run out, one producer moves the consumer's released
+  credits in and the others spin until it has. `push` on those does not
+  return while that producer is descheduled inside the few
+  instructions of the move.
 
 ### Fixed
 - **A panicking slot initializer leaked the ring's allocation and every
   slot already built.** The `Vec` that now builds the buffer drops them
   on unwind.
+- **An mpsc producer could overwrite a value the consumer had not
+  read.** Each `Producer` tested for room against a head it had cached,
+  comparing wrapped distances, and then claimed with a compare-exchange
+  on the tail. A handle left idle on a full ring while the tail
+  advanced exactly `2^usize::BITS` positions saw room and claimed an
+  occupied slot. No word width removes this, only delays it. Room is
+  now a count of credits held in the word the claim exchanges
+  (`mpsc::claim_ledger`), so a claim succeeds only on a word that holds
+  a free slot at that instant. `proofs/Qtz/MpscRing.lean` proves it
+  with no bound on how stale the producer's view is.
 - **mpsc lost the value published at position `usize::MAX / 2`.** The
   abandoned-reservation marker was a bare `usize::MAX`, which is also
   the published word `pos * 2 + 1` for that position, so the consumer

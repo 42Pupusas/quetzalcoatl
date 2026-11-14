@@ -1,6 +1,5 @@
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::task::Poll;
@@ -52,8 +51,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let ring = self.ring();
         // SAFETY: this is the ring's only consumer, and every caller is
         // reached through `&mut self`. `settle` moves nothing out.
-        let mut batch =
-            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
+        let mut batch = unsafe { BatchRelease::new(ring, ring.ledger.head()) };
         let (slot, data_ptr) = batch.settle()?;
         Some((batch.head(), slot, data_ptr))
     }
@@ -80,12 +78,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         slot.sequence.release(head, self.ring().capacity);
 
-        // SeqCst (not Release): `xchg` drains the store buffer,
-        // publishing this store and the `sequence` store above before
-        // the bitmap load inside `wake_one_published`. That makes
-        // `wake_one`'s leading fence redundant, so we pay one barrier
-        // per pop instead of two. Same idiom as `mpmc::Consumer::pop`.
-        self.ring().cursors.publish_head(head.wrapping_add(1));
+        // The credit is added with a locked instruction, which drains
+        // the store buffer: the `sequence` store above is visible
+        // before the bitmap load inside `wake_one_published`. That
+        // makes `wake_one`'s leading fence redundant, so we pay one
+        // barrier per pop instead of two.
+        self.ring().ledger.publish_head(head.wrapping_add(1));
 
         self.ring().producer_park.wake_one_published();
         self.ring().notify_producers();
@@ -120,8 +118,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
         let ring = self.ring();
         // SAFETY: `&mut self` is the ring's only consumer, and stays
         // borrowed for as long as the batch lives.
-        let mut batch =
-            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
+        let mut batch = unsafe { BatchRelease::new(ring, ring.ledger.head()) };
         while let Some(val) = batch.take() {
             f(val);
         }
@@ -137,8 +134,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     pub fn drain_up_to(&mut self, limit: usize, mut f: impl FnMut(T)) -> usize {
         let ring = self.ring();
         // SAFETY: as in `drain`.
-        let mut batch =
-            unsafe { BatchRelease::new(ring, ring.cursors.head().load(Ordering::Relaxed)) };
+        let mut batch = unsafe { BatchRelease::new(ring, ring.ledger.head()) };
         while batch.delivered() < limit {
             let Some(val) = batch.take() else { break };
             f(val);

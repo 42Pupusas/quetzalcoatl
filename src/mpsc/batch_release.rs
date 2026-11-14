@@ -107,10 +107,10 @@ impl<T> Drop for BatchRelease<'_, T> {
         if self.released == 0 {
             return;
         }
-        // SeqCst: see Consumer::pop. Drains the store buffer so the
-        // sequence stores above are visible before the wake path loads
-        // the park bitmap.
-        self.ring.cursors.publish_head(self.head);
+        // See Consumer::pop. Drains the store buffer so the sequence
+        // stores above are visible before the wake path loads the park
+        // bitmap.
+        self.ring.ledger.publish_head(self.head);
         self.ring.producer_park.wake_n(self.released);
         self.ring.notify_producers_n(self.released);
     }

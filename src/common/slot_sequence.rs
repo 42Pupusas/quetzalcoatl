@@ -21,9 +21,13 @@
 //! published there was skipped as abandoned and never delivered. On a
 //! 32-bit target that is push number 2^31.
 //!
-//! The arithmetic wraps. Two words are equal only when both position
-//! and state are, for positions fewer than `2^(usize::BITS - 2)` apart.
-//! That bounds the capacity, not the number of pushes.
+//! Only the low 32 bits of a position enter the word, because that is
+//! all a producer knows of the position it claimed (see
+//! `mpsc::claim_ledger`). The consumer's head runs on unreduced, so
+//! the reduction is made here, where the two meet. The multiplication
+//! then wraps on a 32-bit target. Two words are equal only when both
+//! position and state are, for positions fewer than 2^30 apart. That
+//! bounds the capacity, not the number of pushes.
 //!
 //! Every writer reaches this word through a method here. That is the
 //! point of the type: the release transition alone was written out as
@@ -47,9 +51,12 @@ impl SlotSequence {
     const FREE: usize = 0;
     const PUBLISHED: usize = 1;
     const ABANDONED: usize = 2;
+    const POSITION_MASK: usize = u32::MAX as usize;
 
     const fn encode(pos: usize, state: usize) -> usize {
-        pos.wrapping_mul(4).wrapping_add(state)
+        (pos & Self::POSITION_MASK)
+            .wrapping_mul(4)
+            .wrapping_add(state)
     }
 
     /// A word for a slot that is free and awaiting position `pos`.
@@ -210,6 +217,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A producer publishes the position it claimed, which is reduced
+    /// to 32 bits; the consumer classifies against its unreduced head.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_reduced_position_reads_as_ready_at_the_unreduced_one() {
+        let data = UnsafeCell::new(MaybeUninit::new(7u32));
+        let head = (1usize << 32) + 5;
+        let seq = SlotSequence::free_at(5);
+        seq.publish(5);
+        assert!(matches!(seq.classify(&data, head), SlotSnapshot::Ready(_)));
+        assert!(matches!(
+            seq.classify(&data, head + 1),
+            SlotSnapshot::NotReady
+        ));
     }
 
     #[test]

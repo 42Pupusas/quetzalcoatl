@@ -26,6 +26,7 @@
 //! ```
 
 mod batch_release;
+mod claim_ledger;
 mod consumer;
 mod producer;
 mod reservation_release;
@@ -36,7 +37,6 @@ pub use producer::{Producer, SlotWriter, WrittenSlot};
 
 use crate::capacity::Capacity;
 use crate::common::close_state::CloseState;
-use crate::common::cursors::Cursors;
 use crate::common::endpoint_count::EndpointCount;
 use crate::common::park::WakeSet;
 use crate::common::park_registry::ParkRegistry;
@@ -44,6 +44,7 @@ use crate::common::sole_parker::SoleParker;
 #[cfg(feature = "async")]
 use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, SeqSlot};
+use claim_ledger::ClaimLedger;
 
 use std::sync::Arc;
 
@@ -58,7 +59,7 @@ use std::sync::Arc;
 pub struct RingBuffer<T> {
     pub(crate) buf: AlignedBuf<SeqSlot<T>>,
     pub(crate) capacity: Capacity,
-    pub(crate) cursors: Cursors,
+    ledger: ClaimLedger,
     /// Live producer count; last-drop sets [`closed`].
     pub(crate) producer_count: EndpointCount,
     /// Set by the last [`Producer`] drop. [`Consumer::pop_block`]
@@ -98,6 +99,10 @@ unsafe impl<T: Send> Sync for RingBuffer<T> {}
 
 impl<T> RingBuffer<T> {
     /// Creates a new MPSC ring buffer with the given capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capacity exceeds 2^30.
     #[must_use]
     pub fn new(capacity: Capacity) -> Self {
         let cap = capacity.get();
@@ -110,7 +115,7 @@ impl<T> RingBuffer<T> {
 
         Self {
             buf,
-            cursors: Cursors::new(),
+            ledger: ClaimLedger::new(capacity),
             capacity,
             producer_count: EndpointCount::new(),
             closed: CloseState::new(),
@@ -125,26 +130,26 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    /// Returns the approximate number of items currently in the buffer.
+    /// Returns the number of positions claimed and not yet released.
     ///
-    /// Both cursors are loaded with `Relaxed` ordering, so the result may
-    /// transiently exceed `capacity` when observed from another thread.
-    /// Use this for heuristics, not for precise invariants.
+    /// It counts a position from its claim, before its value is
+    /// published. Under concurrent use it is an estimate, and never
+    /// exceeds the capacity.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cursors.len()
+        self.ledger.len(self.capacity)
     }
 
     /// Returns `true` if the buffer contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.cursors.is_empty()
+        self.len() == 0
     }
 
     /// Returns `true` if the buffer is at capacity.
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.cursors.is_full(self.capacity.get())
+        self.len() == self.capacity.get()
     }
 
     /// Externally closes the ring, causing a blocked
@@ -282,7 +287,7 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        for pos in self.cursors.occupied(self.capacity) {
+        for pos in self.ledger.occupied(self.capacity) {
             self.buf[self.capacity.index_of(pos)].drop_value_at(pos);
         }
     }
@@ -812,12 +817,8 @@ mod tests {
     /// position 2^31 - 1, about two billion pushes in.
     #[test]
     fn a_value_at_the_former_sentinel_position_is_delivered() {
-        let ring = RingBuffer::<u32>::new(Capacity::exact(4));
-        let start = usize::MAX / 2 - 1;
-        ring.cursors.publish_head(start);
-        ring.cursors
-            .tail()
-            .store(start, std::sync::atomic::Ordering::Relaxed);
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        ring.ledger.start_at(usize::MAX / 2 - 1);
         let (producer, mut consumer) = ring.split();
 
         for value in 0..3 {
@@ -828,6 +829,26 @@ mod tests {
         assert_eq!(consumer.pop(), Some(1));
         assert_eq!(consumer.pop(), Some(2));
         assert_eq!(consumer.pop(), None);
+    }
+
+    /// The claim word keeps 32 bits of the position, and the consumer's
+    /// head keeps all of it. A full ring must refuse a push, and deliver
+    /// in order, while the claim's position rolls over.
+    #[test]
+    fn a_full_ring_stays_full_while_the_claim_position_rolls_over() {
+        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        ring.ledger.start_at(u32::MAX as usize - 5);
+        let (producer, mut consumer) = ring.split();
+
+        for value in 0..4 {
+            producer.push(value).unwrap();
+        }
+        for value in 4..16 {
+            assert_eq!(producer.push(value), Err(value));
+            assert_eq!(consumer.pop(), Some(value - 4));
+            producer.push(value).unwrap();
+        }
+        assert!(producer.is_full());
     }
 
     #[test]
@@ -1550,6 +1571,10 @@ mod tests {
         // Each producer pushes exactly once. Their single push will
         // initially fail (ring full) → push_block parks. We rely on
         // drain's wake fan-out to release them.
+        //
+        // The collect is what spawns the threads before the drain
+        // below; iterating lazily would spawn them after it.
+        #[allow(clippy::needless_collect)]
         let producers: Vec<_> = (0..N_PRODUCERS)
             .map(|tid| {
                 let p = p.clone();
