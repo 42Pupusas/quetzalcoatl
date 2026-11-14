@@ -1,9 +1,12 @@
 import Qtz.ConsumedWatermark
 
 /-!
-Model of the full-ring test in `mpsc::Producer::claim_slot` (`src/mpsc/producer.rs`).
+Model of the full-ring test `mpsc::Producer::claim_slot` used before the claim ledger
+(`src/mpsc/claim_ledger.rs`), kept for the two theorems that show why it was replaced:
+`stale_cache_sees_room_in_a_full_ring` and `no_local_test_is_sound`. Nothing in the ring model
+depends on this file.
 
-A producer claims the tail position when `tail.wrapping_sub(cached_head) < capacity`, where
+A producer claimed the tail position when `tail.wrapping_sub(cached_head) < capacity`, where
 `cached_head` is a head it read earlier. Positions here are unwrapped numbers: `tail` is the
 claim cursor, `head` the consumer's current head, `cached` the producer's cached head, with
 `cached ≤ head ≤ tail` and a ring that holds at most `capacity` positions, `tail - head ≤
@@ -27,25 +30,7 @@ theorem wrappedRoom_iff {width tail cached capacity : Nat} (cached_le_tail : cac
   have : cached + distance - cached = distance := by omega
   rw [this]
 
-/-- A claim made on a cached head is sound while the cache is less than a full word lap
-behind the tail: the head, which is at least as far on, then leaves room too. -/
-theorem claim_room_of_cached {width tail head cached capacity : Nat} (cached_le_head : cached ≤ head)
-    (head_le_tail : head ≤ tail) (capacity_fits : capacity < 2 ^ width)
-    (cache_within_lap : tail - cached < 2 ^ width)
-    (room : wrappedRoom (width := width) tail cached capacity = true) :
-    tail - head < capacity := by
-  rw [wrappedRoom_iff (by omega) capacity_fits, Nat.mod_eq_of_lt cache_within_lap] at room
-  omega
-
-/-- A claim made on a head read just now is sound whenever the ring holds at most
-`capacity` positions. -/
-theorem claim_room_of_fresh {width tail head capacity : Nat} (head_le_tail : head ≤ tail)
-    (capacity_fits : capacity < 2 ^ width) (ring_holds_capacity : tail - head ≤ capacity)
-    (room : wrappedRoom (width := width) tail head capacity = true) :
-    tail - head < capacity :=
-  claim_room_of_cached (Nat.le_refl _) head_le_tail capacity_fits (by omega) room
-
-/-- Without that bound the test is unsound at every width: a producer whose cached head is a
+/-- The test is unsound at every width: a producer whose cached head is a
 full word lap behind the tail sees room, however full the ring is. The ring here is exactly
 full (`tail - head = capacity`) and the cache is no later than the head. -/
 theorem stale_cache_sees_room_in_a_full_ring {width capacity : Nat} (capacity_positive : 0 < capacity)
