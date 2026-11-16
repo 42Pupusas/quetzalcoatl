@@ -159,12 +159,12 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
 
             // SeqCst: post-arm half of the close handshake.
             if q.consumer_closed.is_closed_for_parking() {
-                q.producer_park.disarm(slot);
+                q.producer_park.stand_down(slot);
                 return Err(val);
             }
             match self.push(val) {
                 Ok(()) => {
-                    q.producer_park.disarm(slot);
+                    q.producer_park.stand_down(slot);
                     return Ok(());
                 }
                 Err(returned) => val = returned,
@@ -273,11 +273,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.ring().consumer_closed.is_closed_for_parking() {
-                self.ring().producer_park.disarm(slot);
+                self.ring().producer_park.stand_down(slot);
                 return None;
             }
             if let Some(claim) = self.claim_slot() {
-                self.ring().producer_park.disarm(slot);
+                self.ring().producer_park.stand_down(slot);
                 return Some(claim);
             }
 

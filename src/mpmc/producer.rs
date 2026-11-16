@@ -343,12 +343,12 @@ impl<T, C: Config> Producer<T, C> {
 
             // SeqCst: post-arm half of the close handshake.
             if self.queue.consumer_closed.is_closed_for_parking() {
-                self.queue.producer_park.disarm(park_slot);
+                self.queue.producer_park.stand_down_waking_all(park_slot);
                 self.retract_awaited();
                 return None;
             }
             if self.reserve().is_some() {
-                self.queue.producer_park.disarm(park_slot);
+                self.queue.producer_park.stand_down_waking_all(park_slot);
                 self.retract_awaited();
                 return self.reserve();
             }
@@ -408,14 +408,14 @@ impl<T, C: Config> Producer<T, C> {
             match self.push(val) {
                 Ok(()) => {
                     watch.made_progress();
-                    q.producer_park.disarm(slot);
+                    q.producer_park.stand_down_waking_all(slot);
                     self.retract_awaited();
                     return Ok(());
                 }
                 Err(returned) => val = returned,
             }
             if q.consumer_closed.is_closed_for_parking() {
-                q.producer_park.disarm(slot);
+                q.producer_park.stand_down_waking_all(slot);
                 self.retract_awaited();
                 return Err(val);
             }

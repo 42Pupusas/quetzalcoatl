@@ -232,6 +232,9 @@ impl<T> Producer<T> {
                 return Err(val);
             }
             if self.has_space() {
+                // Nothing is claimed here, so a wake that retired our bit
+                // still has its slot for the loop top to take or lose to a
+                // peer, who then parks and re-arms.
                 q.producer_park.disarm(slot);
                 backoff.reset();
                 continue;
@@ -249,6 +252,7 @@ impl<T> Producer<T> {
     ///
     /// Same wait protocol as [`push_block`](Self::push_block).
     pub fn reserve_block(&mut self) -> Option<SlotWriter<'_, T>> {
+        let this = &*self;
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
@@ -256,7 +260,14 @@ impl<T> Producer<T> {
                 return None;
             }
             if self.has_space() {
-                return self.reserve();
+                // A peer can take the slot between `has_space` and the
+                // claim, so `None` here is a lost race, not a closed
+                // channel. Loop; the top of the loop reports the close.
+                if let Some(claimed) = this.claim_slot() {
+                    return Some(this.writer(claimed));
+                }
+                backoff.reset();
+                continue;
             }
             if backoff.spin_unless_exhausted() {
                 continue;
@@ -272,7 +283,8 @@ impl<T> Producer<T> {
             }
             if self.has_space() {
                 self.queue.producer_park.disarm(slot);
-                return self.reserve();
+                backoff.reset();
+                continue;
             }
 
             self.queue.producer_park.park();
@@ -334,14 +346,21 @@ impl<T> Producer<T> {
     #[inline]
     #[must_use]
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T>> {
-        let queue = &*self.queue;
-        self.claim_slot()
-            .map(|(data_ptr, slot_sequence, pos)| SlotWriter {
-                slot_data: data_ptr,
-                slot_sequence,
-                pos,
-                queue,
-            })
+        let this = &*self;
+        this.claim_slot().map(|claimed| this.writer(claimed))
+    }
+
+    #[inline]
+    fn writer<'a>(
+        &'a self,
+        (slot_data, slot_sequence, pos): (*mut MaybeUninit<T>, &'a SequenceWord, usize),
+    ) -> SlotWriter<'a, T> {
+        SlotWriter {
+            slot_data,
+            slot_sequence,
+            pos,
+            queue: &self.queue,
+        }
     }
 
     /// Returns the number of items currently in the buffer.

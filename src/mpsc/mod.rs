@@ -1612,6 +1612,87 @@ mod tests {
         }
     }
 
+    /// A capacity-one ring, two producers and one consumer. The first
+    /// producer runs the real `push_block`, held open between its
+    /// claim and its stand-down by the park gate; see
+    /// [`StagedHandoff`](crate::common::staged_handoff::StagedHandoff).
+    ///
+    /// The consumer frees the slot before the first producer arms, and
+    /// the first producer's re-check claims it. The second producer
+    /// then finds the ring full and parks. The consumer pops again, and
+    /// that release has one wake.
+    struct StagedWake;
+
+    impl StagedWake {
+        /// Runs the schedule and returns whether the parked producer
+        /// was woken. `first_stands_down_first` orders the first
+        /// producer's stand-down before the consumer's second pop;
+        /// without it the pop falls in the window.
+        fn parked_producer_is_woken(first_stands_down_first: bool) -> bool {
+            use crate::common::staged_handoff::StagedHandoff;
+
+            let (first, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(1)).split();
+            let second = first.clone();
+            let ring = Arc::clone(&first.queue);
+            let handoff =
+                StagedHandoff::new(&ring.producer_park, first.park_slot, second.park_slot);
+
+            first.push(0).unwrap();
+            handoff.hold_first();
+            let first_done = std::thread::spawn(move || first.push_block(1));
+            handoff.wait_first_before_arm();
+            assert_eq!(consumer.pop(), Some(0));
+            handoff.let_first_arm();
+
+            let parked = std::thread::spawn(move || second.push_block(2));
+            handoff.wait_second_parked();
+
+            if first_stands_down_first {
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Ok(()));
+                assert_eq!(consumer.pop(), Some(1));
+            } else {
+                assert_eq!(consumer.pop(), Some(1));
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Ok(()));
+            }
+
+            let woken = StagedHandoff::second_woke(&parked);
+            if woken {
+                assert_eq!(parked.join().unwrap(), Ok(()));
+                assert_eq!(consumer.pop(), Some(2));
+            } else {
+                // Release the thread so the test process can end.
+                drop(consumer);
+                parked.join().unwrap().unwrap_err();
+            }
+            woken
+        }
+    }
+
+    /// Control for the test below: the same schedule with the first
+    /// producer's stand-down ordered before the release. It passes, so
+    /// the harness delivers a wake to a parked producer when the window
+    /// is closed.
+    #[test]
+    fn a_release_after_the_first_producer_stands_down_wakes_the_parked_one() {
+        assert!(StagedWake::parked_producer_is_woken(true));
+    }
+
+    /// A producer's wake bit stays set from its arm until it stands
+    /// down, so the consumer's wake can pick a producer whose post-arm
+    /// re-check has already claimed. That wake must still reach a
+    /// producer that is parked.
+    ///
+    /// Without `WakeSet::stand_down` passing the wake on, `wake_one`
+    /// clears the first producer's bit and claims its handle, so the
+    /// one wake for the release goes to a producer that is not parked,
+    /// and the second sleeps with a free slot.
+    #[test]
+    fn a_wake_spent_on_a_producer_that_already_claimed_reaches_a_parked_one() {
+        assert!(StagedWake::parked_producer_is_woken(false));
+    }
+
     /// One round of concurrent [`Producer::push`] calls on a ring that
     /// no consumer drains.
     ///

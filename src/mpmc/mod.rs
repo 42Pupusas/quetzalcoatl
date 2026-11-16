@@ -966,6 +966,87 @@ mod tests {
         assert_eq!(rest, vec![Some(3), Some(99), Some(100), Some(101)]);
     }
 
+    /// A ring of four, two producers and one consumer. The first
+    /// producer runs the real `push_block`, held open between its push
+    /// and its stand-down by the park gate; see
+    /// [`StagedHandoff`](crate::common::staged_handoff::StagedHandoff).
+    ///
+    /// The consumer frees a slot before the first producer arms, and
+    /// the first producer's re-check pushes into it. The second
+    /// producer then finds the ring full and parks. The consumer pops
+    /// again, and that release has one wake. Neither producer
+    /// announced a batch, so both answer "anything" and the cursor
+    /// decides which one the wake goes to.
+    struct StagedWake;
+
+    impl StagedWake {
+        /// Runs the schedule and returns whether the parked producer
+        /// was woken. `first_stands_down_first` orders the first
+        /// producer's stand-down before the consumer's second pop;
+        /// without it the pop falls in the window.
+        fn parked_producer_is_woken(first_stands_down_first: bool) -> bool {
+            use crate::common::staged_handoff::StagedHandoff;
+
+            let (first, consumer) =
+                RingBuffer::<u64, Cfg<1, 128, 1>>::new(Capacity::exact(4)).split();
+            let second = first.clone();
+            let ring = std::sync::Arc::clone(&first.queue);
+            let handoff =
+                StagedHandoff::new(&ring.producer_park, first.park_slot, second.park_slot);
+
+            for v in 0..4u64 {
+                first.push(v).unwrap();
+            }
+            handoff.hold_first();
+            let first_done = std::thread::spawn(move || first.push_block(10));
+            handoff.wait_first_before_arm();
+            assert_eq!(consumer.pop(), Some(0));
+            handoff.let_first_arm();
+
+            let parked = std::thread::spawn(move || second.push_block(11));
+            handoff.wait_second_parked();
+
+            if first_stands_down_first {
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Ok(()));
+                assert_eq!(consumer.pop(), Some(1));
+            } else {
+                assert_eq!(consumer.pop(), Some(1));
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Ok(()));
+            }
+
+            let woken = StagedHandoff::second_woke(&parked);
+            if woken {
+                assert_eq!(parked.join().unwrap(), Ok(()));
+                let mut rest: Vec<_> = std::iter::from_fn(|| consumer.pop()).collect();
+                rest.sort_unstable();
+                assert_eq!(rest, vec![2, 3, 10, 11]);
+            } else {
+                // Release the thread so the test process can end.
+                drop(consumer);
+                let _ = parked.join().unwrap();
+            }
+            woken
+        }
+    }
+
+    /// Control for the test below: the first producer stands down
+    /// before the release, so the harness has to deliver the wake.
+    #[test]
+    fn a_release_after_the_first_producer_stands_down_wakes_the_parked_one() {
+        assert!(StagedWake::parked_producer_is_woken(true));
+    }
+
+    /// A producer's wake bit stays set from its arm until it stands
+    /// down, so a release can be routed to a producer whose post-arm
+    /// re-check has already pushed. That wake must still reach a
+    /// producer that is parked.
+    #[test]
+    fn a_wake_spent_on_a_producer_that_already_pushed_reaches_a_parked_one() {
+        assert!(StagedWake::parked_producer_is_woken(false));
+    }
+
     /// The bound on the pin: producers blocked by a *full ring* are
     /// interchangeable, so misrouting is harmless there.
     ///

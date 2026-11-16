@@ -325,11 +325,11 @@ impl<T, C: Config> Consumer<T, C> {
 
             if let Some(v) = self.pop() {
                 watch.made_progress();
-                q.consumer_park.disarm(slot);
+                q.consumer_park.stand_down(slot);
                 return Some(v);
             }
             if q.closed.is_closed_for_parking() {
-                q.consumer_park.disarm(slot);
+                q.consumer_park.stand_down(slot);
                 return self.pop();
             }
 
@@ -420,7 +420,7 @@ impl<T, C: Config> Consumer<T, C> {
             std::sync::atomic::fence(Ordering::SeqCst);
 
             if self.has_item() {
-                self.queue.consumer_park.disarm(park_slot);
+                self.queue.consumer_park.stand_down(park_slot);
                 if let Some(claimed) = self.claim_slot() {
                     watch.made_progress();
                     return Some(self.reader_for(claimed));
@@ -431,7 +431,7 @@ impl<T, C: Config> Consumer<T, C> {
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
             if self.queue.closed.is_closed_for_parking() {
-                self.queue.consumer_park.disarm(park_slot);
+                self.queue.consumer_park.stand_down(park_slot);
                 if let Some(claimed) = self.claim_slot() {
                     return Some(self.reader_for(claimed));
                 }
@@ -538,7 +538,7 @@ impl<T, C: Config> Drop for SlotReader<'_, T, C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Consumer, DefaultConfig, RingBuffer};
+    use super::{Arc, Consumer, DefaultConfig, RingBuffer};
     use crate::capacity::Capacity;
 
     /// A ring holding exactly one published item, at a chosen position.
@@ -584,6 +584,78 @@ mod tests {
             let claimed = self.consumer.claim_slot().map(|(_, round_pos)| round_pos);
             (gate, claimed)
         }
+    }
+
+    /// An empty ring of eight, one producer and two consumers. The
+    /// first consumer runs the real `pop_block`, held open between its
+    /// pop and its stand-down by the park gate; see
+    /// [`StagedHandoff`](crate::common::staged_handoff::StagedHandoff).
+    ///
+    /// An item is published before the first consumer arms, and its
+    /// re-check takes it. The second consumer then finds the ring empty
+    /// and parks. The producer publishes again, and that publish has
+    /// one wake.
+    struct StagedWake;
+
+    impl StagedWake {
+        /// Runs the schedule and returns whether the parked consumer
+        /// was woken. `first_stands_down_first` orders the first
+        /// consumer's stand-down before the second publish; without
+        /// it the publish falls in the window.
+        fn parked_consumer_is_woken(first_stands_down_first: bool) -> bool {
+            use crate::common::staged_handoff::StagedHandoff;
+
+            let (producer, first) =
+                RingBuffer::<u32, DefaultConfig>::new(Capacity::exact(8)).split();
+            let second = first.clone();
+            let ring = Arc::clone(&first.queue);
+            let handoff =
+                StagedHandoff::new(&ring.consumer_park, first.park_slot, second.park_slot);
+
+            handoff.hold_first();
+            let first_done = std::thread::spawn(move || first.pop_block());
+            handoff.wait_first_before_arm();
+            producer.push(0).unwrap();
+            handoff.let_first_arm();
+
+            let parked = std::thread::spawn(move || second.pop_block());
+            handoff.wait_second_parked();
+
+            if first_stands_down_first {
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Some(0));
+                producer.push(1).unwrap();
+            } else {
+                producer.push(1).unwrap();
+                handoff.let_first_stand_down();
+                assert_eq!(first_done.join().unwrap(), Some(0));
+            }
+
+            let woken = StagedHandoff::second_woke(&parked);
+            if !woken {
+                // Closing the ring releases the thread so the test
+                // process can end.
+                drop(producer);
+            }
+            assert_eq!(parked.join().unwrap(), Some(1));
+            woken
+        }
+    }
+
+    /// Control for the test below: the first consumer stands down
+    /// before the publish, so the harness has to deliver the wake.
+    #[test]
+    fn a_publish_after_the_first_consumer_stands_down_wakes_the_parked_one() {
+        assert!(StagedWake::parked_consumer_is_woken(true));
+    }
+
+    /// A consumer's wake bit stays set from its arm until it stands
+    /// down, so a publish can pick a consumer whose post-arm re-check
+    /// has already taken an item. That wake must still reach a
+    /// consumer that is parked beside the new item.
+    #[test]
+    fn a_wake_spent_on_a_consumer_that_already_popped_reaches_a_parked_one() {
+        assert!(StagedWake::parked_consumer_is_woken(false));
     }
 
     /// The property a blocking consumer rests on: both the pre-park

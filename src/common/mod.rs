@@ -18,6 +18,7 @@ pub mod endpoint_count;
 #[cfg(all(test, loom, feature = "async"))]
 mod loom_models;
 pub mod park;
+pub mod park_gate;
 #[cfg(all(test, loom))]
 mod park_handshake_model;
 pub mod park_overflow;
@@ -37,6 +38,8 @@ pub mod seq_slot;
 pub mod single_parker;
 pub mod slot_sequence;
 pub mod sole_parker;
+#[cfg(test)]
+pub mod staged_handoff;
 #[cfg(test)]
 pub mod stress_iters;
 pub mod thread_parker;

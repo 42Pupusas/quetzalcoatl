@@ -83,6 +83,25 @@ impl<T> Consumer<T> {
         self.queue.notify_producers();
     }
 
+    /// The position at this consumer's head and a pointer to its value,
+    /// after stepping over every abandoned position in the way. `None`
+    /// when the head has nothing published.
+    ///
+    /// The only place an abandoned reservation is recognised. Skipping
+    /// one frees the position for the producers, so it is published and
+    /// notified like any other head advance.
+    #[inline]
+    fn settle(&self) -> Option<(usize, *const MaybeUninit<T>)> {
+        loop {
+            let head = self.queue.consumers.head_of(self.slot_index);
+            match self.queue.slot(head).classify(head) {
+                SlotSnapshot::Tombstoned => self.advance_head(head),
+                SlotSnapshot::NotReady => return None,
+                SlotSnapshot::Ready(data_ptr) => return Some((head, data_ptr)),
+            }
+        }
+    }
+
     /// Pops the next item, returning a clone.
     ///
     /// Returns `None` if the buffer is empty or the next slot hasn't
@@ -97,37 +116,18 @@ impl<T> Consumer<T> {
     where
         T: Clone,
     {
-        loop {
-            let head = self.queue.consumers.head_of(self.slot_index);
+        let (head, data_ptr) = self.settle()?;
 
-            let slot = self.queue.slot(head);
+        // Armed before the clone: `T::clone` is user code, and
+        // unwinding past the advance would leave this consumer
+        // rereading the position forever.
+        let _advance = HeadAdvance::new(&self.queue, self.slot_index, head);
 
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    // Abandoned slot — skip it by advancing this
-                    // consumer's head. That frees the position for the
-                    // producers, so it is published and notified like
-                    // any other head advance.
-                    self.advance_head(head);
-                    continue;
-                }
-                SlotSnapshot::NotReady => return None,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
-
-            // Armed before the clone: `T::clone` is user code, and
-            // unwinding past the advance would leave this consumer
-            // rereading the position forever.
-            let _advance = HeadAdvance::new(&self.queue, self.slot_index, head);
-
-            // SAFETY: classify() returned Ready, which synchronizes with the
-            // producer's Release, ensuring the data write is visible. The
-            // data won't be overwritten because this consumer's head hasn't
-            // advanced (min_head blocks the producer).
-            let val = unsafe { (*data_ptr).assume_init_ref().clone() };
-
-            return Some(val);
-        }
+        // SAFETY: `settle` returned Ready, which synchronizes with the
+        // producer's Release, ensuring the data write is visible. The
+        // data won't be overwritten because this consumer's head hasn't
+        // advanced (min_head blocks the producer).
+        Some(unsafe { (*data_ptr).assume_init_ref().clone() })
     }
 
     /// Pops a value asynchronously, yielding to the executor when this
@@ -182,27 +182,12 @@ impl<T> Consumer<T> {
     #[inline]
     #[must_use]
     pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
-        loop {
-            let head = self.queue.consumers.head_of(self.slot_index);
-
-            let slot = self.queue.slot(head);
-
-            let data_ptr = match slot.classify(head) {
-                SlotSnapshot::Tombstoned => {
-                    // Abandoned slot — skip it, releasing the position.
-                    self.advance_head(head);
-                    continue;
-                }
-                SlotSnapshot::NotReady => return None,
-                SlotSnapshot::Ready(data_ptr) => data_ptr,
-            };
-
-            return Some(SlotReader {
-                data_ptr,
-                consumer: self,
-                head,
-            });
-        }
+        let (head, data_ptr) = self.settle()?;
+        Some(SlotReader {
+            data_ptr,
+            consumer: self,
+            head,
+        })
     }
 
     /// Returns the number of items this consumer has yet to read.

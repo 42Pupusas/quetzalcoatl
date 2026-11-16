@@ -19,6 +19,7 @@
 use super::atomics::{fence, AtomicU64};
 use std::sync::atomic::Ordering;
 
+use super::park_gate::ParkGate;
 use super::park_overflow::ParkOverflow;
 use super::thread_parker::ThreadParker;
 use super::wake_interest::WakeInterest;
@@ -91,6 +92,8 @@ pub struct WakeSet {
     /// all but heavily over-subscribed rings, where it costs one
     /// `SeqCst` load per wake.
     pub overflow: ParkOverflow,
+    /// Test stops inside the handshake; empty outside tests.
+    pub gate: ParkGate,
 }
 
 impl WakeSet {
@@ -101,6 +104,7 @@ impl WakeSet {
             parkers: AlignedBuf::new_with(PARK_SLOTS, ThreadParker::new),
             cursor: AtomicU64::new(0),
             overflow: ParkOverflow::new(),
+            gate: ParkGate::new(),
         }
     }
 
@@ -396,6 +400,7 @@ impl WakeSet {
     /// it must precede the caller's final re-check of the ring.
     #[inline]
     pub fn arm(&self, slot: ParkSlot) {
+        self.gate.reach_arm(slot);
         if !slot.is_leased() {
             self.overflow.register();
             return;
@@ -420,7 +425,45 @@ impl WakeSet {
     /// Clears this waiter's wake bit.
     #[inline]
     pub fn disarm(&self, slot: ParkSlot) {
+        self.gate.reach_clear(slot);
         self.wake.fetch_and(!slot.mask(), Ordering::Relaxed);
+    }
+
+    /// Clears this waiter's wake bit after its post-arm re-check made
+    /// progress, and passes on a wake that a peer spent on it.
+    ///
+    /// The bit stays set from [`arm`](Self::arm) until now, so a waker
+    /// can retire it and unpark this waiter after the re-check has
+    /// already succeeded. That release is then spent on a waiter that
+    /// is not parked, while one that is stays parked beside a free
+    /// slot. The `fetch_and` and the waker's own are on one word, so
+    /// exactly one of them finds the bit set: either the waker skips
+    /// this waiter, or this finds the bit gone and wakes another.
+    ///
+    /// A wake passed on needlessly only makes a parked waiter re-check
+    /// and park again. Use [`disarm`](Self::disarm) after a park, where
+    /// the wake was meant for this waiter.
+    #[inline]
+    pub fn stand_down(&self, slot: ParkSlot) {
+        self.gate.reach_clear(slot);
+        let mask = slot.mask();
+        if mask != 0 && self.wake.fetch_and(!mask, Ordering::SeqCst) & mask == 0 {
+            self.wake_one();
+        }
+    }
+
+    /// [`stand_down`](Self::stand_down) for waiters that are woken by
+    /// position, as mpmc producers are: the release spent on this
+    /// waiter was for one position, which it cannot name, and handing
+    /// it to an arbitrary waiter could reach one pinned to another
+    /// position. So every parked waiter is woken and re-checks.
+    #[inline]
+    pub fn stand_down_waking_all(&self, slot: ParkSlot) {
+        self.gate.reach_clear(slot);
+        let mask = slot.mask();
+        if mask != 0 && self.wake.fetch_and(!mask, Ordering::SeqCst) & mask == 0 {
+            self.wake_n(PARK_SLOTS);
+        }
     }
 
     /// Watches `slot`'s handle for up to `limit`, reporting whether a
@@ -515,6 +558,47 @@ mod tests {
         set.arm_all(&[3, 9]);
         set.disarm(ParkSlot::Leased(3));
         assert_eq!(set.parked_slots(), vec![9]);
+    }
+
+    #[test]
+    fn standing_down_with_the_bit_still_set_wakes_nobody() {
+        let set = WakeSet::new();
+        set.arm_all(&[3, 9]);
+        set.stand_down(ParkSlot::Leased(3));
+        assert_eq!(set.parked_slots(), vec![9]);
+        assert!(set.is_armed(ParkSlot::Leased(9)));
+    }
+
+    #[test]
+    fn standing_down_after_a_wake_took_the_bit_passes_the_wake_on() {
+        let set = WakeSet::new();
+        set.arm_all(&[3, 9]);
+        // A waker retires slot 3 and claims its handle.
+        set.wake_one();
+        assert_eq!(set.parked_slots(), vec![9]);
+        set.stand_down(ParkSlot::Leased(3));
+        assert_eq!(set.parked_slots(), Vec::<u32>::new());
+        assert!(!set.is_armed(ParkSlot::Leased(9)));
+    }
+
+    #[test]
+    fn standing_down_by_position_wakes_every_parked_waiter() {
+        let set = WakeSet::new();
+        set.arm_all(&[3, 9, 12]);
+        set.wake_one();
+        set.stand_down_waking_all(ParkSlot::Leased(3));
+        assert_eq!(set.parked_slots(), Vec::<u32>::new());
+        assert!(!set.is_armed(ParkSlot::Leased(9)));
+        assert!(!set.is_armed(ParkSlot::Leased(12)));
+    }
+
+    #[test]
+    fn a_slotless_waiter_stands_down_without_touching_the_bitmap() {
+        let set = WakeSet::new();
+        set.arm(ParkSlot::Leased(5));
+        set.stand_down(ParkSlot::Shared);
+        set.stand_down_waking_all(ParkSlot::Shared);
+        assert_eq!(set.parked_slots(), vec![5]);
     }
 
     #[test]

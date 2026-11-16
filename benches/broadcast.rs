@@ -139,6 +139,65 @@ mod producer_scaling {
 }
 
 // ---------------------------------------------------------------------------
+// Blocking push: N producers on a small ring, 2 spinning consumers
+// ---------------------------------------------------------------------------
+
+mod blocking_push {
+    use super::*;
+
+    const NUM_PRODUCERS: &[usize] = &[1, 2, 4, 8];
+    const ITEMS_PER_PRODUCER: u64 = 5_000;
+
+    #[divan::bench(args = NUM_PRODUCERS)]
+    fn blocking_push(bencher: divan::Bencher, num_producers: usize) {
+        let total_items = ITEMS_PER_PRODUCER * num_producers as u64;
+        bencher
+            .counter(divan::counter::ItemsCount::new(total_items))
+            .bench(|| {
+                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(8), 4).split();
+                let mut c2 = consumer.clone();
+                let mut c1 = consumer;
+
+                let producer_handles: Vec<_> = (0..num_producers)
+                    .map(|_| {
+                        let p = producer.clone();
+                        thread::spawn(move || {
+                            for i in 0..ITEMS_PER_PRODUCER {
+                                p.push_block(black_box(i)).expect("consumers dropped");
+                            }
+                        })
+                    })
+                    .collect();
+
+                let h1 = thread::spawn(move || {
+                    let mut received = 0u64;
+                    while received < total_items {
+                        if c1.pop().is_some() {
+                            received += 1;
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+
+                let mut received = 0u64;
+                while received < total_items {
+                    if c2.pop().is_some() {
+                        received += 1;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+
+                for h in producer_handles {
+                    h.join().unwrap();
+                }
+                h1.join().unwrap();
+            });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 3. Large struct: pop (clone) vs pop_ref (zero-copy)
 // ---------------------------------------------------------------------------
 

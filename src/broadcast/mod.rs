@@ -1516,6 +1516,73 @@ mod tests {
         drop(producer);
     }
 
+    /// The schedule that loses a wake in the other variants, driven
+    /// through the real `push_block`. Here the first producer's
+    /// re-check only observes space; it claims nothing.
+    ///
+    /// A third producer takes the slot the first one saw, so the
+    /// second finds the ring full and parks. The next head advance
+    /// frees one slot and its wake lands on the first producer's
+    /// still-set bit. The first producer retries and takes that slot,
+    /// so the ring is full again and the second must stay parked, and
+    /// the advance after that must wake it.
+    ///
+    /// This holds with or without `stand_down` on that exit, so it
+    /// does not pin the exit; it pins that no wake is lost here.
+    #[test]
+    fn a_wake_spent_on_a_producer_that_saw_space_does_not_strand_the_second() {
+        use crate::common::staged_handoff::StagedHandoff;
+        use std::sync::Arc;
+
+        let (first, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2), 4).split();
+        let second = first.clone();
+        let third = first.clone();
+        let ring = Arc::clone(&first.queue);
+        let handoff = StagedHandoff::new(&ring.producer_park, first.park_slot, second.park_slot);
+        let first_bit = first.park_slot.mask();
+
+        first.push(0).unwrap();
+        first.push(1).unwrap();
+        handoff.hold_first();
+        let first_done = std::thread::spawn(move || first.push_block(10));
+        handoff.wait_first_before_arm();
+        assert_eq!(consumer.pop(), Some(0));
+        handoff.let_first_arm();
+        third.push(20).unwrap();
+
+        let parked = std::thread::spawn(move || second.push_block(11));
+        handoff.wait_second_parked();
+
+        // Frees the second slot; its wake lands on the first producer.
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(
+            ring.producer_park
+                .wake
+                .load(std::sync::atomic::Ordering::SeqCst)
+                & first_bit,
+            0,
+            "the advance must have retired the first producer's bit",
+        );
+        handoff.let_first_stand_down();
+        assert_eq!(first_done.join().unwrap(), Ok(()));
+        assert!(
+            !parked.is_finished(),
+            "the ring is full again, so the second producer must still be parked",
+        );
+
+        // The next advance has nobody ahead of the second producer.
+        assert_eq!(consumer.pop(), Some(20));
+        let woken = StagedHandoff::second_woke(&parked);
+        if !woken {
+            drop(consumer);
+            parked.join().unwrap().unwrap_err();
+            panic!("the second producer was not woken by the next advance");
+        }
+        assert_eq!(parked.join().unwrap(), Ok(()));
+        assert_eq!(consumer.pop(), Some(10));
+        assert_eq!(consumer.pop(), Some(11));
+    }
+
     #[test]
     fn push_block_returns_err_when_all_consumers_gone() {
         let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
@@ -1552,6 +1619,52 @@ mod tests {
         let producer = h.join().unwrap();
         assert_eq!(consumer.pop(), Some(20));
         assert_eq!(consumer.pop(), Some(30));
+        drop(producer);
+    }
+
+    /// `reserve_block` reports `None` only when every consumer has
+    /// dropped. Producers racing for the last free slot must not see it
+    /// while the consumer is still subscribed.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
+    fn reserve_block_does_not_report_close_when_it_loses_a_race() {
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: u64 = 20_000;
+        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2), 4).split();
+        let reported_close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handles: Vec<_> = (0..PRODUCERS)
+            .map(|_| {
+                let mut producer = producer.clone();
+                let reported_close = std::sync::Arc::clone(&reported_close);
+                std::thread::spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        let Some(slot) = producer.reserve_block() else {
+                            reported_close.store(true, Ordering::Relaxed);
+                            return;
+                        };
+                        slot.write(i).commit();
+                    }
+                })
+            })
+            .collect();
+
+        let mut received = 0;
+        while received < PRODUCERS as u64 * PER_PRODUCER && !reported_close.load(Ordering::Relaxed)
+        {
+            if consumer.pop().is_some() {
+                received += 1;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        assert!(
+            !reported_close.load(Ordering::Relaxed),
+            "a lost race was reported as a closed channel"
+        );
+        for handle in handles {
+            handle.join().unwrap();
+        }
         drop(producer);
     }
 
