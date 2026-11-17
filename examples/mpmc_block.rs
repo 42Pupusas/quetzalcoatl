@@ -12,7 +12,7 @@
 //   mode = pop_spin | pop_block | push_spin | push_block | all
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc::RingBuffer;
+use quetzalcoatl::mpmc::SplitRing;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,7 +32,7 @@ const FLUSH_EVERY: usize = 64;
 fn run_pop_spin(p: usize, q: usize, total_items: u64) -> Duration {
     let per = total_items / p as u64;
     let target = (per * p as u64) as usize;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(CAP_LARGE)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(CAP_LARGE)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumers: Vec<_> = (0..q)
@@ -93,7 +93,7 @@ fn run_pop_spin(p: usize, q: usize, total_items: u64) -> Duration {
 /// Consumer uses `pop_block`; producer is unblocked (cap is large).
 fn run_pop_block(p: usize, q: usize, total_items: u64) -> Duration {
     let per = total_items / p as u64;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(CAP_LARGE)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(CAP_LARGE)).split();
 
     let consumers: Vec<_> = (0..q)
         .map(|_| {
@@ -142,7 +142,7 @@ fn run_pop_block(p: usize, q: usize, total_items: u64) -> Duration {
 fn run_push_spin(p: usize, q: usize, total_items: u64) -> Duration {
     let per = total_items / p as u64;
     let target = (per * p as u64) as usize;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(CAP_SMALL)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(CAP_SMALL)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumers: Vec<_> = (0..q)
@@ -204,7 +204,7 @@ fn run_push_spin(p: usize, q: usize, total_items: u64) -> Duration {
 fn run_push_block(p: usize, q: usize, total_items: u64) -> Duration {
     let per = total_items / p as u64;
     let target = (per * p as u64) as usize;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(CAP_SMALL)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(CAP_SMALL)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumers: Vec<_> = (0..q)

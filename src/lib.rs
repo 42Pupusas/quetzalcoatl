@@ -22,10 +22,10 @@
 //! ## MPSC (multi-producer, single-consumer)
 //!
 //! ```
-//! use quetzalcoatl::mpsc::RingBuffer;
+//! use quetzalcoatl::mpsc::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(64)).split();
+//! let (producer, mut consumer) = SplitRing::new(Capacity::exact(64)).split();
 //!
 //! // Clone the producer for multiple threads
 //! let p2 = producer.clone();
@@ -43,10 +43,10 @@
 //! ## SPSC (single-producer, single-consumer)
 //!
 //! ```
-//! use quetzalcoatl::spsc::RingBuffer;
+//! use quetzalcoatl::spsc::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(64)).split();
+//! let (producer, mut consumer) = SplitRing::new(Capacity::exact(64)).split();
 //!
 //! producer.push(42u64).unwrap();
 //! assert_eq!(consumer.pop(), Some(42));
@@ -55,10 +55,10 @@
 //! ## SPMC (single-producer, multiple-consumer)
 //!
 //! ```
-//! use quetzalcoatl::spmc::RingBuffer;
+//! use quetzalcoatl::spmc::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, consumer) = RingBuffer::new(Capacity::exact(64)).split();
+//! let (producer, consumer) = SplitRing::new(Capacity::exact(64)).split();
 //!
 //! // Clone the consumer for multiple threads
 //! let c2 = consumer.clone();
@@ -76,11 +76,11 @@
 //! Every consumer sees every item published after it subscribes.
 //!
 //! ```
-//! use quetzalcoatl::broadcast::RingBuffer;
+//! use quetzalcoatl::broadcast::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
 //! // max_consumers = 4
-//! let (producer, mut c1) = RingBuffer::new(Capacity::exact(64), 4).split();
+//! let (producer, mut c1) = SplitRing::new(Capacity::exact(64), 4).split();
 //! let mut c2 = c1.clone(); // new consumer, sees future items
 //!
 //! producer.push(99u64).unwrap();
@@ -97,10 +97,10 @@
 //! `WrittenSlot` that can be safely committed:
 //!
 //! ```
-//! use quetzalcoatl::spsc::RingBuffer;
+//! use quetzalcoatl::spsc::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (mut producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
+//! let (mut producer, mut consumer) = SplitRing::<[u8; 4096]>::new(Capacity::exact(4)).split();
 //!
 //! // Write directly into the slot
 //! let writer = producer.reserve().unwrap();

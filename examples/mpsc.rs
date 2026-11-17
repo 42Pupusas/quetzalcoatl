@@ -3,7 +3,7 @@
 //! Demonstrates concurrent producers pushing to the same ring buffer.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ fn main() {
     println!("=== MPSC Concurrent Producers Example ===\n");
 
     // Create a ring buffer with capacity for at least 1000 items
-    let (producer, mut consumer) = RingBuffer::new(Capacity::at_least(1000)).split();
+    let (producer, mut consumer) = SplitRing::new(Capacity::at_least(1000)).split();
 
     let num_producers = 4;
     let items_per_producer = 100;

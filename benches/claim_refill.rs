@@ -6,7 +6,7 @@
 //! `fetch_add` time per round: below 1.0 means CAS is faster.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc::{Cfg, Config, RingBuffer};
+use quetzalcoatl::mpmc::{Cfg, Config, SplitRing};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -27,8 +27,7 @@ struct Shape {
 impl Shape {
     fn run<C: Config>(&self) -> Duration {
         let total = self.producers * ITEMS_PER_PRODUCER as usize;
-        let (producer, consumer) =
-            RingBuffer::<u64, C>::new(Capacity::exact(self.capacity)).split();
+        let (producer, consumer) = SplitRing::<u64, C>::new(Capacity::exact(self.capacity)).split();
         let received = Arc::new(AtomicUsize::new(0));
         let started = Instant::now();
 

@@ -1,8 +1,8 @@
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spmc::RingBuffer;
+use quetzalcoatl::spmc::SplitRing;
 
 fn main() {
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
     let n = 16u64;
 
     let handle = std::thread::spawn(move || {

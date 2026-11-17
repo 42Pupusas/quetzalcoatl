@@ -15,7 +15,7 @@ struct QuetzalcoatlSteady {
 
 impl QuetzalcoatlSteady {
     fn new(num_consumers: u64) -> Self {
-        let (producer, consumer) = quetzalcoatl::spmc::RingBuffer::<u64>::new(
+        let (producer, consumer) = quetzalcoatl::spmc::SplitRing::<u64>::new(
             quetzalcoatl::capacity::Capacity::exact(CAPACITY),
         )
         .split();
@@ -161,7 +161,7 @@ impl Drop for CrossbeamSteady {
 fn quetzalcoatl_setup(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         black_box(
-            quetzalcoatl::spmc::RingBuffer::<u64>::new(quetzalcoatl::capacity::Capacity::exact(
+            quetzalcoatl::spmc::SplitRing::<u64>::new(quetzalcoatl::capacity::Capacity::exact(
                 CAPACITY,
             ))
             .split(),

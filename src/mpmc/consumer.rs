@@ -187,10 +187,10 @@ impl<T, C: Config> Consumer<T, C> {
     /// from one call cannot: the reader borrows `self`, so the caller
     /// cannot retry after a `None`.
     #[inline]
-    const fn reader_for(&mut self, claimed: (usize, usize)) -> SlotReader<'_, T, C> {
+    fn reader_for(&self, claimed: (usize, usize)) -> SlotReader<'_, T, C> {
         let (pos, round_pos) = claimed;
         SlotReader {
-            consumer: self,
+            queue: &self.queue,
             pos,
             round_pos,
         }
@@ -504,8 +504,12 @@ impl<T, C: Config> Drop for Consumer<T, C> {
 /// On drop: drops the value in place, stores
 /// `done[s] = round_pos + cap` to release the slot, and wakes one
 /// parked producer (if any).
+///
+/// The reader holds the ring, not the consumer. Its lifetime is the
+/// `&mut Consumer` borrow `pop_ref` took, so the consumer cannot be
+/// used while a reader is alive.
 pub struct SlotReader<'a, T, C: Config = DefaultConfig> {
-    consumer: &'a mut Consumer<T, C>,
+    queue: &'a RingBuffer<T, C>,
     pos: usize,
     round_pos: usize,
 }
@@ -516,13 +520,13 @@ impl<T, C: Config> std::ops::Deref for SlotReader<'_, T, C> {
         // SAFETY: claim_slot's CAS gave us unique ownership of this
         // (slot, round) pair, and the producer committed the value
         // before publishing state=1.
-        unsafe { (*self.consumer.queue.data_slot(self.pos).get()).assume_init_ref() }
+        unsafe { (*self.queue.data_slot(self.pos).get()).assume_init_ref() }
     }
 }
 
 impl<T, C: Config> Drop for SlotReader<'_, T, C> {
     fn drop(&mut self) {
-        let q = &*self.consumer.queue;
+        let q = self.queue;
         // The release is armed before the value is dropped so that a
         // panicking `T::drop` still hands this slot back. Leaving it
         // "claimed but not released" would make `RingBuffer::drop` drop
@@ -538,8 +542,9 @@ impl<T, C: Config> Drop for SlotReader<'_, T, C> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arc, Consumer, DefaultConfig, RingBuffer};
+    use super::{Arc, Consumer, DefaultConfig};
     use crate::capacity::Capacity;
+    use crate::mpmc::SplitRing;
 
     /// A ring holding exactly one published item, at a chosen position.
     ///
@@ -560,7 +565,7 @@ mod tests {
         /// `keep`, so `keep` is the only one a scan can find.
         fn holding(keep: usize) -> Self {
             let (producer, consumer) =
-                RingBuffer::<u64, DefaultConfig>::new(Capacity::exact(Self::CAP)).split();
+                SplitRing::<u64, DefaultConfig>::new(Capacity::exact(Self::CAP)).split();
             for i in 0..Self::CAP {
                 producer.push(i as u64).expect("the ring starts empty");
             }
@@ -606,7 +611,7 @@ mod tests {
             use crate::common::staged_handoff::StagedHandoff;
 
             let (producer, first) =
-                RingBuffer::<u32, DefaultConfig>::new(Capacity::exact(8)).split();
+                SplitRing::<u32, DefaultConfig>::new(Capacity::exact(8)).split();
             let second = first.clone();
             let ring = Arc::clone(&first.queue);
             let handoff =

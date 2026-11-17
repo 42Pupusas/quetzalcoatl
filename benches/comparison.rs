@@ -19,7 +19,7 @@ mod cmp_spsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::spsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::exact(4096),
                 )
                 .split();
@@ -85,7 +85,7 @@ mod cmp_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::exact(8192),
                 )
                 .split();
@@ -214,7 +214,7 @@ mod cmp_spmc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, consumer) = quetzalcoatl::spmc::RingBuffer::<u64>::new(
+                let (producer, consumer) = quetzalcoatl::spmc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::exact(8192),
                 )
                 .split();
@@ -310,7 +310,7 @@ mod cmp_broadcast {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, consumer) = quetzalcoatl::broadcast::RingBuffer::<u64>::new(
+                let (producer, consumer) = quetzalcoatl::broadcast::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::exact(4096),
                     num_consumers as usize + 1,
                 )
@@ -434,7 +434,7 @@ mod cmp_large_spsc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::spsc::RingBuffer::<LargeStruct>::new(
+                let (producer, mut consumer) = quetzalcoatl::spsc::SplitRing::<LargeStruct>::new(
                     quetzalcoatl::capacity::Capacity::exact(256),
                 )
                 .split();
@@ -466,7 +466,7 @@ mod cmp_large_spsc {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
                 let (mut producer, mut consumer) =
-                    quetzalcoatl::spsc::RingBuffer::<LargeStruct>::new(
+                    quetzalcoatl::spsc::SplitRing::<LargeStruct>::new(
                         quetzalcoatl::capacity::Capacity::exact(256),
                     )
                     .split();
@@ -537,7 +537,7 @@ mod cmp_large_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<LargeStruct>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<LargeStruct>::new(
                     quetzalcoatl::capacity::Capacity::exact(256),
                 )
                 .split();
@@ -579,7 +579,7 @@ mod cmp_large_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<LargeStruct>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<LargeStruct>::new(
                     quetzalcoatl::capacity::Capacity::exact(256),
                 )
                 .split();
@@ -711,7 +711,7 @@ mod cmp_large_spmc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, consumer) = quetzalcoatl::spmc::RingBuffer::<LargeStruct>::new(
+                let (producer, consumer) = quetzalcoatl::spmc::SplitRing::<LargeStruct>::new(
                     quetzalcoatl::capacity::Capacity::exact(256),
                 )
                 .split();

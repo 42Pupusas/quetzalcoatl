@@ -3,7 +3,7 @@
 //! Demonstrates a pub/sub pattern where every consumer receives
 //! every item published after it subscribes.
 
-use quetzalcoatl::broadcast::RingBuffer;
+use quetzalcoatl::broadcast::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
@@ -12,7 +12,7 @@ fn main() {
 
     // Create a broadcast ring buffer.
     // max_consumers = 8: up to 8 concurrent consumers.
-    let (producer, mut c1) = RingBuffer::new(Capacity::exact(64), 8).split();
+    let (producer, mut c1) = SplitRing::new(Capacity::exact(64), 8).split();
 
     // Clone to create a second consumer — it sees only future items.
     let mut c2 = c1.clone();

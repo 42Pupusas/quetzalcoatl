@@ -16,11 +16,12 @@ use crate::common::{SlotSequence, UncommittedSlot};
 /// The producer side of an MPSC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static`.
 ///
-/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
+/// Obtained via [`SplitRing::split`](super::SplitRing::split). Cloneable
 /// (when `R = Arc`) — each clone shares the same underlying buffer and
 /// claims slots through an atomic compare-and-exchange operation on the
 /// ring's claim word. A handle keeps no view of the ring between calls.
@@ -65,7 +66,7 @@ impl<'a, T> Producer<T, &'a RingBuffer<T>> {
     /// `R = Arc`. The new handle gets its own park slot.
     ///
     /// This hangs off the producer rather than the ring because
-    /// [`RingBuffer::split_borrowed`](super::RingBuffer::split_borrowed)
+    /// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)
     /// takes `&mut self`: while these handles are alive the ring is
     /// mutably borrowed and cannot be borrowed again. An existing handle
     /// already holds the shared reference, so it can hand out siblings

@@ -16,8 +16,9 @@ use crate::common::UncommittedSlot;
 /// The producer side of an SPMC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static`.
 ///
 /// Not cloneable — only one producer exists per buffer.

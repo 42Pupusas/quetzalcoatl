@@ -18,8 +18,9 @@ use crate::common::{SeqSlot, SlotSequence};
 /// The consumer side of an MPSC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static`.
 ///
 /// Not cloneable — only one consumer exists per buffer.
@@ -33,6 +34,10 @@ pub struct Consumer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
 unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Consumer<T, R> {}
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub(super) const fn new_with(queue: R) -> Self {
+        Self { queue }
+    }
+
     #[inline]
     fn ring(&self) -> &RingBuffer<T> {
         &self.queue
@@ -93,14 +98,14 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     #[inline]
     #[must_use]
-    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let (head, slot, data_ptr) = self.head_value()?;
         let seq_ptr = &raw const slot.sequence;
 
         Some(SlotReader {
             data_ptr,
             seq_ptr,
-            consumer: self,
+            ring: self.ring(),
             head,
         })
     }
@@ -182,7 +187,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     }
 
     #[must_use]
-    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
         crate::common::SingleParkerConsumerRef::pop_ref_block(self)
     }
 
@@ -234,13 +239,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
     for Consumer<T, R>
 {
     type Reader<'a>
-        = SlotReader<'a, T, R>
+        = SlotReader<'a, T>
     where
         Self: 'a;
     fn ready_for_claim(&mut self) -> bool {
         Self::ready_for_claim(self)
     }
-    fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+    fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         self.pop_ref()
     }
     fn producer_gone(&self) -> bool {
@@ -268,8 +273,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     }
 }
 
-/// A zero-copy read reference to an item in the ring buffer.
-///
 #[cfg(feature = "async")]
 impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
     fn park_set(&mut self) -> &WakerSet {
@@ -277,19 +280,25 @@ impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
     }
 }
 
+/// A zero-copy read reference to an item in the ring buffer.
+///
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without copying.
 ///
 /// When dropped, drops the `T` value, releases the slot by updating
 /// the sequence number, and advances the head pointer.
-pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
+///
+/// The reader holds the ring, not the consumer. Its lifetime is still
+/// the `&mut Consumer` borrow `pop_ref` took, so the consumer cannot be
+/// used while a reader is alive.
+pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
     seq_ptr: *const SlotSequence,
-    consumer: &'a mut Consumer<T, R>,
+    ring: &'a RingBuffer<T>,
     head: usize,
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, R> {
+impl<T> std::ops::Deref for SlotReader<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: pop_ref classified the slot as Ready at `head` (Acquire).
@@ -297,16 +306,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, 
     }
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
+impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
         // The release is armed before the value is dropped so that a
         // panicking `T::drop` still hands this slot back. Leaving the
         // sequence published and `head` stale would make
         // `RingBuffer::drop` drop the same value again.
         //
-        // SAFETY: `seq_ptr` points into the RingBuffer kept alive by the
-        // consumer's reference.
-        let _release = SlotRelease::new(self.consumer.ring(), unsafe { &*self.seq_ptr }, self.head);
+        // SAFETY: `seq_ptr` points into the ring this reader borrows.
+        let _release = SlotRelease::new(self.ring, unsafe { &*self.seq_ptr }, self.head);
         // SAFETY: The value is initialized (seq check verified in pop_ref).
         unsafe {
             std::ptr::drop_in_place(self.data_ptr.cast_mut().cast::<T>());

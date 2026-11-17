@@ -14,7 +14,7 @@
 // Usage: broadcast_arc_cost <consumers> <items> <iters>
 
 use quetzalcoatl::broadcast::arc::ArcRingBuffer;
-use quetzalcoatl::broadcast::RingBuffer;
+use quetzalcoatl::broadcast::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -80,7 +80,7 @@ impl SizeProbe {
     fn run_clone<const N: usize>(&self) -> Duration {
         let start = Instant::now();
         let (producer, consumer) =
-            RingBuffer::<Payload<N>>::new(Capacity::exact(CAP), self.consumers + 1).split();
+            SplitRing::<Payload<N>>::new(Capacity::exact(CAP), self.consumers + 1).split();
         let mut consumers: Vec<_> = (0..self.consumers - 1).map(|_| consumer.clone()).collect();
         consumers.push(consumer);
 

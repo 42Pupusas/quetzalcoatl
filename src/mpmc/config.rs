@@ -71,10 +71,10 @@ impl Config for DefaultConfig {
 /// declaring a named config type:
 ///
 /// ```
-/// use quetzalcoatl::mpmc::{Cfg, RingBuffer};
+/// use quetzalcoatl::mpmc::{Cfg, SplitRing};
 /// use quetzalcoatl::capacity::Capacity;
 ///
-/// let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
+/// let (p, c) = SplitRing::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
 /// ```
 ///
 /// Type parameters: `<PRODUCER_BATCH, CAS_FAIL_SKIP, CONSUMED_FLUSH, REFILL_CAS>`;
@@ -113,7 +113,7 @@ impl<C: Config> ConfigBounds<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::RingBuffer;
+    use super::super::SplitRing;
     use super::{Cfg, Config, ConfigBounds, DefaultConfig};
     use crate::capacity::Capacity;
 
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn a_ring_with_blind_refill_still_delivers_in_order() {
-        let (p, c) = RingBuffer::<u64, Cfg<1, 64, 32, false>>::new(Capacity::exact(8)).split();
+        let (p, c) = SplitRing::<u64, Cfg<1, 64, 32, false>>::new(Capacity::exact(8)).split();
         for v in 0..100u64 {
             p.push(v).unwrap();
             assert_eq!(c.pop(), Some(v));
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_ring_builds_around_an_inline_config() {
-        let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
+        let (p, c) = SplitRing::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(64)).split();
         p.push(1).unwrap();
         assert_eq!(c.pop(), Some(1));
     }

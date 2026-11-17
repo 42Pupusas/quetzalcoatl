@@ -17,8 +17,9 @@ use std::task::Poll;
 /// The producer side of an SPSC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static` — the borrow checker proves the ring
 /// outlives both handles.
 ///
@@ -44,6 +45,41 @@ impl<T> Producer<T> {
             write_pos: Cell::new(0),
             cached_head: Cell::new(0),
         }
+    }
+}
+
+impl<T> Producer<T, &'static RingBuffer<T>> {
+    /// Reconstructs a producer handle from a raw pointer to a ring buffer.
+    ///
+    /// This is the cross-address-space seam: when the `RingBuffer` lives in
+    /// memory shared between two execution contexts that do **not** share a
+    /// Rust allocator — most notably a WebAssembly main thread and a Web
+    /// Worker instantiated against the *same* `WebAssembly.Memory` — neither
+    /// `split` (needs `Arc`, whose refcount the other side can't see safely)
+    /// nor `split_borrowed` (needs a Rust `&` with a provable lifetime) can
+    /// bridge it. Each side instead reconstitutes its own handle from the
+    /// shared address via `Producer::from_raw` /
+    /// [`Consumer::from_raw`](super::Consumer::from_raw).
+    ///
+    /// The handle borrows the ring for `'static`, which is sound only because
+    /// the caller pins the ring for the whole program (e.g. `Box::leak`).
+    ///
+    /// # Safety
+    /// The caller must guarantee all of:
+    /// - `ptr` points to a live, initialized `RingBuffer<T>` that remains
+    ///   valid and at this exact address for `'static` (never moved, never
+    ///   dropped) — `Box::leak` satisfies this.
+    /// - The pointed-to memory is genuinely shared with the other context
+    ///   (same `WebAssembly.Memory` / `SharedArrayBuffer`), so atomic
+    ///   operations on the cursors are coherent across both.
+    /// - The SPSC contract holds across the boundary: **exactly one** producer
+    ///   handle and **exactly one** consumer handle exist for this ring, each
+    ///   used from a single context. Reconstructing two producers, or using a
+    ///   handle from more than one thread, is undefined behavior.
+    #[must_use]
+    pub const unsafe fn from_raw(ptr: *const RingBuffer<T>) -> Self {
+        // SAFETY: caller guarantees `ptr` is a live `'static` ring (contract above).
+        Self::new_with(unsafe { &*ptr })
     }
 }
 

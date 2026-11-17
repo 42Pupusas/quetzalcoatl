@@ -18,8 +18,9 @@ use std::task::Poll;
 /// The consumer side of an SPSC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static`.
 ///
 /// Not cloneable — only one consumer exists per buffer.
@@ -34,7 +35,32 @@ pub struct Consumer<T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
 // touched by the single consumer thread. R is Send, and RingBuffer is Sync.
 unsafe impl<T: Send, R: Deref<Target = RingBuffer<T>> + Send> Send for Consumer<T, R> {}
 
+impl<T> Consumer<T, &'static RingBuffer<T>> {
+    /// Reconstructs a consumer handle from a raw pointer to a ring buffer.
+    ///
+    /// The consumer counterpart to
+    /// [`Producer::from_raw`](super::Producer::from_raw); see it for the
+    /// cross-address-space rationale.
+    ///
+    /// # Safety
+    /// Same contract as [`Producer::from_raw`](super::Producer::from_raw):
+    /// `ptr` must be a live, `'static`, genuinely-shared `RingBuffer<T>`, and
+    /// exactly one consumer (and one producer) handle may exist for it.
+    #[must_use]
+    pub const unsafe fn from_raw(ptr: *const RingBuffer<T>) -> Self {
+        // SAFETY: caller guarantees `ptr` is a live `'static` ring (contract above).
+        Self::new_with(unsafe { &*ptr })
+    }
+}
+
 impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
+    pub(super) const fn new_with(queue: R) -> Self {
+        Self {
+            queue,
+            cached_tail: std::cell::Cell::new(0),
+        }
+    }
+
     #[inline]
     fn ring(&self) -> &RingBuffer<T> {
         &self.queue
@@ -218,7 +244,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Returns `None` if the buffer is empty.
     #[inline]
     #[must_use]
-    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let head = self.ring().cursors.head().load(Ordering::Relaxed);
 
         if !self.available(head) {
@@ -227,11 +253,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
         // Data is initialized — tail advanced past this slot, synchronized
         // via Acquire in `available`.
-        let data_ptr = self.ring().slot(head).get().cast_const();
-
+        let ring = self.ring();
         Some(SlotReader {
-            data_ptr,
-            consumer: self,
+            data_ptr: ring.slot(head).get().cast_const(),
+            ring,
             head,
         })
     }
@@ -263,7 +288,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// [`pop_ref`](Self::pop_ref) for non-blocking or
     /// [`pop_block`](Self::pop_block) for value-copy reads.
     #[must_use]
-    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
         crate::common::SingleParkerConsumerRef::pop_ref_block(self)
     }
 
@@ -307,13 +332,13 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
     for Consumer<T, R>
 {
     type Reader<'a>
-        = SlotReader<'a, T, R>
+        = SlotReader<'a, T>
     where
         Self: 'a;
     fn ready_for_claim(&mut self) -> bool {
         Self::ready_for_claim(self)
     }
-    fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+    fn try_pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         self.pop_ref()
     }
     fn producer_gone(&self) -> bool {
@@ -339,11 +364,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     }
 }
 
-/// A zero-copy read reference to an item in the ring buffer.
-///
-/// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
-/// direct reads from the slot without copying.
-///
 #[cfg(feature = "async")]
 impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
     fn park_set(&mut self) -> &WakerSet {
@@ -351,29 +371,49 @@ impl<T, R: Deref<Target = RingBuffer<T>>> ParkSite for Consumer<T, R> {
     }
 }
 
+/// A zero-copy read reference to an item in the ring buffer.
+///
+/// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
+/// direct reads from the slot without copying.
+///
 /// When dropped, drops the `T` value and advances the head pointer.
-pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
+///
+/// The reader holds the ring, not the consumer. Its lifetime is still
+/// the `&mut Consumer` borrow `pop_ref` took, so the consumer cannot be
+/// used while a reader is alive:
+///
+/// ```compile_fail,E0499
+/// use quetzalcoatl::spsc::SplitRing;
+/// use quetzalcoatl::capacity::Capacity;
+///
+/// let (producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+/// producer.push(1).unwrap();
+/// let reader = consumer.pop_ref().unwrap();
+/// let _ = consumer.pop();
+/// drop(reader);
+/// ```
+pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
-    consumer: &'a mut Consumer<T, R>,
+    ring: &'a RingBuffer<T>,
     head: usize,
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, R> {
+impl<T> std::ops::Deref for SlotReader<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: The slot was verified available (tail > head with Acquire)
         // in pop_ref. The data is initialized and we have exclusive access
-        // via &mut Consumer.
+        // via the `&mut Consumer` borrow this reader's lifetime came from.
         unsafe { (*self.data_ptr).assume_init_ref() }
     }
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
+impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
         // The publisher is armed before the value is dropped so that a
         // panicking `T::drop` still hands this slot back. Leaving `head`
         // stale would make `Consumer::drop` drop the same value again.
-        let mut publisher = HeadPublisher::new(self.consumer.ring(), self.head);
+        let mut publisher = HeadPublisher::new(self.ring, self.head);
         publisher.advance();
         // SAFETY: `pop_ref` verified the slot is initialized, and the
         // `&mut Consumer` borrow gives us exclusive access to it.

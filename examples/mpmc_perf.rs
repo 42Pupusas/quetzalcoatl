@@ -4,7 +4,7 @@
 // Usage: mpmc_perf <P> <Q> <total_items>
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpmc::RingBuffer;
+use quetzalcoatl::mpmc::SplitRing;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ fn main() {
     let per_producer = total_items / p as u64;
     let actual_total = per_producer * p as u64;
 
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
     let received = Arc::new(AtomicUsize::new(0));
     let target = actual_total as usize;
 

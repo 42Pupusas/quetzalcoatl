@@ -10,10 +10,10 @@
 //! # Example
 //!
 //! ```
-//! use quetzalcoatl::mpsc::RingBuffer;
+//! use quetzalcoatl::mpsc::SplitRing;
 //! use quetzalcoatl::capacity::Capacity;
 //!
-//! let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
+//! let (producer, mut consumer) = SplitRing::new(Capacity::exact(16)).split();
 //! let p2 = producer.clone();
 //!
 //! producer.push(1u32).unwrap();
@@ -31,9 +31,11 @@ mod consumer;
 mod producer;
 mod reservation_release;
 mod slot_release;
+mod split_ring;
 
 pub use consumer::{Consumer, SlotReader};
 pub use producer::{Producer, SlotWriter, WrittenSlot};
+pub use split_ring::SplitRing;
 
 use crate::capacity::Capacity;
 use crate::common::close_state::CloseState;
@@ -46,13 +48,11 @@ use crate::common::wake_async::WakerSet;
 use crate::common::{AlignedBuf, SeqSlot};
 use claim_ledger::ClaimLedger;
 
-use std::sync::Arc;
-
 /// A lock-free MPSC ring buffer.
 ///
-/// Created via [`RingBuffer::new`], then [`split`](RingBuffer::split) into
-/// a [`Producer`] / [`Consumer`] pair. The `Producer` is [`Clone`]; the
-/// `Consumer` is not (single-consumer).
+/// The state a [`Producer`] / [`Consumer`] pair shares. Obtain the pair
+/// from a [`SplitRing`]. The `Producer` is [`Clone`]; the `Consumer` is
+/// not (single-consumer).
 // repr(C) locks field order: shared immutable fields first (same cache
 // line), then the cursor pair, which pads each cursor onto its own line.
 #[repr(C)]
@@ -178,56 +178,6 @@ impl<T> RingBuffer<T> {
         unsafe { std::hint::assert_unchecked(idx < self.buf.len()) };
         &self.buf[idx]
     }
-
-    /// Splits the ring buffer into a [`Producer`] and [`Consumer`] pair.
-    ///
-    /// Both handles hold an `Arc` to the ring buffer, so `T` must be
-    /// `'static`. For borrowed data (non-`'static` `T`), use
-    /// [`split_borrowed`](Self::split_borrowed).
-    #[must_use]
-    pub fn split(self) -> (Producer<T>, Consumer<T>) {
-        let arc = Arc::new(self);
-        let park_slot = arc.producer_slots.lease();
-        let producer = Producer::new_with(arc.clone(), park_slot);
-        let consumer = Consumer { queue: arc };
-        (producer, consumer)
-    }
-
-    /// Splits a *borrowed* ring buffer into a producer/consumer pair
-    /// whose lifetimes are tied to the ring.
-    ///
-    /// Unlike [`split`](Self::split), the handles hold `&RingBuffer<T>`
-    /// instead of `Arc<RingBuffer<T>>`. This lets `T` carry lifetimes
-    /// shorter than `'static`.
-    ///
-    /// The returned producer is not `Clone`. Create additional producers
-    /// via [`Producer::new_producer`], which assigns each one its own
-    /// park slot.
-    ///
-    /// Takes `&mut self` so the ring can be split only once. A second
-    /// split would mint a second *consumer* — breaking the single-
-    /// consumer contract this queue's `head` protocol relies on — and a
-    /// second producer sharing park slot 0 with the first. The exclusive
-    /// borrow makes that a borrow-check error rather than undefined
-    /// behavior.
-    ///
-    /// ```compile_fail
-    /// use quetzalcoatl::mpsc::RingBuffer;
-    /// use quetzalcoatl::capacity::Capacity;
-    ///
-    /// let mut ring = RingBuffer::<String>::new(Capacity::exact(4));
-    /// let (p1, mut c1) = ring.split_borrowed();
-    /// let (p2, mut c2) = ring.split_borrowed();
-    /// p1.push("a".to_string()).unwrap();
-    /// ```
-    #[must_use]
-    pub fn split_borrowed(&mut self) -> (Producer<T, &Self>, Consumer<T, &Self>) {
-        let shared: &Self = self;
-        let park_slot = shared.producer_slots.lease();
-        let producer = Producer::new_with(shared, park_slot);
-        let consumer = Consumer { queue: shared };
-        (producer, consumer)
-    }
 }
 
 impl<T> RingBuffer<T> {
@@ -300,7 +250,7 @@ mod tests {
 
     #[test]
     fn capacity_one() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -310,7 +260,7 @@ mod tests {
 
     #[test]
     fn zero_sized_types() {
-        let (producer, mut consumer) = RingBuffer::<()>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<()>::new(Capacity::exact(4)).split();
 
         producer.push(()).unwrap();
         assert_eq!(consumer.pop(), Some(()));
@@ -324,7 +274,7 @@ mod tests {
         let cap = Capacity::exact(128 * 1024 * 1024);
         let n = cap.get() as u64;
         let instant = std::time::Instant::now();
-        let (producer, _consumer) = RingBuffer::<u64>::new(cap).split();
+        let (producer, _consumer) = SplitRing::<u64>::new(cap).split();
 
         for i in 0..n {
             producer
@@ -336,7 +286,7 @@ mod tests {
 
     #[test]
     fn pop_empty_is_idempotent() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(1)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(1)).split();
         assert_eq!(consumer.pop(), None);
         assert!(consumer.is_empty());
         assert_eq!(consumer.len(), 0);
@@ -351,7 +301,7 @@ mod tests {
 
     #[test]
     fn length_invariants() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(2)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(2)).split();
         assert_eq!(producer.len(), 0);
         producer.push(1).unwrap();
         assert_eq!(producer.len(), 1);
@@ -367,7 +317,7 @@ mod tests {
 
     #[test]
     fn overwrite_oldest_element() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -386,7 +336,7 @@ mod tests {
 
     #[test]
     fn wraparound_behavior() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(4)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         assert_eq!(consumer.pop(), Some(1));
@@ -402,7 +352,7 @@ mod tests {
 
     #[test]
     fn fill_to_capacity() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
 
         for i in 0..16 {
             producer.push(i).unwrap();
@@ -421,7 +371,7 @@ mod tests {
 
     #[test]
     fn pop_empty_buffer() {
-        let (_, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
+        let (_, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
         assert_eq!(consumer.pop(), None);
         assert!(consumer.is_empty());
         assert_eq!(consumer.len(), 0);
@@ -429,7 +379,7 @@ mod tests {
 
     #[test]
     fn push_to_buffer() {
-        let (producer, mut consumer) = RingBuffer::<u8>::new(Capacity::exact(16)).split();
+        let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         producer.push(3).unwrap();
@@ -446,7 +396,7 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn multiple_producers_concurrent() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(1024)).split();
 
         let handles: Vec<_> = (0..10)
             .map(|thread_id| {
@@ -478,7 +428,7 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn dynamic_producer_creation() {
-        let (producer, mut consumer) = RingBuffer::<usize>::new(Capacity::exact(128)).split();
+        let (producer, mut consumer) = SplitRing::<usize>::new(Capacity::exact(128)).split();
 
         // Simulate dynamic producer creation (e.g., new connections)
         let mut handles = Vec::new();
@@ -507,7 +457,7 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn mpsc_stress_test() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::at_least(10000)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::at_least(10000)).split();
 
         let handles: Vec<_> = (0..4)
             .map(|thread_id| {
@@ -544,7 +494,7 @@ mod tests {
     #[test]
     fn drop_items_on_consumer_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, consumer) = SplitRing::new(Capacity::exact(4)).split();
 
         for _ in 0..4 {
             producer
@@ -563,7 +513,7 @@ mod tests {
     #[test]
     fn drop_items_on_pop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::new(Capacity::exact(4)).split();
 
         for _ in 0..3 {
             producer
@@ -588,7 +538,7 @@ mod tests {
     /// Exercise `get_unchecked` on every index by wrapping around multiple times.
     #[test]
     fn wraparound_exercises_all_slots() {
-        let (producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps = 12 push/pops, covering slot indices 0-3 three times
         for lap in 0..3u32 {
@@ -605,7 +555,7 @@ mod tests {
     /// Concurrent push/pop with a tiny buffer — Miri checks for data races.
     #[test]
     fn concurrent_data_race_check() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {
@@ -632,7 +582,7 @@ mod tests {
     /// Two producers, tiny buffer — checks tail + sequence synchronization.
     #[test]
     fn concurrent_mpsc_data_race_check() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         let n = 2u64;
 
         let p2 = producer.clone();
@@ -671,7 +621,7 @@ mod tests {
 
     #[test]
     fn reserve_write_commit_pop_ref_cycle() {
-        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
 
         let writer = producer.reserve().unwrap();
         writer.write(42).commit();
@@ -685,7 +635,7 @@ mod tests {
 
     #[test]
     fn reserve_slot_mut_commit() {
-        let (mut producer, mut consumer) = RingBuffer::<[u8; 64]>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<[u8; 64]>::new(Capacity::exact(4)).split();
 
         let mut writer = producer.reserve().unwrap();
         writer.slot_mut().write([0xAB; 64]);
@@ -699,7 +649,7 @@ mod tests {
 
     #[test]
     fn reserve_returns_none_when_full() {
-        let (mut producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (mut producer, _consumer) = SplitRing::<u64>::new(Capacity::exact(2)).split();
 
         let w1 = producer.reserve().unwrap();
         w1.write(1).commit();
@@ -712,13 +662,13 @@ mod tests {
 
     #[test]
     fn pop_ref_returns_none_when_empty() {
-        let (_producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (_producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         assert!(consumer.pop_ref().is_none());
     }
 
     #[test]
     fn pop_ref_returns_none_when_not_ready() {
-        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
 
         // Reserve but don't commit — slot is claimed but not ready
         let writer = producer.reserve().unwrap();
@@ -732,7 +682,7 @@ mod tests {
 
     #[test]
     fn mixed_push_reserve_pop_pop_ref() {
-        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8)).split();
 
         // Mix of push and reserve
         producer.push(1).unwrap();
@@ -752,7 +702,7 @@ mod tests {
     #[test]
     fn slot_reader_drops_value() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::new(Capacity::exact(4)).split();
 
         producer
             .push(DropCounter {
@@ -775,7 +725,7 @@ mod tests {
 
     #[test]
     fn reserve_pop_ref_wraparound() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         // 3 full laps via reserve/pop_ref
         for lap in 0..3u32 {
@@ -794,7 +744,7 @@ mod tests {
 
     #[test]
     fn reserve_drop_without_commit_tombstones() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         // Push a value, then reserve-and-drop (tombstone), then push again
         producer.push(1).unwrap();
@@ -817,8 +767,8 @@ mod tests {
     /// position 2^31 - 1, about two billion pushes in.
     #[test]
     fn a_value_at_the_former_sentinel_position_is_delivered() {
-        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
-        ring.ledger.start_at(usize::MAX / 2 - 1);
+        let mut ring = SplitRing::<u32>::new(Capacity::exact(4));
+        ring.0.ledger.start_at(usize::MAX / 2 - 1);
         let (producer, mut consumer) = ring.split();
 
         for value in 0..3 {
@@ -836,8 +786,8 @@ mod tests {
     /// in order, while the claim's position rolls over.
     #[test]
     fn a_full_ring_stays_full_while_the_claim_position_rolls_over() {
-        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
-        ring.ledger.start_at(u32::MAX as usize - 5);
+        let mut ring = SplitRing::<u32>::new(Capacity::exact(4));
+        ring.0.ledger.start_at(u32::MAX as usize - 5);
         let (producer, mut consumer) = ring.split();
 
         for value in 0..4 {
@@ -853,7 +803,7 @@ mod tests {
 
     #[test]
     fn reserve_drop_without_write_tombstones() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         producer.push(10).unwrap();
         {
@@ -871,7 +821,7 @@ mod tests {
     fn reserve_drop_does_not_leak() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (mut producer, _consumer) =
-            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+            SplitRing::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
 
         {
             let w = producer.reserve().unwrap();
@@ -893,13 +843,13 @@ mod tests {
 
     #[test]
     fn drain_empty_returns_zero() {
-        let (_producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (_producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         assert_eq!(consumer.drain(|_| unreachable!()), 0);
     }
 
     #[test]
     fn drain_all_available() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8)).split();
 
         for i in 0..5 {
             producer.push(i).unwrap();
@@ -914,7 +864,7 @@ mod tests {
 
     #[test]
     fn drain_up_to_limits() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8)).split();
 
         for i in 0..5 {
             producer.push(i).unwrap();
@@ -934,7 +884,7 @@ mod tests {
     #[test]
     fn drain_drops_values() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::new(Capacity::exact(4)).split();
 
         for _ in 0..3 {
             producer
@@ -951,7 +901,7 @@ mod tests {
 
     #[test]
     fn drain_skips_tombstones() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         producer.push(1).unwrap();
         {
@@ -973,7 +923,7 @@ mod tests {
     /// forever.
     #[test]
     fn tombstone_only_drain_releases_capacity() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(2)).split();
 
         for _ in 0..2 {
             drop(producer.reserve().expect("a slot is free"));
@@ -994,7 +944,7 @@ mod tests {
     /// and so never bounds the tombstone skipping.
     #[test]
     fn tombstone_only_drain_up_to_releases_capacity() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(2)).split();
 
         for _ in 0..2 {
             drop(producer.reserve().expect("a slot is free"));
@@ -1012,7 +962,7 @@ mod tests {
     /// the contract says block and deliver that value.
     #[test]
     fn pop_ref_block_skips_a_tombstone_and_waits_for_the_value() {
-        let (mut producer, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         drop(producer.reserve().expect("the empty ring has a slot"));
 
@@ -1039,7 +989,7 @@ mod tests {
     fn drain_callback_panic_does_not_double_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (producer, mut consumer) =
-            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+            SplitRing::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
 
         for _ in 0..4 {
             producer
@@ -1077,7 +1027,7 @@ mod tests {
     fn drain_up_to_callback_panic_does_not_double_drop() {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (producer, mut consumer) =
-            RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+            SplitRing::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
 
         for _ in 0..4 {
             producer
@@ -1125,7 +1075,7 @@ mod tests {
         }
 
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (producer, mut consumer) = RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<PanicOnDrop>::new(Capacity::exact(4)).split();
 
         assert!(producer
             .push(PanicOnDrop {
@@ -1173,7 +1123,7 @@ mod tests {
         }
 
         let (mut producer, mut consumer) =
-            RingBuffer::<PanicOnDrop>::new(Capacity::exact(4)).split();
+            SplitRing::<PanicOnDrop>::new(Capacity::exact(4)).split();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let writer = producer.reserve().unwrap();
@@ -1200,7 +1150,7 @@ mod tests {
     #[test]
     #[ignore = "too slow for Miri"]
     fn concurrent_drain() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(1024)).split();
         let total = 100_000u64;
         let num_producers = 4u64;
         let per_producer = total / num_producers;
@@ -1236,7 +1186,7 @@ mod tests {
 
     #[test]
     fn concurrent_reserve_pop_ref() {
-        let (mut producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         let n = 16u64;
 
         let handle = std::thread::spawn(move || {
@@ -1277,7 +1227,7 @@ mod tests {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
             let (mut producer, _consumer) =
-                RingBuffer::<DropCounter>::new(Capacity::exact(4)).split();
+                SplitRing::<DropCounter>::new(Capacity::exact(4)).split();
 
             producer
                 .push(DropCounter {
@@ -1322,7 +1272,7 @@ mod tests {
     /// Concurrent multi-producer + drain consumer at small N (Miri-tractable).
     #[test]
     fn concurrent_drain_small_n() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(8)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8)).split();
         let n_per = 4u64;
         let n_producers = 2u64;
 
@@ -1359,7 +1309,7 @@ mod tests {
     #[test]
     fn capacity_one_concurrent() {
         let n = 8u64;
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(1)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(1)).split();
 
         let h = std::thread::spawn(move || {
             for i in 0..n {
@@ -1387,7 +1337,7 @@ mod tests {
 
     #[test]
     fn pop_block_wakes_on_push() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         let h = std::thread::spawn(move || c.pop_block());
         std::thread::sleep(std::time::Duration::from_millis(50));
         p.push(7).unwrap();
@@ -1399,7 +1349,7 @@ mod tests {
     /// wake must reach whichever thread is parked *now*.
     #[test]
     fn pop_block_wakes_a_consumer_that_moved_threads() {
-        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
 
         let first = std::thread::spawn(move || {
             let mut c = c;
@@ -1430,7 +1380,7 @@ mod tests {
 
         const EXTRA: usize = 8;
         let n_producers = PARK_SLOTS + EXTRA;
-        let (p, mut c) = RingBuffer::<usize>::new(Capacity::exact(2)).split();
+        let (p, mut c) = SplitRing::<usize>::new(Capacity::exact(2)).split();
 
         let handles: Vec<_> = (0..n_producers)
             .map(|i| {
@@ -1461,7 +1411,7 @@ mod tests {
     fn park_slots_do_not_alias_after_churning_producers() {
         use crate::common::park::PARK_SLOTS;
 
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
 
@@ -1479,7 +1429,7 @@ mod tests {
 
     #[test]
     fn pop_block_returns_none_on_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         let h = std::thread::spawn(move || c.pop_block());
         std::thread::sleep(std::time::Duration::from_millis(50));
         drop(p);
@@ -1488,7 +1438,7 @@ mod tests {
 
     #[test]
     fn push_block_unblocks_on_pop() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         for i in 0..4 {
             p.push(i).unwrap();
         }
@@ -1506,7 +1456,7 @@ mod tests {
 
     #[test]
     fn push_block_returns_err_on_consumer_close() {
-        let (p, c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         for i in 0..4 {
             p.push(i).unwrap();
         }
@@ -1521,7 +1471,7 @@ mod tests {
 
     #[test]
     fn pop_block_drains_before_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
         drop(p);
@@ -1562,7 +1512,7 @@ mod tests {
         // N == CAP so the post-drain pushes all fit exactly.
         const N_PRODUCERS: u32 = 4;
 
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(CAP as usize)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(CAP as usize)).split();
         // Fill the ring so the next push from any producer must park.
         for i in 0..CAP {
             p.push(i).unwrap();
@@ -1631,9 +1581,9 @@ mod tests {
         fn parked_producer_is_woken(first_stands_down_first: bool) -> bool {
             use crate::common::staged_handoff::StagedHandoff;
 
-            let (first, mut consumer) = RingBuffer::<u32>::new(Capacity::exact(1)).split();
+            let (first, mut consumer) = SplitRing::<u32>::new(Capacity::exact(1)).split();
             let second = first.clone();
-            let ring = Arc::clone(&first.queue);
+            let ring = std::sync::Arc::clone(&first.queue);
             let handoff =
                 StagedHandoff::new(&ring.producer_park, first.park_slot, second.park_slot);
 
@@ -1730,7 +1680,7 @@ mod tests {
             use std::sync::{Arc, Barrier};
 
             let (producer, _consumer) =
-                RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+                SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
             let gate = Arc::new(Barrier::new(self.producers));
             let returned = Arc::new(AtomicUsize::new(0));
             let accepted = Arc::new(AtomicUsize::new(0));
@@ -1815,7 +1765,7 @@ mod tests {
 
     #[test]
     fn drain_block_drains_to_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(8)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(8)).split();
         let p2 = p.clone();
         let h = std::thread::spawn(move || {
             let mut got = Vec::new();
@@ -1841,7 +1791,7 @@ mod tests {
         // Two producers contending for a single slot. Each takes its
         // park slot; the consumer drains slowly. All values must
         // eventually arrive.
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(1)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(1)).split();
         let p2 = p.clone();
         let h1 = std::thread::spawn(move || {
             for i in 0..16u32 {
@@ -1875,7 +1825,7 @@ mod tests {
 
     #[test]
     fn reserve_block_unblocks_on_pop() {
-        let (mut p, mut c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (mut p, mut c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
         assert!(p.reserve().is_none());
@@ -1892,7 +1842,7 @@ mod tests {
 
     #[test]
     fn reserve_block_returns_none_on_consumer_close() {
-        let (mut p, c) = RingBuffer::<u32>::new(Capacity::exact(2)).split();
+        let (mut p, c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
         let h = std::thread::spawn(move || p.reserve_block().is_some());
@@ -1903,7 +1853,7 @@ mod tests {
 
     #[test]
     fn pop_ref_block_wakes_on_push() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         let h = std::thread::spawn(move || {
             let r = c.pop_ref_block().unwrap();
             *r
@@ -1915,7 +1865,7 @@ mod tests {
 
     #[test]
     fn pop_ref_block_returns_none_on_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         let h = std::thread::spawn(move || c.pop_ref_block().is_some());
         std::thread::sleep(std::time::Duration::from_millis(50));
         drop(p);
@@ -1924,7 +1874,7 @@ mod tests {
 
     #[test]
     fn pop_ref_block_drains_before_close() {
-        let (p, mut c) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+        let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
         p.push(1).unwrap();
         p.push(2).unwrap();
         drop(p);
@@ -1956,7 +1906,7 @@ mod tests {
             "mpsc async_push_pop_cross_thread",
         );
 
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         let n_producers: u64 = 4;
         let per_producer: u64 = 2_500;
         let total = n_producers * per_producer;
@@ -2035,10 +1985,10 @@ mod tests {
         }
 
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ring = RingBuffer::<crate::common::DropCounter>::new(Capacity::exact(4));
+        let ring = SplitRing::<crate::common::DropCounter>::new(Capacity::exact(4));
 
         let waker = PanicWaker::waker();
-        ring.consumer_waker.register(
+        ring.0.consumer_waker.register(
             crate::common::park_registry::ParkSlot::SOLE,
             &Context::from_waker(&waker),
         );
@@ -2096,10 +2046,10 @@ mod tests {
             }
         }
 
-        let ring = RingBuffer::<u64>::new(Capacity::exact(4));
+        let ring = SplitRing::<u64>::new(Capacity::exact(4));
 
         let waker = PanicWaker::waker();
-        ring.consumer_waker.register(
+        ring.0.consumer_waker.register(
             crate::common::park_registry::ParkSlot::SOLE,
             &Context::from_waker(&waker),
         );
@@ -2124,7 +2074,7 @@ mod tests {
     #[test]
     #[cfg(feature = "async")]
     fn async_push_pop_cross_thread_small() {
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(2)).split();
         let n_producers: u64 = 2;
         let per_producer: u64 = 3;
         let total = n_producers * per_producer;
@@ -2177,7 +2127,7 @@ mod tests {
     #[cfg(feature = "async")]
     fn async_pop_returns_none_on_close() {
         // Producer drops without pushing; pop_async should resolve to None.
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(4)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -2196,7 +2146,7 @@ mod tests {
     #[cfg(feature = "async")]
     fn async_push_returns_err_on_consumer_close() {
         // Consumer drops; a parked async push should resolve to Err(val).
-        let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(2)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
         let h = std::thread::spawn(move || {
@@ -2238,7 +2188,7 @@ mod tests {
             fn wake(self: Arc<Self>) {}
         }
 
-        let ring = RingBuffer::<u64>::new(Capacity::exact(2));
+        let ring = SplitRing::<u64>::new(Capacity::exact(2));
         let (producer, _consumer) = ring.split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
@@ -2278,7 +2228,7 @@ mod tests {
         use std::rc::Rc;
         use std::time::{Duration, Instant};
 
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(2)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(2)).split();
         producer.push(1).unwrap();
         producer.push(2).unwrap();
 
@@ -2331,7 +2281,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_push_pop() {
-        let mut ring = RingBuffer::<u32>::new(Capacity::exact(4));
+        let mut ring = SplitRing::<u32>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(1).unwrap();
@@ -2344,7 +2294,7 @@ mod tests {
     #[test]
     fn borrowed_split_non_static_lifetime() {
         let wire_buf = [10u8, 20, 30, 40];
-        let mut ring = RingBuffer::<&[u8]>::new(Capacity::exact(4));
+        let mut ring = SplitRing::<&[u8]>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
 
         producer.push(&wire_buf[0..2]).unwrap();
@@ -2356,7 +2306,7 @@ mod tests {
 
     #[test]
     fn borrowed_split_multiple_producers() {
-        let mut ring = RingBuffer::<u32>::new(Capacity::exact(8));
+        let mut ring = SplitRing::<u32>::new(Capacity::exact(8));
         let (p1, mut consumer) = ring.split_borrowed();
         let p2 = p1.new_producer();
 
@@ -2399,7 +2349,7 @@ mod tests {
         }
 
         let wire = vec![0xBB; 128];
-        let mut ring = RingBuffer::<Req<'_>>::new(Capacity::exact(4));
+        let mut ring = SplitRing::<Req<'_>>::new(Capacity::exact(4));
         let (producer, mut consumer) = ring.split_borrowed();
         let wire_ref = &wire;
 

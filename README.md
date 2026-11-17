@@ -51,10 +51,10 @@ quetzalcoatl = { version = "0.15", features = ["async"] }
 ### SPSC (single producer, single consumer)
 
 ```rust
-use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::spsc::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 
-let (producer, mut consumer) = RingBuffer::new(Capacity::exact(64)).split();
+let (producer, mut consumer) = SplitRing::new(Capacity::exact(64)).split();
 
 producer.push(42u64).unwrap();
 producer.push(43).unwrap();
@@ -67,11 +67,11 @@ assert_eq!(consumer.pop(), None);
 ### MPSC (multiple producers, single consumer)
 
 ```rust
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
-let (producer, mut consumer) = RingBuffer::new(Capacity::at_least(1000)).split();
+let (producer, mut consumer) = SplitRing::new(Capacity::at_least(1000)).split();
 
 let handles: Vec<_> = (0..4)
     .map(|id| {
@@ -103,11 +103,11 @@ One producer pushes items; multiple consumers compete to pop them.
 Each item is consumed by exactly one consumer — ideal for work distribution.
 
 ```rust
-use quetzalcoatl::spmc::RingBuffer;
+use quetzalcoatl::spmc::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
-let (producer, consumer) = RingBuffer::new(Capacity::exact(64)).split();
+let (producer, consumer) = SplitRing::new(Capacity::exact(64)).split();
 
 let handles: Vec<_> = (0..4)
     .map(|_| {
@@ -141,11 +141,11 @@ push order, and there is no FIFO guarantee across producers. Trade
 strict ordering for throughput when the workload allows.
 
 ```rust
-use quetzalcoatl::mpmc::RingBuffer;
+use quetzalcoatl::mpmc::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
-let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(1024)).split();
+let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(1024)).split();
 
 // Cloneable producer + consumer handles for fan-in / fan-out.
 let producers: Vec<_> = (0..4)
@@ -197,11 +197,11 @@ chosen for `cap=1024` and balanced (P, Q) workloads; tune via the
 inline helper:
 
 ```rust
-use quetzalcoatl::mpmc::{Cfg, RingBuffer};
+use quetzalcoatl::mpmc::{Cfg, SplitRing};
 use quetzalcoatl::capacity::Capacity;
 
 // PRODUCER_BATCH=16, CAS_FAIL_SKIP=64, CONSUMED_FLUSH=32
-let (p, c) = RingBuffer::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(256)).split();
+let (p, c) = SplitRing::<u64, Cfg<16, 64, 32>>::new(Capacity::exact(256)).split();
 # drop((p, c));
 ```
 
@@ -225,11 +225,11 @@ for details.
 Every consumer sees every item published after it subscribes.
 
 ```rust
-use quetzalcoatl::broadcast::RingBuffer;
+use quetzalcoatl::broadcast::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 
 // Second argument is the maximum number of concurrent consumers.
-let (producer, mut c1) = RingBuffer::new(Capacity::exact(64), 4).split();
+let (producer, mut c1) = SplitRing::new(Capacity::exact(64), 4).split();
 let mut c2 = c1.clone(); // starts reading from current position
 
 producer.push(10u64).unwrap();
@@ -266,10 +266,10 @@ All five variants support a zero-copy path using a **typestate pattern**
 that enforces correctness at compile time:
 
 ```rust
-use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::spsc::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 
-let (mut producer, mut consumer) = RingBuffer::<[u8; 4096]>::new(Capacity::exact(4)).split();
+let (mut producer, mut consumer) = SplitRing::<[u8; 4096]>::new(Capacity::exact(4)).split();
 
 // Producer: reserve a slot, write into it, commit
 let writer = producer.reserve().unwrap();   // SlotWriter (no data yet)

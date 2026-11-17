@@ -68,10 +68,10 @@ fn shard_cap(total: usize, n_rings: usize) -> Capacity {
 // ---------------------------------------------------------------------------
 
 fn run_mpmc(p: usize, q: usize) {
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
 
     let total_items = (p as u64) * ITEMS_PER_PRODUCER;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumers: Vec<_> = (0..q)
@@ -125,8 +125,8 @@ fn run_mpmc(p: usize, q: usize) {
 // ---------------------------------------------------------------------------
 
 fn run_n_spmc(p: usize, q: usize, slow: bool) {
-    use quetzalcoatl::spmc::RingBuffer as SpmcRing;
-    use quetzalcoatl::spsc::RingBuffer as SpscRing;
+    use quetzalcoatl::spmc::SplitRing as SpmcRing;
+    use quetzalcoatl::spsc::SplitRing as SpscRing;
 
     let total_items = (p as u64) * ITEMS_PER_PRODUCER;
     let cap = shard_cap(TOTAL_CAPACITY, p + q);
@@ -324,7 +324,7 @@ impl LargeStruct {
 
 mod large_struct_mpmc {
     use super::*;
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
 
     const TOTAL_ITEMS: u64 = 10_000;
 
@@ -334,7 +334,7 @@ mod large_struct_mpmc {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..TOTAL_ITEMS {
@@ -362,7 +362,7 @@ mod large_struct_mpmc {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (mut producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..TOTAL_ITEMS {
@@ -400,7 +400,7 @@ mod large_struct_mpmc {
 
 mod blocking_mpmc {
     use super::*;
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
 
     const P_COUNT: u64 = 2;
     const Q_COUNT: usize = 2;
@@ -412,7 +412,7 @@ mod blocking_mpmc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
                 let received = Arc::new(AtomicUsize::new(0));
 
                 let consumers: Vec<_> = (0..Q_COUNT)
@@ -461,7 +461,7 @@ mod blocking_mpmc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
 
                 let consumers: Vec<_> = (0..Q_COUNT)
                     .map(|_| {
@@ -509,7 +509,7 @@ mod blocking_mpmc {
 
 mod large_struct_mpmc_zero_copy_blocking {
     use super::*;
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
 
     const P_COUNT: u64 = 2;
     const Q_COUNT: usize = 2;
@@ -522,7 +522,7 @@ mod large_struct_mpmc_zero_copy_blocking {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(16)).split();
 
                 let consumers: Vec<_> = (0..Q_COUNT)
                     .map(|_| {
@@ -581,10 +581,10 @@ fn run_async_mpmc(
     per_p: u64,
     consumer_work: fn(u64) -> u64,
 ) {
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
 
     let total_items = p_count * per_p;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumer_threads: Vec<_> = (0..c_count)

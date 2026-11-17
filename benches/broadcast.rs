@@ -1,6 +1,6 @@
 use divan::black_box;
 use quetzalcoatl::broadcast::arc::ArcRingBuffer;
-use quetzalcoatl::broadcast::RingBuffer;
+use quetzalcoatl::broadcast::SplitRing;
 use quetzalcoatl::capacity::Capacity;
 use std::thread;
 
@@ -40,7 +40,7 @@ mod consumer_scaling {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, consumer) =
-                    RingBuffer::<u64>::new(Capacity::exact(4096), num_consumers + 1).split();
+                    SplitRing::<u64>::new(Capacity::exact(4096), num_consumers + 1).split();
                 let mut consumers: Vec<_> =
                     (0..num_consumers - 1).map(|_| consumer.clone()).collect();
                 consumers.push(consumer);
@@ -93,7 +93,7 @@ mod producer_scaling {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(4096), 4).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(4096), 4).split();
                 let mut c2 = consumer.clone();
                 let mut c1 = consumer;
 
@@ -154,7 +154,7 @@ mod blocking_push {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(8), 4).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(8), 4).split();
                 let mut c2 = consumer.clone();
                 let mut c1 = consumer;
 
@@ -212,7 +212,7 @@ mod large_struct {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), 4).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256), 4).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..TOTAL_ITEMS {
@@ -241,7 +241,7 @@ mod large_struct {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (mut producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), 4).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256), 4).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..TOTAL_ITEMS {
@@ -286,7 +286,7 @@ mod arc_large_struct {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256), NUM_CONSUMERS + 1).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256), NUM_CONSUMERS + 1).split();
                 let mut consumers: Vec<_> =
                     (0..NUM_CONSUMERS - 1).map(|_| consumer.clone()).collect();
                 consumers.push(consumer);
@@ -435,7 +435,7 @@ mod async_broadcast {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench(|| {
                 let (producer, c1) =
-                    RingBuffer::<u64>::new(Capacity::exact(cap), N_CONSUMERS + 1).split();
+                    SplitRing::<u64>::new(Capacity::exact(cap), N_CONSUMERS + 1).split();
                 let mut consumers: Vec<_> = (0..N_CONSUMERS - 1).map(|_| c1.clone()).collect();
                 consumers.push(c1);
 

@@ -18,7 +18,7 @@ impl SpscWorkload {
     pub fn quetzalcoatl_spin(&self) {
         let total = self.total_items;
         let (producer, mut consumer) =
-            quetzalcoatl::spsc::RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            quetzalcoatl::spsc::SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
 
         let ph = thread::spawn(move || {
             for i in 0..total {
@@ -43,7 +43,7 @@ impl SpscWorkload {
     pub fn quetzalcoatl_block(&self) {
         let total = self.total_items;
         let (producer, mut consumer) =
-            quetzalcoatl::spsc::RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            quetzalcoatl::spsc::SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
 
         let ph = thread::spawn(move || {
             for i in 0..total {

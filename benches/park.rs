@@ -260,9 +260,9 @@ mod ping_pong {
     #[divan::bench]
     fn crate_spsc(bencher: Bencher) {
         let (to_peer, mut from_main) =
-            quetzalcoatl::spsc::RingBuffer::<u64>::new(Capacity::exact(2)).split();
+            quetzalcoatl::spsc::SplitRing::<u64>::new(Capacity::exact(2)).split();
         let (to_main, mut from_peer) =
-            quetzalcoatl::spsc::RingBuffer::<u64>::new(Capacity::exact(2)).split();
+            quetzalcoatl::spsc::SplitRing::<u64>::new(Capacity::exact(2)).split();
         thread::scope(|scope| {
             scope.spawn(move || {
                 while let Some(value) = from_main.pop_block() {

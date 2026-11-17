@@ -13,10 +13,11 @@ use super::RingBuffer;
 /// its stale head holds `min_head` down so the producer cannot reclaim
 /// the capacity either.
 ///
-/// Advancing anyway is what [`SlotReader`](super::SlotReader) already
-/// does — its `Drop` advances whether or not the borrower panicked —
-/// and it costs nothing here, because a broadcast consumer never owns
-/// the value: the producer drops it when the slot is overwritten.
+/// Advancing anyway is what [`SlotReader`](super::SlotReader) does — it
+/// holds one of these, so it advances whether or not the borrower
+/// panicked — and it costs nothing here, because a broadcast consumer
+/// never owns the value: the producer drops it when the slot is
+/// overwritten.
 pub(super) struct HeadAdvance<'a, T> {
     queue: &'a RingBuffer<T>,
     slot_index: usize,

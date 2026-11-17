@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING: handles are minted by a `SplitRing` in each flavor.**
+  `RingBuffer::new(cap).split()` becomes `SplitRing::new(cap).split()`
+  in `spsc`, `mpsc`, `spmc`, `mpmc` and `broadcast`, and `split_borrowed`
+  moves with it. `RingBuffer` is now only the state the handles share
+  and no longer names them, which removes the ring ↔ handle dependency
+  cycle.
+- **BREAKING: `spsc::RingBuffer::{producer_from_raw, consumer_from_raw}`
+  are now `spsc::Producer::from_raw` and `spsc::Consumer::from_raw`.**
+  Same safety contract.
+- **BREAKING: `SlotReader` no longer holds the consumer.** In `spsc`,
+  `mpsc` and `spmc` it lost its `R` parameter and holds `&RingBuffer<T>`;
+  in `mpmc` it holds `&RingBuffer<T, C>`; in `broadcast` it holds the
+  head-advance guard. The reader's lifetime is still the `&mut Consumer`
+  borrow `pop_ref` took, so the consumer stays exclusively borrowed
+  while a reader is alive.
+- **`mpmc::SlotWriter` and `WrittenSlot` hold the ring and the
+  producer's `batch_unused` cell** instead of `&Producer`. Same borrow:
+  `reserve` still takes `&mut self`.
 - **MSRV is now 1.100.** `AlignedBuf` is built on the now-stable
   `Allocator` API: a `CacheLineAlloc` raises every block to 64-byte
   alignment, and the buffer is a `Box<[T], CacheLineAlloc>`. The

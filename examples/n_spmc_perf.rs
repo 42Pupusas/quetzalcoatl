@@ -5,8 +5,8 @@
 // Mirror of mpmc_perf for direct cycles/IPC/cache-miss comparison.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spmc::RingBuffer as SpmcRing;
-use quetzalcoatl::spsc::RingBuffer as SpscRing;
+use quetzalcoatl::spmc::SplitRing as SpmcRing;
+use quetzalcoatl::spsc::SplitRing as SpscRing;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

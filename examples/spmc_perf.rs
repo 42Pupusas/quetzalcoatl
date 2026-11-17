@@ -7,7 +7,7 @@
 // Otherwise spawns N consumer threads racing on pop().
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spmc::RingBuffer;
+use quetzalcoatl::spmc::SplitRing;
 use std::hint::black_box;
 use std::thread;
 
@@ -22,14 +22,14 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .expect("usage: spmc_perf <num_consumers> <total_items>");
 
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(8192)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(8192)).split();
 
     let start;
 
     if num_consumers == 0 {
         drop(consumer);
         // Fresh ring so we own both ends on this thread.
-        let (p, c) = RingBuffer::<u64>::new(Capacity::exact(8192)).split();
+        let (p, c) = SplitRing::<u64>::new(Capacity::exact(8192)).split();
         start = std::time::Instant::now();
         for i in 0..total_items {
             while p.push(black_box(i)).is_err() {

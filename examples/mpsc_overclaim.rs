@@ -1,5 +1,5 @@
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ impl OverclaimProbe {
     }
 
     fn run(&self) -> ProbeOutcome {
-        let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+        let (producer, _consumer) = SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
         let gate = Arc::new(Barrier::new(self.producers));
         let returned = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::new(AtomicUsize::new(0));

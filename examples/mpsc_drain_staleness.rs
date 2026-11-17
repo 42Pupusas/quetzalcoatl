@@ -12,7 +12,7 @@
 // Usage: mpsc_drain_staleness <producers> <per_producer> <iters>
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::hint::black_box;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -171,7 +171,7 @@ impl Probe {
         let per = self.per_producer;
         let start = Instant::now();
 
-        let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::at_least(self.cap)).split();
+        let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::at_least(self.cap)).split();
 
         let handles: Vec<_> = (0..self.producers)
             .map(|_| {

@@ -28,11 +28,11 @@ const TOTAL_CAPACITY: usize = 1024;
 const FLUSH_EVERY: usize = 64;
 
 fn run_mpmc(p: usize, q: usize, total_items: u64) -> std::time::Duration {
-    use quetzalcoatl::mpmc::RingBuffer;
+    use quetzalcoatl::mpmc::SplitRing;
     let per = total_items / p as u64;
     let actual = per * p as u64;
     let target = actual as usize;
-    let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
+    let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(TOTAL_CAPACITY)).split();
     let received = Arc::new(AtomicUsize::new(0));
 
     let consumers: Vec<_> = (0..q)
@@ -96,8 +96,8 @@ fn shard_cap(total: usize, n_rings: usize) -> Capacity {
 }
 
 fn run_n_spmc(p: usize, q: usize, total_items: u64) -> std::time::Duration {
-    use quetzalcoatl::spmc::RingBuffer as SpmcRing;
-    use quetzalcoatl::spsc::RingBuffer as SpscRing;
+    use quetzalcoatl::spmc::SplitRing as SpmcRing;
+    use quetzalcoatl::spsc::SplitRing as SpscRing;
     let per = total_items / p as u64;
     let actual = per * p as u64;
     let target = actual as usize;

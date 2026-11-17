@@ -25,7 +25,7 @@ impl MpscWorkload {
         let per_producer = self.items_per_producer;
         let total = self.total_items();
         let (producer, mut consumer) =
-            quetzalcoatl::mpsc::RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            quetzalcoatl::mpsc::SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
 
         let handles: Vec<_> = (0..self.num_producers)
             .map(|_| {
@@ -59,7 +59,7 @@ impl MpscWorkload {
         let per_producer = self.items_per_producer;
         let total = self.total_items();
         let (producer, mut consumer) =
-            quetzalcoatl::mpsc::RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            quetzalcoatl::mpsc::SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
 
         let handles: Vec<_> = (0..self.num_producers)
             .map(|_| {

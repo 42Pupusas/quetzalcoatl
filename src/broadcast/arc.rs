@@ -9,21 +9,21 @@ use std::sync::Arc;
 
 use crate::capacity::Capacity;
 
-use super::RingBuffer;
+use super::SplitRing;
 
 /// Creates an Arc-wrapped broadcast ring buffer.
 ///
-/// Equivalent to [`RingBuffer<Arc<T>>`] with ergonomic wrappers:
+/// Equivalent to [`SplitRing<Arc<T>>`] with ergonomic wrappers:
 /// the producer accepts `T` directly (wraps in `Arc` internally),
 /// and consumers receive `Arc<T>` (cheap refcount clone).
 ///
 /// # When to use
 ///
-/// Use this instead of plain [`RingBuffer`] when `T` is large and
+/// Use this instead of plain [`SplitRing`] when `T` is large and
 /// cloning is expensive. The trade-off is one heap allocation per
 /// push (for the `Arc`), but every consumer pop becomes O(1)
 /// regardless of `T`'s size.
-pub struct ArcRingBuffer<T>(RingBuffer<Arc<T>>);
+pub struct ArcRingBuffer<T>(SplitRing<Arc<T>>);
 
 impl<T> ArcRingBuffer<T> {
     /// Creates a new Arc-wrapped broadcast ring buffer.
@@ -33,7 +33,7 @@ impl<T> ArcRingBuffer<T> {
     /// Panics if `max_consumers` is 0.
     #[must_use]
     pub fn new(capacity: Capacity, max_consumers: usize) -> Self {
-        Self(RingBuffer::new(capacity, max_consumers))
+        Self(SplitRing::new(capacity, max_consumers))
     }
 
     /// Splits into a producer and the first consumer.

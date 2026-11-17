@@ -4,7 +4,7 @@
 //! scenarios like network servers where connections arrive over time.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::thread;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ fn main() {
     println!("Simulating a server with dynamic client connections\n");
 
     // Create a ring buffer for messages
-    let (producer, mut consumer) = RingBuffer::new(Capacity::at_least(100)).split();
+    let (producer, mut consumer) = SplitRing::new(Capacity::at_least(100)).split();
 
     // Simulate connections arriving over time
     let connection_handles: Vec<_> = (0..10)

@@ -1,6 +1,6 @@
 use divan::black_box;
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::thread;
 
 fn main() {
@@ -49,8 +49,7 @@ mod mpsc_scaling {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) =
-                    RingBuffer::<u64>::new(Capacity::exact(8192)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8192)).split();
 
                 let handles: Vec<_> = (0..num_producers)
                     .map(|_| {
@@ -98,7 +97,7 @@ mod contention {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
 
                 let handles: Vec<_> = (0..NUM_PRODUCERS)
                     .map(|_| {
@@ -146,7 +145,7 @@ mod large_struct_mpsc {
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let handles: Vec<_> = (0..num_producers)
                     .map(|p| {
@@ -197,7 +196,7 @@ mod large_struct_mpsc_zero_copy {
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let handles: Vec<_> = (0..num_producers)
                     .map(|p| {
@@ -253,7 +252,7 @@ mod blocking_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
                 let producers: Vec<_> = (0..P_COUNT)
                     .map(|tid| {
                         let p = producer.clone();
@@ -288,7 +287,7 @@ mod blocking_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
                 let producers: Vec<_> = (0..P_COUNT)
                     .map(|tid| {
                         let p = producer.clone();
@@ -335,7 +334,7 @@ mod large_struct_mpsc_zero_copy_blocking {
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(16)).split();
                 let producers: Vec<_> = (0..P_COUNT)
                     .map(|_| {
                         let p = producer.clone();
@@ -446,7 +445,7 @@ mod async_mpsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
                 for tx in &p_txs {
                     tx.send(producer.clone()).unwrap();
                 }

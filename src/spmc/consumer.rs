@@ -20,8 +20,9 @@ use crate::common::park_registry::ParkSlot;
 /// The consumer side of an SPMC ring buffer.
 ///
 /// Generic over `R`: the ring reference. Defaults to `Arc<RingBuffer<T>>`
-/// (owned split via [`RingBuffer::split`]). When `R = &'a RingBuffer<T>`
-/// (borrowed split via [`RingBuffer::split_borrowed`]), `T` may carry
+/// (owned split via [`SplitRing::split`](super::SplitRing::split)). When
+/// `R = &'a RingBuffer<T>` (borrowed split via
+/// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)), `T` may carry
 /// lifetimes shorter than `'static`.
 ///
 /// Cloneable when `R = Arc<RingBuffer<T>>`. For borrowed consumers, create
@@ -63,7 +64,7 @@ impl<'a, T> Consumer<T, &'a RingBuffer<T>> {
     /// cursors.
     ///
     /// This hangs off the consumer rather than the ring because
-    /// [`RingBuffer::split_borrowed`](super::RingBuffer::split_borrowed)
+    /// [`SplitRing::split_borrowed`](super::SplitRing::split_borrowed)
     /// takes `&mut self`: while these handles are alive the ring is
     /// mutably borrowed and cannot be borrowed again. An existing handle
     /// already holds the shared reference, so it can hand out siblings
@@ -332,7 +333,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// Returns a zero-copy read reference to the next item in the buffer.
     #[inline]
     #[must_use]
-    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref(&mut self) -> Option<SlotReader<'_, T>> {
         let claimed = self.claim_detached()?;
         Some(self.reader_for(claimed))
     }
@@ -356,9 +357,8 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     /// Wraps an already-claimed position in its reader.
     #[inline]
-    fn reader_for(&mut self, claimed: ClaimedSlot<T>) -> SlotReader<'_, T, R> {
-        let capacity = self.ring().capacity;
-        claimed.into_reader(self, capacity)
+    fn reader_for(&self, claimed: ClaimedSlot<T>) -> SlotReader<'_, T> {
+        claimed.into_reader(self.ring())
     }
 
     /// Returns a zero-copy read reference, blocking when empty.
@@ -370,7 +370,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     /// open, non-empty ring. A lost claim is contention, not emptiness:
     /// the loop restarts.
     #[must_use]
-    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T, R>> {
+    pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
@@ -478,34 +478,34 @@ struct ClaimedSlot<T> {
 }
 
 impl<T> ClaimedSlot<T> {
-    /// Hands the claim to the consumer that made it, as the reader that
+    /// Hands the claim to the ring it was made on, as the reader that
     /// will release it on drop.
     #[inline]
-    const fn into_reader<R: Deref<Target = RingBuffer<T>>>(
-        self,
-        consumer: &mut Consumer<T, R>,
-        capacity: Capacity,
-    ) -> SlotReader<'_, T, R> {
+    const fn into_reader(self, ring: &RingBuffer<T>) -> SlotReader<'_, T> {
         SlotReader {
             data_ptr: self.data_ptr,
             done_ptr: self.done_ptr,
             head: self.head,
-            capacity,
-            consumer,
+            capacity: ring.capacity,
+            ring,
         }
     }
 }
 
 /// A zero-copy read reference to an item in the ring buffer.
-pub struct SlotReader<'a, T, R: Deref<Target = RingBuffer<T>> = Arc<RingBuffer<T>>> {
+///
+/// The reader holds the ring, not the consumer. Its lifetime is the
+/// `&mut Consumer` borrow `pop_ref` took, so the consumer cannot be
+/// used while a reader is alive.
+pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
     done_ptr: *const DoneWord,
     head: usize,
     capacity: Capacity,
-    consumer: &'a mut Consumer<T, R>,
+    ring: &'a RingBuffer<T>,
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, R> {
+impl<T> std::ops::Deref for SlotReader<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: The consumer claimed this published position.
@@ -513,21 +513,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> std::ops::Deref for SlotReader<'_, T, 
     }
 }
 
-impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
+impl<T> Drop for SlotReader<'_, T> {
     fn drop(&mut self) {
         // Armed before the destructor runs: a panicking `T::drop` would
         // otherwise unwind past the release and lose the position for
         // the life of the ring.
-        // SAFETY: `done_ptr` names the slot at `head`, in a ring the
-        // consumer's borrow keeps alive.
-        let _release = unsafe {
-            SlotRelease::new(
-                self.consumer.ring(),
-                self.done_ptr,
-                self.head,
-                self.capacity,
-            )
-        };
+        // SAFETY: `done_ptr` names the slot at `head`, in the ring this
+        // reader borrows.
+        let _release =
+            unsafe { SlotRelease::new(self.ring, self.done_ptr, self.head, self.capacity) };
         // SAFETY: the consumer claimed this published position, so the
         // value is initialized and owned by this reader.
         unsafe {
@@ -538,9 +532,10 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for SlotReader<'_, T, R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arc, RingBuffer};
+    use super::Arc;
     use crate::capacity::Capacity;
     use crate::common::staged_handoff::StagedHandoff;
+    use crate::spmc::SplitRing;
 
     /// An empty ring of four, one producer and two consumers. The
     /// first consumer runs the real `pop_block`, held open between its
@@ -558,7 +553,7 @@ mod tests {
         /// consumer's stand-down before the second publish; without
         /// it the publish falls in the window.
         fn parked_consumer_is_woken(first_stands_down_first: bool) -> bool {
-            let (producer, first) = RingBuffer::<u32>::new(Capacity::exact(4)).split();
+            let (producer, first) = SplitRing::<u32>::new(Capacity::exact(4)).split();
             let second = first.clone();
             let ring = Arc::clone(&first.queue);
             let handoff =

@@ -23,7 +23,7 @@
 // Usage: mpsc_hot <solo|pair|multi> <items> [producers] [capacity] [qz|crossbeam]
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::RingBuffer;
+use quetzalcoatl::mpsc::SplitRing;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -125,7 +125,7 @@ impl Config {
     // No peer thread exists, so no line ever leaves this core.
     fn run_solo(&self) -> Report {
         let (producer, mut consumer) =
-            RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
 
         let start = Instant::now();
         for i in 0..self.items {
@@ -213,7 +213,7 @@ impl Config {
         let total = per_producer * producers as u64;
 
         let (producer, mut consumer) =
-            RingBuffer::<u64>::new(Capacity::exact(self.capacity)).split();
+            SplitRing::<u64>::new(Capacity::exact(self.capacity)).split();
         let go = Arc::new(AtomicBool::new(false));
 
         let handles: Vec<_> = (0..producers)

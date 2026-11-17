@@ -16,7 +16,7 @@ use crate::common::SlotSnapshot;
 
 /// The consumer side of a broadcast ring buffer.
 ///
-/// Obtained via [`RingBuffer::split`](super::RingBuffer::split) or by
+/// Obtained via [`SplitRing::split`](super::SplitRing::split) or by
 /// cloning an existing consumer. Each clone starts reading from the
 /// current tail (only future items).
 ///
@@ -185,8 +185,7 @@ impl<T> Consumer<T> {
         let (head, data_ptr) = self.settle()?;
         Some(SlotReader {
             data_ptr,
-            consumer: self,
-            head,
+            _advance: HeadAdvance::new(&self.queue, self.slot_index, head),
         })
     }
 
@@ -210,8 +209,6 @@ impl<T> Consumer<T> {
     }
 }
 
-/// A zero-copy read reference to an item in the broadcast ring buffer.
-///
 #[cfg(feature = "async")]
 impl<T> ParkSite for Consumer<T> {
     fn park_set(&mut self) -> &WakerSet {
@@ -219,16 +216,21 @@ impl<T> ParkSite for Consumer<T> {
     }
 }
 
+/// A zero-copy read reference to an item in the broadcast ring buffer.
+///
 /// Obtained via [`Consumer::pop_ref`]. Dereferences to `&T`, allowing
 /// direct reads from the slot without cloning.
 ///
 /// When dropped, advances the consumer's head pointer. Does **not** drop
 /// the `T` value — other consumers may still need it. The producer drops
 /// old values when overwriting slots.
+///
+/// The reader holds the advance obligation, not the consumer. Its
+/// lifetime is the `&mut Consumer` borrow `pop_ref` took, so the
+/// consumer cannot be used while a reader is alive.
 pub struct SlotReader<'a, T> {
     data_ptr: *const MaybeUninit<T>,
-    consumer: &'a mut Consumer<T>,
-    head: usize,
+    _advance: HeadAdvance<'a, T>,
 }
 
 impl<T> std::ops::Deref for SlotReader<'_, T> {
@@ -238,13 +240,5 @@ impl<T> std::ops::Deref for SlotReader<'_, T> {
         // The data is initialized and won't be overwritten while we hold a reference
         // (this consumer's head hasn't advanced, blocking the producer via min_head).
         unsafe { (*self.data_ptr).assume_init_ref() }
-    }
-}
-
-impl<T> Drop for SlotReader<'_, T> {
-    fn drop(&mut self) {
-        // Do NOT drop the T value — other consumers may still need it.
-        // Just advance this consumer's head.
-        self.consumer.advance_head(self.head);
     }
 }

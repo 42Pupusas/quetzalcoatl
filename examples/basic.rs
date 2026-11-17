@@ -4,11 +4,11 @@
 //! and one consumer thread.
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::spsc::SplitRing;
 
 fn main() {
     // Create a ring buffer with capacity for 16 items (power of two)
-    let (producer, mut consumer) = RingBuffer::new(Capacity::exact(16)).split();
+    let (producer, mut consumer) = SplitRing::new(Capacity::exact(16)).split();
 
     println!("=== Basic SPSC Example ===\n");
 

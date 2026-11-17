@@ -47,7 +47,7 @@ mod fanin {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
                 )
                 .split();
@@ -87,7 +87,7 @@ mod fanin {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::at_least(mpsc_cap),
                 )
                 .split();
@@ -133,7 +133,7 @@ mod fanin {
                 let mut producer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
                 for _ in 0..num_producers {
-                    let (producer, consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                    let (producer, consumer) = quetzalcoatl::spsc::SplitRing::<u64>::new(
                         quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
                     )
                     .split();
@@ -179,7 +179,7 @@ mod fanin {
                 let mut producer_handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
                 for _ in 0..num_producers {
-                    let (producer, consumer) = quetzalcoatl::spsc::RingBuffer::<u64>::new(
+                    let (producer, consumer) = quetzalcoatl::spsc::SplitRing::<u64>::new(
                         quetzalcoatl::capacity::Capacity::exact(PER_RING_CAP),
                     )
                     .split();
@@ -353,7 +353,7 @@ mod fanin_capacity {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::exact(cap),
                 )
                 .split();
@@ -403,7 +403,7 @@ mod drain_strategy {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::at_least(cap),
                 )
                 .split();
@@ -442,7 +442,7 @@ mod drain_strategy {
         bencher
             .counter(divan::counter::ItemsCount::new(TOTAL_ITEMS))
             .bench_local(|| {
-                let (producer, mut consumer) = quetzalcoatl::mpsc::RingBuffer::<u64>::new(
+                let (producer, mut consumer) = quetzalcoatl::mpsc::SplitRing::<u64>::new(
                     quetzalcoatl::capacity::Capacity::at_least(cap),
                 )
                 .split();

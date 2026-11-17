@@ -303,7 +303,8 @@ impl<T, C: Config> Producer<T, C> {
     pub fn reserve(&mut self) -> Option<SlotWriter<'_, T, C>> {
         let (bit, pos) = self.acquire_slot()?;
         Some(SlotWriter {
-            producer: self,
+            queue: &self.queue,
+            unused: &self.batch_unused,
             pos,
             bit,
         })
@@ -506,15 +507,20 @@ impl<T, C: Config> Drop for Producer<T, C> {
 /// silently rolled back: the slot's bit is restored to the producer's
 /// `batch_unused` bitmap, so a subsequent `push` or `reserve` from
 /// the same producer can reuse it without claiming a new batch.
+///
+/// The writer holds the ring and the producer's `batch_unused` cell,
+/// not the producer. Its lifetime is the `&mut Producer` borrow
+/// `reserve` took.
 pub struct SlotWriter<'a, T, C: Config = DefaultConfig> {
-    producer: &'a Producer<T, C>,
+    queue: &'a RingBuffer<T, C>,
+    unused: &'a Cell<u32>,
     pos: usize,
     bit: u32,
 }
 
-// SAFETY: SlotWriter borrows the producer mutably (via &mut self in
-// reserve), so it has exclusive access to that producer's batch state
-// and to the slot's data via the position bit.
+// SAFETY: SlotWriter's lifetime is the `&mut self` borrow of `reserve`,
+// so it has exclusive access to that producer's batch state and to the
+// slot's data via the position bit.
 unsafe impl<T: Send, C: Config> Send for SlotWriter<'_, T, C> {}
 
 impl<'a, T, C: Config> SlotWriter<'a, T, C> {
@@ -531,14 +537,14 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
         // confirmed `done[pos] == pos` and removed the bit from
         // batch_unused). The `&mut self` borrow on the producer
         // serializes against any other access from the same handle.
-        unsafe { &mut *self.producer.queue.data_slot(self.pos).get() }
+        unsafe { &mut *self.queue.data_slot(self.pos).get() }
     }
 
     /// Writes a value into the slot, consuming this `SlotWriter` and
     /// returning a [`WrittenSlot`] that can be safely committed.
     pub fn write(self, val: T) -> WrittenSlot<'a, T, C> {
         // SAFETY: exclusive access (see slot_mut).
-        let data_ptr = self.producer.queue.data_slot(self.pos).get();
+        let data_ptr = self.queue.data_slot(self.pos).get();
         unsafe { (*data_ptr).write(val) };
         // Skip SlotWriter::drop — WrittenSlot now owns the rollback.
         let this = std::mem::ManuallyDrop::new(self);
@@ -547,7 +553,8 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
             // exclusively and never published, so no consumer can see
             // it. The producer borrow keeps the buffer alive.
             value: unsafe { UncommittedSlot::armed(data_ptr) },
-            producer: this.producer,
+            queue: this.queue,
+            unused: this.unused,
             pos: this.pos,
             bit: this.bit,
         }
@@ -570,7 +577,7 @@ impl<'a, T, C: Config> SlotWriter<'a, T, C> {
     pub unsafe fn commit_unchecked(self) {
         // Skips SlotWriter::drop, which would restore the bit.
         let this = std::mem::ManuallyDrop::new(self);
-        let q = &*this.producer.queue;
+        let q = this.queue;
         q.ready_slot(this.pos).publish(this.pos);
         q.consumer_park.wake_one();
         q.notify_consumers();
@@ -584,8 +591,7 @@ impl<T, C: Config> Drop for SlotWriter<'_, T, C> {
         // the bit so the slot can be reused without re-claiming a
         // batch position. Producer::drop will tombstone it if this
         // handle is dropped before the bit is consumed.
-        let unused = self.producer.batch_unused.get();
-        self.producer.batch_unused.set(unused | (1u32 << self.bit));
+        self.unused.set(self.unused.get() | (1u32 << self.bit));
     }
 }
 
@@ -597,12 +603,13 @@ impl<T, C: Config> Drop for SlotWriter<'_, T, C> {
 /// to `batch_unused`).
 pub struct WrittenSlot<'a, T, C: Config = DefaultConfig> {
     value: UncommittedSlot<T>,
-    producer: &'a Producer<T, C>,
+    queue: &'a RingBuffer<T, C>,
+    unused: &'a Cell<u32>,
     pos: usize,
     bit: u32,
 }
 
-// SAFETY: same as SlotWriter — exclusive access via the producer
+// SAFETY: same as SlotWriter — exclusive access via the `reserve`
 // borrow and the held batch bit.
 unsafe impl<T: Send, C: Config> Send for WrittenSlot<'_, T, C> {}
 
@@ -616,7 +623,7 @@ impl<T, C: Config> WrittenSlot<'_, T, C> {
     #[inline]
     pub fn commit(mut self) {
         self.value.commit();
-        let q = &*self.producer.queue;
+        let q = self.queue;
         q.ready_slot(self.pos).publish(self.pos);
         q.consumer_park.wake_one();
         q.notify_consumers();
@@ -632,16 +639,16 @@ impl<T, C: Config> Drop for WrittenSlot<'_, T, C> {
         // panicking `T::drop` still hands the position back. Unwinding
         // past the return would reserve it for the rest of this
         // handle's life.
-        let _return = ReservationReturn::new(&self.producer.batch_unused, self.bit);
+        let _return = ReservationReturn::new(self.unused, self.bit);
         self.value.drop_if_uncommitted();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DefaultConfig, Producer, RingBuffer};
+    use super::{DefaultConfig, Producer};
     use crate::capacity::Capacity;
-    use crate::mpmc::Consumer;
+    use crate::mpmc::{Consumer, SplitRing};
 
     /// A producer pinned to a full batch of positions, exactly one of
     /// which a consumer has released.
@@ -683,7 +690,7 @@ mod tests {
         /// position in the batch blocked.
         fn with_one_free(free_bit: Option<usize>) -> Self {
             let (producer, consumer) =
-                RingBuffer::<u64, DefaultConfig>::new(Capacity::exact(Self::CAP)).split();
+                SplitRing::<u64, DefaultConfig>::new(Capacity::exact(Self::CAP)).split();
             for i in 0..Self::CAP {
                 producer.push(i as u64).expect("the ring starts empty");
             }

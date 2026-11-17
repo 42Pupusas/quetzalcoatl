@@ -1,6 +1,6 @@
 use divan::black_box;
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::spsc::SplitRing;
 use std::thread;
 
 fn main() {
@@ -47,7 +47,7 @@ mod push_only {
         bencher
             .counter(divan::counter::ItemsCount::new(cap))
             .bench(|| {
-                let (producer, _consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+                let (producer, _consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
                 for i in 0..cap as u64 {
                     let _ = producer.push(black_box(i));
                 }
@@ -69,7 +69,7 @@ mod pop_only {
         bencher
             .counter(divan::counter::ItemsCount::new(cap))
             .bench(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
                 for i in 0..cap as u64 {
                     producer.push(i).unwrap();
                 }
@@ -91,7 +91,7 @@ mod push_pop_alternating {
         bencher
             .counter(divan::counter::ItemsCount::new(ops))
             .bench(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(64)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(64)).split();
                 for i in 0..ops {
                     let _ = producer.push(black_box(i));
                     black_box(consumer.pop());
@@ -114,8 +114,7 @@ mod spsc_concurrent {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, mut consumer) =
-                    RingBuffer::<u64>::new(Capacity::exact(4096)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4096)).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
@@ -155,7 +154,7 @@ mod capacity_impact {
             .counter(divan::counter::ItemsCount::new(ops))
             .bench(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<u64>::new(Capacity::at_least(cap)).split();
+                    SplitRing::<u64>::new(Capacity::at_least(cap)).split();
                 for i in 0..ops {
                     let _ = producer.push(black_box(i));
                     if i % 2 == 0 {
@@ -180,7 +179,7 @@ mod large_struct_spsc {
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
                 let (producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
@@ -218,7 +217,7 @@ mod large_struct_spsc_zero_copy {
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
                 let (mut producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(256)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(256)).split();
 
                 let producer_handle = thread::spawn(move || {
                     for i in 0..total_items {
@@ -260,7 +259,7 @@ mod blocking_spsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
                 let h = thread::spawn(move || {
                     for i in 0..total_items {
                         while producer.push(i).is_err() {
@@ -287,7 +286,7 @@ mod blocking_spsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, mut consumer) = RingBuffer::<u64>::new(Capacity::exact(16)).split();
+                let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(16)).split();
                 let h = thread::spawn(move || {
                     for i in 0..total_items {
                         producer.push_block(i).expect("consumer dropped");
@@ -322,7 +321,7 @@ mod large_struct_spsc_zero_copy_blocking {
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
                 let (mut producer, mut consumer) =
-                    RingBuffer::<LargeStruct>::new(Capacity::exact(16)).split();
+                    SplitRing::<LargeStruct>::new(Capacity::exact(16)).split();
                 let h = thread::spawn(move || {
                     for i in 0..total_items {
                         let w = producer.reserve_block().expect("consumer dropped");
@@ -413,7 +412,7 @@ mod async_spsc {
         bencher
             .counter(divan::counter::ItemsCount::new(total_items))
             .bench(|| {
-                let (producer, consumer) = RingBuffer::<u64>::new(Capacity::exact(cap)).split();
+                let (producer, consumer) = SplitRing::<u64>::new(Capacity::exact(cap)).split();
                 p_tx.send(producer).unwrap();
                 c_tx.send(consumer).unwrap();
                 barrier.wait(); // wait for both sides to finish
