@@ -13,10 +13,15 @@ While the channel is open, `ParkLedger`'s count bounds the free slots. On each r
 producer sleeps where a peer can find it by that route, the free slots never outnumber what is owed
 on that route.
 
-Once the channel closes, no producer can start to park, because its re-check sees `closed`. The
-consumer's drain of the overflow stack and its flush of the bitmap take every producer already
-parked, unless it holds a token. A forwarded wake loop can still be running, but it can always take
-a step, so it never leaves the run stuck.
+A producer sleeps once it has made its last look at the ring before parking. mpsc and broadcast
+producers check `closed` and then look at the ring, so they sleep from `park`; mpmc producers look
+at the ring and then check `closed`, so they already sleep while that check is pending.
+
+Once the channel closes, no producer can start to park, because its re-check sees `closed`. One
+that has already passed that check (it may park: `Pc.mayPark`) armed before the close, so the
+consumer's drain of the overflow stack and its flush of the bitmap take it, unless it holds a
+token. A forwarded wake loop can still be running, but it can always take a step, so it never leaves
+the run stuck.
 
 What every producer keeps, open or closed, is `Producer.Fit`: a parked producer will be woken.
 -/
@@ -66,9 +71,10 @@ def Producer.Forwards (ps : List Producer) (j : Nat) (route : Route) : Prop :=
 def State.Delivers (s : State) (j : Nat) (route : Route) : Prop :=
   s.consumer.Delivers route j ∨ Producer.Forwards s.producers j route
 
-/-- Some producer is parked where a peer can find it by `route`. -/
+/-- Some producer sleeps where a peer can find it by `route`. -/
 def State.Sleeper (s : State) (route : Route) : Prop :=
-  ∃ j, (Producer.at s.producers j).pc = .park ∧ (Producer.at s.producers j).visible route = true
+  ∃ j, (Producer.at s.producers j).pc.sleeps = true ∧
+    (Producer.at s.producers j).visible route = true
 
 structure State.Safe (variant : Variant) (s : State) : Prop where
   opened : s.closed = false → s.consumer.Open
@@ -76,13 +82,14 @@ structure State.Safe (variant : Variant) (s : State) : Prop where
   releasing : s.consumer = .release → 0 < s.left
   won : ∀ j, (Producer.at s.producers j).pc = .disarmWon → variant.standsDown = true
   exits : ∀ j, (Producer.at s.producers j).pc = .disarmClosed → s.closed = true
+  stacked : ∀ j, (Producer.at s.producers j).registered = true → j ∈ s.stack
   fit : ∀ j, (Producer.at s.producers j).Fit (s.Delivers j)
   owed : ∀ route, s.closed = false → s.Sleeper route →
     s.free ≤ Producer.owedSum route s.producers + s.consumer.pending route
   drained : s.closed = true → s.consumer.Drained → ∀ j,
-    (Producer.at s.producers j).pc = .park → (Producer.at s.producers j).registered = false
+    (Producer.at s.producers j).pc.mayPark = true → (Producer.at s.producers j).registered = false
   flushed : s.closed = true → s.consumer.Flushed → ∀ j,
-    (Producer.at s.producers j).pc = .park → (Producer.at s.producers j).bit = false
+    (Producer.at s.producers j).pc.mayPark = true → (Producer.at s.producers j).bit = false
 
 theorem Variant.Proved.sees {variant : Variant} (proved : variant.Proved) :
     variant.seesClose = true := by
@@ -90,6 +97,14 @@ theorem Variant.Proved.sees {variant : Variant} (proved : variant.Proved) :
 
 theorem Variant.forwardCount_pos (variant : Variant) : 1 ≤ variant.forwardCount := by
   cases variant <;> simp [Variant.forwardCount]
+
+theorem Variant.standsDown_of_claimsFirst {variant : Variant} (first : variant.claimsFirst = true) :
+    variant.standsDown = true := by
+  cases variant <;> simp_all [Variant.claimsFirst, Variant.standsDown]
+
+theorem Variant.Proved.standsDown_of_claims {variant : Variant} (proved : variant.Proved)
+    (claims : variant.observes = false) : variant.standsDown = true := by
+  cases variant <;> simp_all [Variant.observes, Variant.standsDown, Variant.Proved]
 
 theorem Consumer.afterRelease_open (closes : Bool) (left : Nat) :
     (Consumer.afterRelease closes left).Open := by
@@ -125,10 +140,15 @@ theorem Producer.Forwards.frame {ps ps' : List Producer} (frame : Producer.Frame
   fun ⟨k, w, pc, delivers⟩ => ⟨k, w, (frame.2 k).1.trans pc, delivers⟩
 
 theorem Producer.Frame.back {ps ps' : List Producer} (frame : Producer.Frame ps ps') (j : Nat)
-    (park : (Producer.at ps' j).pc = .park) :
-    (Producer.at ps j).pc = .park ∧ ∀ route,
+    (park : (Producer.at ps' j).pc.mayPark = true) :
+    (Producer.at ps j).pc.mayPark = true ∧ ∀ route,
       (Producer.at ps' j).visible route = true → (Producer.at ps j).visible route = true :=
-  ⟨(frame.2 j).1.symm.trans park, (frame.2 j).2⟩
+  ⟨(frame.2 j).1 ▸ park, (frame.2 j).2⟩
+
+theorem State.Safe.stacked_frame {variant : Variant} {s : State} (inv : s.Safe variant)
+    {ps' : List Producer} (frame : Producer.Frame s.producers ps') (j : Nat)
+    (registered : (Producer.at ps' j).registered = true) : j ∈ s.stack :=
+  inv.stacked j ((frame.2 j).2 .overflow registered)
 
 /-- Every producer is fit after `update`, given that the updated one is. -/
 theorem Producer.Fit.update {ps : List Producer} {i : Nat} {f : Producer → Producer}
@@ -152,8 +172,8 @@ theorem Producer.Fit.update {ps : List Producer} {i : Nat} {f : Producer → Pro
 producer visible, with the consumer no earlier in its closing sequence. -/
 theorem State.Safe.closing_keep {variant : Variant} {s t : State} (inv : s.Safe variant)
     (closed : t.closed = s.closed)
-    (back : t.closed = true → ∀ j, (Producer.at t.producers j).pc = .park →
-      (Producer.at s.producers j).pc = .park ∧ ∀ route,
+    (back : t.closed = true → ∀ j, (Producer.at t.producers j).pc.mayPark = true →
+      (Producer.at s.producers j).pc.mayPark = true ∧ ∀ route,
         (Producer.at t.producers j).visible route = true →
           (Producer.at s.producers j).visible route = true)
     (drained : t.consumer.Drained →
@@ -161,9 +181,11 @@ theorem State.Safe.closing_keep {variant : Variant} {s t : State} (inv : s.Safe 
     (flushed : t.consumer.Flushed →
       s.consumer.Flushed ∨ ∀ j, (Producer.at t.producers j).bit = false) :
     (t.closed = true → t.consumer.Drained → ∀ j,
-      (Producer.at t.producers j).pc = .park → (Producer.at t.producers j).registered = false) ∧
+      (Producer.at t.producers j).pc.mayPark = true →
+        (Producer.at t.producers j).registered = false) ∧
     (t.closed = true → t.consumer.Flushed → ∀ j,
-      (Producer.at t.producers j).pc = .park → (Producer.at t.producers j).bit = false) := by
+      (Producer.at t.producers j).pc.mayPark = true →
+        (Producer.at t.producers j).bit = false) := by
   refine ⟨fun c d j park => ?_, fun c f j park => ?_⟩
   · rcases drained d with before | none
     · cases registered : (Producer.at t.producers j).registered
@@ -189,6 +211,7 @@ and registrations away. -/
 theorem State.Safe.closing_step {variant : Variant} {s t : State} (inv : s.Safe variant)
     (frame : Producer.Frame s.producers t.producers) (sClosed : s.closed = true)
     (closed : t.closed = true) (consumer : t.consumer.Closing)
+    (stacked : ∀ j, (Producer.at t.producers j).registered = true → j ∈ t.stack)
     (fit : ∀ j, (Producer.at t.producers j).Fit (t.Delivers j))
     (drained : t.consumer.Drained →
       s.consumer.Drained ∨ ∀ j, (Producer.at t.producers j).registered = false)
@@ -202,6 +225,7 @@ theorem State.Safe.closing_step {variant : Variant} {s t : State} (inv : s.Safe 
     releasing := fun release => by rw [release] at consumer; exact nomatch consumer
     won := fun j disarm => inv.won j ((frame.2 j).1.symm.trans disarm)
     exits := fun _ _ => closed
+    stacked
     fit
     owed := fun _ c => nomatch closed.symm.trans c
     drained := keep.1
@@ -214,16 +238,24 @@ theorem State.Safe.move {variant : Variant} {s t : State} (inv : s.Safe variant)
     {f : Producer → Producer}
     (producers : t.producers = Producer.update s.producers i f)
     (consumer : t.consumer = s.consumer) (closed : t.closed = s.closed) (left : t.left = s.left)
+    (stack : t.stack = s.stack ∨ t.stack = i :: s.stack)
+    (registers : (f p).registered = true → p.registered = true ∨ t.stack = i :: s.stack)
     (notForward : ∀ w, p.pc ≠ .forward w)
     (fitAfter : (f p).Fit (s.Delivers i))
     (wonAfter : (f p).pc = .disarmWon → variant.standsDown = true)
     (exitAfter : (f p).pc = .disarmClosed → s.closed = true)
-    (parkAfter : (f p).pc = .park → s.closed = false)
+    (parkAfter : (f p).pc.mayPark = true → s.closed = false ∨
+      (p.pc.mayPark = true ∧ ∀ route, (f p).visible route = true → p.visible route = true))
     (bound : ∀ route, s.closed = false → t.free = 0 ∨
       (t.free + p.owed route ≤ s.free + (f p).owed route ∧
-        ((f p).pc = .park → (f p).visible route = false))) :
+        ((f p).pc.sleeps = true → (f p).visible route = true →
+          p.pc.sleeps = true ∧ p.visible route = true))) :
     t.Safe variant := by
   subst current
+  have kept : ∀ j, j ∈ s.stack → j ∈ t.stack := fun j mem => by
+    rcases stack with same | pushed
+    · rw [same]; exact mem
+    · rw [pushed]; exact List.mem_cons_of_mem _ mem
   have others : ∀ j, j ≠ i → Producer.at t.producers j = Producer.at s.producers j :=
     fun j different => by
       rw [producers, Producer.at_update,
@@ -238,10 +270,11 @@ theorem State.Safe.move {variant : Variant} {s t : State} (inv : s.Safe variant)
   have keep := inv.closing_keep closed
     (fun c j park => by
       by_cases same : j = i
-      · rw [same, self] at park
-        have opened := parkAfter park
-        rw [closed, opened] at c
-        cases c
+      · rw [same, self] at park ⊢
+        rcases parkAfter park with opened | before
+        · rw [closed, opened] at c
+          cases c
+        · exact before
       · rw [others j same] at park ⊢
         exact ⟨park, fun _ => id⟩)
     (fun d => Or.inl (consumer ▸ d)) (fun f' => Or.inl (consumer ▸ f'))
@@ -268,6 +301,15 @@ theorem State.Safe.move {variant : Variant} {s t : State} (inv : s.Safe variant)
         exact exitAfter disarm
       · rw [others j same] at disarm
         exact inv.exits j disarm
+    stacked := fun j registered => by
+      by_cases same : j = i
+      · rw [same, self] at registered
+        rw [same]
+        rcases registers registered with before | pushed
+        · exact kept i (inv.stacked i before)
+        · rw [pushed]; exact List.mem_cons.mpr (Or.inl rfl)
+      · rw [others j same] at registered
+        exact kept j (inv.stacked j registered)
     fit := fun j => by
       by_cases same : j = i
       · rw [same, self]
@@ -282,8 +324,8 @@ theorem State.Safe.move {variant : Variant} {s t : State} (inv : s.Safe variant)
       have before : s.Sleeper route := by
         by_cases same : j = i
         · rw [same, self] at park visible
-          rw [notPark park] at visible
-          cases visible
+          obtain ⟨sleeps, seen⟩ := notPark park visible
+          exact ⟨i, sleeps, seen⟩
         · rw [others j same] at park visible
           exact ⟨j, park, visible⟩
       have total := Producer.owedSum_update route s.producers i f inside
@@ -293,19 +335,40 @@ theorem State.Safe.move {variant : Variant} {s t : State} (inv : s.Safe variant)
     drained := keep.1
     flushed := keep.2 }
 
+/-- A producer step that only moves producer `i`'s program counter to `next`, and perhaps takes a
+slot. -/
+theorem State.Safe.relabel {variant : Variant} {s t : State} (inv : s.Safe variant) {i : Nat}
+    (inside : i < s.producers.length) {p : Producer} (current : Producer.at s.producers i = p)
+    {next : Pc} (producers : t.producers = Producer.update s.producers i fun q => { q with pc := next })
+    (consumer : t.consumer = s.consumer) (closed : t.closed = s.closed) (left : t.left = s.left)
+    (stack : t.stack = s.stack) (notForward : ∀ w, p.pc ≠ .forward w)
+    (fitAfter : ({ p with pc := next } : Producer).Fit (s.Delivers i))
+    (wonAfter : next = .disarmWon → variant.standsDown = true)
+    (exitAfter : next = .disarmClosed → s.closed = true)
+    (parkAfter : next.mayPark = true → s.closed = false ∨ p.pc.mayPark = true)
+    (bound : ∀ route, s.closed = false → t.free = 0 ∨
+      (t.free + p.owed route ≤ s.free + ({ p with pc := next } : Producer).owed route ∧
+        (next.sleeps = true → p.pc.sleeps = true))) :
+    t.Safe variant :=
+  inv.move inside current producers consumer closed left (Or.inl stack) (fun r => Or.inl r)
+    notForward fitAfter wonAfter exitAfter
+    (fun park => (parkAfter park).imp_right fun before => ⟨before, fun _ => id⟩)
+    (fun route opened => (bound route opened).imp_right fun ⟨le, sleeps⟩ =>
+      ⟨le, fun asleep seen => ⟨sleeps asleep, seen⟩⟩)
+
 /-- A step of the wake loop producer `i` forwards from `stand_down`. -/
 theorem State.Safe.forward_step {variant : Variant} {s t : State} (inv : s.Safe variant)
     {i : Nat} (inside : i < s.producers.length) {w : Waker}
     (pc : (Producer.at s.producers i).pc = .forward w) {ps' : List Producer}
-    {next : Option Waker} (step : (ps', next) ∈ Waker.step s.producers w)
+    {next : Option Waker} (step : (ps', next) ∈ Waker.step s.producers s.stack w)
     (producers : t.producers = Producer.update ps' i fun p => { p with pc := Waker.resume next })
     (consumer : t.consumer = s.consumer) (closed : t.closed = s.closed) (left : t.left = s.left)
-    (free : t.free = s.free) : t.Safe variant := by
+    (free : t.free = s.free) (stack : t.stack = w.stackAfter s.stack) : t.Safe variant := by
   have frame := Waker.step_frame step
   have insideAfter : i < ps'.length := by rw [frame.1]; exact inside
   have after := Waker.step_fit (other := fun j route => s.consumer.Delivers route j ∨
       ∃ k w', k ≠ i ∧ (Producer.at s.producers k).pc = .forward w' ∧ w'.Delivers route j)
-    (fun j => (inv.fit j).mono fun route delivers => by
+    inv.stacked (fun j => (inv.fit j).mono fun route delivers => by
       rcases delivers with delivers | ⟨k, w', claim, delivers⟩
       · exact Or.inl (Or.inl delivers)
       · by_cases same : k = i
@@ -320,14 +383,17 @@ theorem State.Safe.forward_step {variant : Variant} {s t : State} (inv : s.Safe 
   have self : Producer.at t.producers i = { Producer.at ps' i with pc := Waker.resume next } := by
     rw [producers, Producer.at_update, ite_eq_left_of_eq_true _ _ (eq_true ⟨rfl, insideAfter⟩)]
   have selfPc : (Producer.at ps' i).pc = .forward w := (frame.2 i).1.trans pc
-  have parked : ∀ j, (Producer.at t.producers j).pc = .park →
-      j ≠ i ∧ (Producer.at ps' j).pc = .park := by
-    intro j park
+  have parked : ∀ {holds : Pc → Bool}, (∀ w', holds (.forward w') = false) →
+      holds .done = false → ∀ j, (holds (Producer.at t.producers j).pc) = true →
+      j ≠ i ∧ holds (Producer.at ps' j).pc = true := by
+    intro holds forwards done j park
     by_cases same : j = i
     · rw [same, self] at park
-      cases next <;> simp [Waker.resume] at park
+      cases next <;> simp [Waker.resume, forwards, done] at park
     · rw [others j same] at park
       exact ⟨same, park⟩
+  have parks := @parked Pc.mayPark (fun _ => rfl) rfl
+  have sleeps := @parked Pc.sleeps (fun _ => rfl) rfl
   have resumedPc : ∀ target, (Producer.at t.producers i).pc = target →
       target ≠ .disarmWon ∧ target ≠ .disarmClosed := by
     intro target eq
@@ -336,7 +402,7 @@ theorem State.Safe.forward_step {variant : Variant} {s t : State} (inv : s.Safe 
     cases next <;> simp [Waker.resume]
   have keep := inv.closing_keep closed
     (fun _ j park => by
-      obtain ⟨same, park⟩ := parked j park
+      obtain ⟨same, park⟩ := parks j park
       rw [others j same]
       exact frame.back j park)
     (fun d => Or.inl (consumer ▸ d)) (fun f => Or.inl (consumer ▸ f))
@@ -363,6 +429,14 @@ theorem State.Safe.forward_step {variant : Variant} {s t : State} (inv : s.Safe 
       · rw [others j same] at disarm
         rw [closed]
         exact inv.exits j ((frame.2 j).1.symm.trans disarm)
+    stacked := fun j registered => by
+      rw [stack]
+      refine Waker.step_stacked step inv.stacked j ?_
+      by_cases same : j = i
+      · rw [same, self] at registered
+        rw [same]
+        exact registered
+      · rwa [others j same] at registered
     fit := fun j => by
       have widen : ∀ route, (s.consumer.Delivers route j ∨
           ∃ k w', k ≠ i ∧ (Producer.at s.producers k).pc = .forward w' ∧ w'.Delivers route j) ∨
@@ -390,10 +464,10 @@ theorem State.Safe.forward_step {variant : Variant} {s t : State} (inv : s.Safe 
       · rw [others j same]
         exact (after j).mono widen
     owed := fun route c ⟨j, park, visible⟩ => by
-      obtain ⟨same, park⟩ := parked j park
+      obtain ⟨same, park⟩ := sleeps j park
       rw [others j same] at visible
       have previous := inv.owed route (closed ▸ c)
-        ⟨j, (frame.2 j).1.symm.trans park, (frame.2 j).2 route visible⟩
+        ⟨j, (frame.2 j).1 ▸ park, (frame.2 j).2 route visible⟩
       have total := Producer.owedSum_update route ps' i
         (fun p => { p with pc := Waker.resume next }) insideAfter
       have selfOwed : (Producer.at ps' i).owed route = w.owed route := by
@@ -417,33 +491,85 @@ theorem State.Safe.producer_step {variant : Variant} (proved : variant.Proved) {
   have wonAt := inv.won i
   have exitsAt := inv.exits i
   have sees := proved.sees
-  unfold State.producerSteps at mem
+  unfold State.producerSteps State.leave State.claimOrArm at mem
   generalize current : Producer.at s.producers i = p at fit wonAt exitsAt mem
   obtain ⟨pc, leased, bit, handle, token, registered⟩ := p
   obtain ⟨kept, shape⟩ := fit
+  /- A step between the looks at the top of the loop (bit clear), to `handle`, or out of the loop.
+  `bound` is the open-channel accounting of what the producer owes. -/
+  have early : ∀ {next : Pc} {t : State},
+      t.producers = Producer.update s.producers i (fun q => { q with pc := next }) →
+      t.consumer = s.consumer → t.closed = s.closed → t.left = s.left → t.stack = s.stack →
+      (next = .top ∨ next = .attempt ∨ next = .topClosed ∨ next = .take ∨ next = .handle ∨
+        next = .done) →
+      pc ≠ .bit → (∀ w, pc ≠ .forward w) → bit = false →
+      (s.closed = false → t.free = 0 ∨ t.free + (if pc = .topClosed then 0 else 1) ≤
+        s.free + (if next = .top ∨ next = .attempt ∨ next = .take then 1 else 0)) →
+      (pc = .top ∨ pc = .attempt ∨ pc = .topClosed ∨ pc = .take) →
+      t.Safe variant := by
+    intro next t producers consumer closed left stack target notBit notForward quiet bound source
+    refine inv.relabel inside current producers consumer closed left stack notForward
+      ?_ ?_ ?_ ?_ ?_
+    · refine ⟨kept, ?_⟩
+      rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> exact quiet
+    · intro won; rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> cases won
+    · intro exits; rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> cases exits
+    · intro park; rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> cases park
+    · intro route opened
+      refine (bound opened).imp_right fun le => ⟨?_, ?_⟩
+      · rcases source with rfl | rfl | rfl | rfl <;>
+          rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;>
+          simp [Producer.owed] at le ⊢ <;> omega
+      · rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> simp
+  /- A re-check step only moves the program counter: to the next look, to `park`, or to a disarm.
+  A producer still visible owes nothing; one whose bit or registration a waker took owes one look,
+  and pays it with the slot it takes, if any. -/
+  have look : ∀ {next : Pc} {t : State},
+      t.producers = Producer.update s.producers i (fun q => { q with pc := next }) →
+      t.consumer = s.consumer → t.closed = s.closed → t.left = s.left →
+      t.stack = s.stack →
+      (next = .recheckRing ∨ next = .recheckClosed ∨ next = .park ∨ next = .disarmWon ∨
+        next = .disarmWoken ∨ next = .disarmClosed) →
+      (next = .disarmWon → variant.standsDown = true) →
+      (next = .disarmClosed → s.closed = true) →
+      (next.mayPark = true → s.closed = false ∨ pc.mayPark = true) →
+      (next.sleeps = true → pc.sleeps = true ∨ t.free = 0) →
+      (s.closed = false → t.free + (if next = .disarmWon then 1 else 0) ≤ s.free ∨ t.free = 0) →
+      (pc = .recheck ∨ pc = .recheckRing ∨ pc = .recheckClosed) →
+      t.Safe variant := by
+    intro next t producers consumer closed left stack target won exits parks sleeps bound
+      source
+    refine inv.relabel inside current producers consumer closed left stack
+      (by rcases source with rfl | rfl | rfl <;> simp) ⟨kept, ?_⟩ won exits parks ?_
+    · rcases source with rfl | rfl | rfl <;>
+        rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;> first | exact shape | trivial
+    · intro route opened
+      rcases bound opened with le | zero
+      · by_cases asleep : next.sleeps = true
+        · rcases sleeps asleep with before | zero
+          · refine Or.inr ⟨?_, fun _ => before⟩
+            rcases source with rfl | rfl | rfl <;>
+              rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;>
+              simp [Producer.owed] at asleep before ⊢ <;> (try split) <;> omega
+          · exact Or.inl zero
+        · refine Or.inr ⟨?_, fun now => absurd now asleep⟩
+          rcases source with rfl | rfl | rfl <;>
+            rcases target with rfl | rfl | rfl | rfl | rfl | rfl <;>
+            simp [Producer.owed] at asleep le ⊢ <;> (try split) <;> (try split) <;> omega
+      · exact Or.inl zero
   cases pc with
-  | attempt =>
+  | top | attempt | topClosed | take =>
     dsimp only at mem shape
-    split at mem
-    · rename_i closed
-      simp only [List.mem_singleton] at mem
-      subst mem
-      exact inv.move inside current (f := fun p => { p with pc := .done }) rfl rfl rfl rfl
-        (by simp) ⟨kept, shape⟩ (by simp) (by simp) (by simp)
-        (fun _ c => nomatch closed.symm.trans c)
-    · split at mem
-      · rename_i free
-        simp only [List.mem_singleton] at mem
-        subst mem
-        exact inv.move inside current (f := fun p => { p with pc := .done }) rfl rfl rfl rfl
-          (by simp) ⟨kept, shape⟩ (by simp) (by simp) (by simp)
-          (fun _ _ => Or.inr ⟨by simp only [Producer.owed]; omega, by simp⟩)
-      · rename_i full
-        simp only [List.mem_singleton] at mem
-        subst mem
-        exact inv.move inside current (f := fun p => { p with pc := .handle }) rfl rfl rfl rfl
-          (by simp) ⟨kept, shape⟩ (by simp) (by simp) (by simp)
-          (fun _ _ => Or.inl (by simp only [State.setPc]; omega))
+    repeat' split at mem
+    all_goals
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at mem
+      first
+        | (rcases mem with rfl | rfl)
+        | subst mem
+    all_goals
+      exact early rfl rfl rfl rfl rfl (by simp) (by simp) (by simp) shape
+        (fun opened => by first | (simp [State.setPc] <;> omega) | simp_all)
+        (by simp)
   | handle =>
     dsimp only at mem shape
     split at mem
@@ -451,13 +577,15 @@ theorem State.Safe.producer_step {variant : Variant} (proved : variant.Proved) {
       simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move inside current (f := fun p => { p with handle := true, pc := .bit })
-        rfl rfl rfl rfl (by simp) ⟨kept, isLeased, shape, Or.inr rfl⟩ (by simp) (by simp)
-        (by simp) (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit], by simp⟩)
+        rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp) ⟨kept, isLeased, shape, Or.inr rfl⟩
+        (by simp) (by simp) (by simp)
+        (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit], by simp⟩)
     · rename_i unleased
       simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move inside current
-        (f := fun p => { p with registered := true, pc := .recheck }) rfl rfl rfl rfl (by simp)
+        (f := fun p => { p with registered := true, pc := .recheck }) rfl rfl rfl rfl
+        (Or.inr rfl) (fun _ => Or.inr rfl) (by simp)
         ⟨⟨fun _ => by simpa using unleased, fun set => nomatch shape.symm.trans set⟩,
           Or.inr (Or.inr ⟨by simpa using unleased, Or.inl rfl⟩)⟩
         (by simp) (by simp) (by simp)
@@ -468,102 +596,80 @@ theorem State.Safe.producer_step {variant : Variant} (proved : variant.Proved) {
     simp only [List.mem_singleton] at mem
     subst mem
     exact inv.move inside current (f := fun p => { p with bit := true, pc := .recheck })
-      rfl rfl rfl rfl (by simp)
+      rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp)
       ⟨⟨kept.1, fun _ => isLeased⟩,
         armed.elim Or.inl fun armedHandle => Or.inr (Or.inl ⟨isLeased, armedHandle, Or.inl rfl⟩)⟩
       (by simp) (by simp) (by simp)
       (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit], by simp⟩)
-  | recheck =>
+  | recheck | recheckRing | recheckClosed =>
     dsimp only at mem shape
-    simp only [sees, Bool.and_true] at mem
-    split at mem
-    · rename_i closed
+    repeat' split at mem
+    all_goals
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move inside current (f := fun p => { p with pc := .disarmClosed }) rfl rfl rfl rfl
-        (by simp) ⟨kept, trivial⟩ (by simp) (fun _ => closed) (by simp)
-        (fun _ c => nomatch closed.symm.trans c)
-    · rename_i opened
-      split at mem
-      · rename_i free
-        have won : ∀ {t : State}, t = { s.setPc i .disarmWon with free := s.free - 1 } →
-            variant.standsDown = true → t.Safe variant := by
-          rintro t rfl stands
-          exact inv.move inside current (f := fun p => { p with pc := .disarmWon })
-            rfl rfl rfl rfl (by simp) ⟨kept, trivial⟩ (fun _ => stands) (by simp) (by simp)
-            (fun _ _ => Or.inr ⟨by
-              simp only [Producer.owed]
-              cases leased <;> cases bit <;> cases registered <;> simp <;> omega,
-              by simp⟩)
-        cases variant with
-        | unrepaired => exact (proved : False).elim
-        | ignoresClose => exact (proved : False).elim
-        | observing =>
-          simp only [List.mem_singleton] at mem
-          subst mem
-          exact inv.move inside current (f := fun p => { p with pc := .disarmWoken })
-            rfl rfl rfl rfl (by simp) ⟨kept, trivial⟩ (by simp) (by simp) (by simp)
-            (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.setPc], by simp⟩)
-        | repaired => exact won (List.mem_singleton.mp mem) rfl
-        | repairedWakingAll => exact won (List.mem_singleton.mp mem) rfl
-      · rename_i full
-        simp only [List.mem_singleton] at mem
-        subst mem
-        exact inv.move inside current (f := fun p => { p with pc := .park }) rfl rfl rfl rfl
-          (by simp) ⟨kept, shape⟩ (by simp) (by simp) (fun _ => by simpa using opened)
-          (fun _ _ => Or.inl (by simp only [State.setPc]; omega))
+    all_goals
+      refine look rfl rfl rfl rfl rfl (by simp) ?_ ?_ ?_ ?_ ?_ (by simp)
+    all_goals
+      intro hyp
+      try simp only [Pc.mayPark, Pc.sleeps, State.setPc, reduceCtorEq, Bool.false_eq_true,
+        false_or, or_false, true_or, or_true, ↓reduceIte] at hyp ⊢
+      first
+        | done
+        | assumption
+        | omega
+        | exact Variant.standsDown_of_claimsFirst ‹_›
+        | exact proved.standsDown_of_claims (by simpa using ‹¬variant.observes = true›)
+        | simp_all
   | park =>
     dsimp only at mem shape
     split at mem
     · simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move inside current (f := fun p => { p with token := false, pc := .disarmWoken })
-        rfl rfl rfl rfl (by simp) ⟨kept, trivial⟩ (by simp) (by simp) (by simp)
-        (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit], by simp⟩)
+        rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp) ⟨kept, trivial⟩ (by simp) (by simp)
+        (by simp) (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit], by simp⟩)
     · simp at mem
-  | disarmWon =>
+  | disarmWon | disarmClosed =>
     dsimp only at mem
-    have stands : variant.standsDown = true := wonAt rfl
-    simp only [stands, Bool.true_and] at mem
     split at mem
     · rename_i owes
       simp only [List.mem_singleton] at mem
       subst mem
-      have quiet : bit = false := by
-        simp at owes
-        exact owes.2
+      have quiet : bit = false := by cases bit <;> simp_all
+      have isLeased : leased = true := by cases leased <;> simp_all
       exact inv.move inside current
         (f := fun p => { p with pc := .forward (.drain variant.forwardCount) })
-        rfl rfl rfl rfl (by simp) ⟨kept, quiet⟩ (by simp) (by simp) (by simp)
+        rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp) ⟨kept, quiet⟩ (by simp) (by simp)
+        (by simp)
         (fun _ _ => Or.inr ⟨by
           have := variant.forwardCount_pos
-          simp [Producer.owed, Waker.owed, State.edit, owes]
-          omega, by simp⟩)
+          simp [Producer.owed, Waker.owed, State.edit, quiet, isLeased]
+          (try split) <;> omega, by simp⟩)
     · rename_i keeps
       simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move inside current (f := fun p => { p with bit := false, pc := .done })
-        rfl rfl rfl rfl (by simp) ⟨⟨kept.1, nofun⟩, rfl⟩ (by simp) (by simp) (by simp)
-        (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.edit, keeps], by simp⟩)
+        rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp) ⟨⟨kept.1, nofun⟩, rfl⟩ (by simp)
+        (by simp) (by simp)
+        (fun _ opened => Or.inr ⟨by
+          first
+            | (have := wonAt rfl
+               cases leased <;> cases bit <;> cases registered <;>
+                 simp_all [Producer.owed, State.edit] <;> omega)
+            | (have := exitsAt rfl; simp_all), by simp⟩)
   | disarmWoken =>
     dsimp only at mem
     simp only [List.mem_singleton] at mem
     subst mem
-    exact inv.move inside current (f := fun p => { p with bit := false, pc := .attempt })
-      rfl rfl rfl rfl (by simp) ⟨⟨kept.1, nofun⟩, rfl⟩ (by simp) (by simp) (by simp)
+    exact inv.move inside current (f := fun p => { p with bit := false, pc := .top })
+      rfl rfl rfl rfl (Or.inl rfl) (fun r => Or.inl r) (by simp) ⟨⟨kept.1, nofun⟩, rfl⟩ (by simp)
+      (by simp) (by simp)
       (fun _ _ => Or.inr ⟨by simp only [Producer.owed, State.edit]; split <;> omega, by simp⟩)
-  | disarmClosed =>
-    dsimp only at mem
-    simp only [List.mem_singleton] at mem
-    subst mem
-    exact inv.move inside current (f := fun p => { p with bit := false, pc := .done })
-      rfl rfl rfl rfl (by simp) ⟨⟨kept.1, nofun⟩, rfl⟩ (by simp) (by simp) (by simp)
-      (fun _ c => nomatch (exitsAt rfl).symm.trans c)
   | forward w =>
     dsimp only at mem
     obtain ⟨⟨ps', next⟩, step, rfl⟩ := List.mem_map.mp mem
     have pc : (Producer.at s.producers i).pc = .forward w := by rw [current]
-    cases next <;> exact inv.forward_step inside pc step rfl rfl rfl rfl rfl
+    cases next <;> exact inv.forward_step inside pc step rfl rfl rfl rfl rfl rfl
   | done =>
     dsimp only at mem
     simp at mem
@@ -580,33 +686,35 @@ theorem State.Safe.spurious_step {variant : Variant} {s t : State} (inv : s.Safe
     obtain ⟨pc, leased, bit, handle, token, registered⟩ := p
     dsimp only at park
     subst park
-    exact inv.move inside current (f := fun p => { p with pc := .disarmWoken }) rfl rfl rfl rfl
-      (by simp) ⟨fit.1, trivial⟩ (by simp) (by simp) (by simp)
-      (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.setPc], by simp⟩)
+    exact inv.relabel inside current rfl rfl rfl rfl rfl (by simp) ⟨fit.1, trivial⟩ (by simp)
+      (by simp) (by simp) (fun _ _ => Or.inr ⟨by simp [Producer.owed, State.setPc], by simp⟩)
   · simp at mem
 
 /-- A step of the consumer's wake loop. -/
 theorem State.Safe.consumer_waker {variant : Variant} {s : State} (inv : s.Safe variant)
     {w : Waker} (consumer : s.consumer = .waking w) {ps' : List Producer} {next : Option Waker}
-    (step : (ps', next) ∈ Waker.step s.producers w) :
+    (step : (ps', next) ∈ Waker.step s.producers s.stack w) :
     (match next with
-      | some w' => { s with producers := ps', consumer := .waking w' }
-      | none => { s with producers := ps', consumer := Consumer.afterRelease s.closes s.left } :
+      | some w' => { s with producers := ps', stack := w.stackAfter s.stack, consumer := .waking w' }
+      | none =>
+        { s with producers := ps', stack := w.stackAfter s.stack,
+                 consumer := Consumer.afterRelease s.closes s.left } :
         State).Safe variant := by
   have frame := Waker.step_frame step
+  have stacked := Waker.step_stacked step inv.stacked
   have opened : s.closed = false := inv.open_of (by rw [consumer]; exact id)
   have after := Waker.step_fit (other := fun j route => Producer.Forwards s.producers j route)
-    (fun j => (inv.fit j).mono fun route delivers => by
+    inv.stacked (fun j => (inv.fit j).mono fun route delivers => by
       rcases delivers with delivers | forwards
       · rw [consumer] at delivers
         exact Or.inr delivers
       · exact Or.inl forwards) step
-  have bound : ∀ route, (∃ j, (Producer.at ps' j).pc = .park ∧
+  have bound : ∀ route, (∃ j, (Producer.at ps' j).pc.sleeps = true ∧
       (Producer.at ps' j).visible route = true) →
       s.free ≤ Producer.owedSum route ps' + Waker.owedAfter route next :=
     fun route ⟨j, park, visible⟩ => by
       have previous := inv.owed route opened
-        ⟨j, (frame.2 j).1.symm.trans park, (frame.2 j).2 route visible⟩
+        ⟨j, (frame.2 j).1 ▸ park, (frame.2 j).2 route visible⟩
       rw [consumer] at previous
       rcases Waker.step_owed route inv.fit step with grows | quiet
       · simp only [Consumer.pending] at previous
@@ -625,6 +733,7 @@ theorem State.Safe.consumer_waker {variant : Variant} {s : State} (inv : s.Safe 
       releasing := Consumer.afterRelease_releasing
       won
       exits
+      stacked
       fit := fun j => (after j).mono fun route delivers => by
         rcases delivers with forwards | resumes
         · exact Or.inr (Producer.Forwards.frame frame forwards)
@@ -643,6 +752,7 @@ theorem State.Safe.consumer_waker {variant : Variant} {s : State} (inv : s.Safe 
       releasing := fun release => nomatch release
       won
       exits
+      stacked
       fit := fun j => (after j).mono fun route delivers => by
         rcases delivers with forwards | resumes
         · exact Or.inr (Producer.Forwards.frame frame forwards)
@@ -664,6 +774,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
       releasing := fun release => nomatch release
       won := inv.won
       exits := inv.exits
+      stacked := inv.stacked
       fit := fun j => (inv.fit j).mono fun route delivers => by
         rcases delivers with delivers | forwards
         · rw [consumer] at delivers
@@ -689,6 +800,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
       releasing := fun release => nomatch release
       won := inv.won
       exits := fun _ _ => rfl
+      stacked := inv.stacked
       fit := fun j => (inv.fit j).mono fun route delivers => by
         rcases delivers with delivers | forwards
         · rw [consumer] at delivers
@@ -703,11 +815,15 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
     subst mem
     have frame := Producer.Frame.unregister s.producers
     exact inv.closing_step frame closed closed trivial
+      (fun j registered => by
+        change (Producer.at (Producer.unregister s.producers) j).registered = true at registered
+        rw [Producer.at_unregister] at registered
+        cases registered)
       (fun j => by
         show (Producer.at (Producer.unregister s.producers) j).Fit _
         rw [Producer.at_unregister]
         exact (inv.fit j).unregister
-          (fun registered => Or.inl (Producer.mem_registeredIndices registered))
+          (fun registered => Or.inl (inv.stacked j registered))
           fun route delivers => by
             rcases delivers with delivers | forwards
             · rw [consumer] at delivers
@@ -724,7 +840,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
     | nil =>
       simp only [State.consumerSteps, consumer, List.mem_singleton] at mem
       subst mem
-      exact inv.closing_step (Producer.Frame.refl _) closed closed trivial
+      exact inv.closing_step (Producer.Frame.refl _) closed closed trivial inv.stacked
         (fun j => (inv.fit j).mono fun route delivers => by
           rcases delivers with delivers | forwards
           · rw [consumer] at delivers
@@ -737,7 +853,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
       have frame : Producer.Frame s.producers
           (Producer.update s.producers i fun p => { p with token := true }) :=
         Producer.Frame.update (fun _ => rfl) fun _ route => by cases route <;> exact id
-      exact inv.closing_step frame closed closed trivial
+      exact inv.closing_step frame closed closed trivial (inv.stacked_frame frame)
         (fun j => Producer.Fit.update (f := fun p => { p with token := true })
           (delivered := fun j route =>
             Consumer.Delivers (.unparking rest) route j ∨
@@ -757,7 +873,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
     simp only [State.consumerSteps, consumer, List.mem_singleton] at mem
     subst mem
     have frame := Producer.Frame.clear_bits s.producers
-    exact inv.closing_step frame closed closed trivial
+    exact inv.closing_step frame closed closed trivial (inv.stacked_frame frame)
       (fun j => by
         show (Producer.at (s.producers.map fun p => { p with bit := false }) j).Fit _
         rw [Producer.at_clear_bits]
@@ -781,7 +897,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
     | nil =>
       simp only [State.consumerSteps, consumer, List.mem_singleton] at mem
       subst mem
-      exact inv.closing_step (Producer.Frame.refl _) closed closed trivial
+      exact inv.closing_step (Producer.Frame.refl _) closed closed trivial inv.stacked
         (fun j => (inv.fit j).mono fun route delivers => by
           rcases delivers with delivers | forwards
           · rw [consumer] at delivers
@@ -796,7 +912,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
         Producer.Frame.update (fun p => by split <;> rfl) fun p route visible => by
           revert visible
           split <;> (cases route <;> exact id)
-      exact inv.closing_step frame closed closed trivial
+      exact inv.closing_step frame closed closed trivial (inv.stacked_frame frame)
         (fun j => Producer.Fit.update (delivered := fun j route =>
             Consumer.Delivers (.flushing rest) route j ∨
               Producer.Forwards (Producer.update s.producers i fun p =>
@@ -822,7 +938,7 @@ theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe
   | finished => simp [State.consumerSteps, consumer] at mem
 
 theorem State.init_at (leases : List Bool) (releases : Nat) (closes : Bool) (j : Nat) :
-    (Producer.at (State.init leases releases closes).producers j).pc = .attempt ∧
+    (Producer.at (State.init leases releases closes).producers j).pc = .top ∧
       (Producer.at (State.init leases releases closes).producers j).bit = false ∧
       (Producer.at (State.init leases releases closes).producers j).registered = false := by
   simp only [State.init, Producer.at, List.getD_eq_getElem?_getD, List.getElem?_map]
@@ -839,6 +955,9 @@ theorem State.Safe.init (variant : Variant) (leases : List Bool) (releases : Nat
   exits j disarm := by
     rw [(State.init_at leases releases closes j).1] at disarm
     cases disarm
+  stacked j registered := by
+    rw [(State.init_at leases releases closes j).2.2] at registered
+    cases registered
   fit j := by
     obtain ⟨pc, bit, registered⟩ := State.init_at leases releases closes j
     revert pc bit registered
@@ -850,7 +969,7 @@ theorem State.Safe.init (variant : Variant) (leases : List Bool) (releases : Nat
     exact ⟨⟨nofun, nofun⟩, rfl⟩
   owed _ _ := fun ⟨j, park, _⟩ => by
     rw [(State.init_at leases releases closes j).1] at park
-    cases park
+    simp at park
   drained c := nomatch c
   flushed c := nomatch c
 
@@ -886,7 +1005,7 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
       omega
     | waking w =>
       simp only [State.consumerSteps, consumer, List.map_eq_nil_iff] at consumerIdle
-      exact absurd consumerIdle (Waker.step_ne_nil _ _)
+      exact absurd consumerIdle (Waker.step_ne_nil _ _ _)
     | unparking pending =>
       cases pending <;> simp [State.consumerSteps, consumer] at consumerIdle
     | flushing pending =>
@@ -897,7 +1016,7 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
         ((Producer.at s.producers i).pc = .park ∧ (Producer.at s.producers i).token = false) := by
     intro i inside
     have stuck := (List.flatMap_eq_nil_iff.mp producersIdle) i (List.mem_range.mpr inside)
-    unfold State.producerSteps at stuck
+    unfold State.producerSteps State.leave State.claimOrArm at stuck
     cases pcEq : (Producer.at s.producers i).pc with
     | park =>
       simp only [pcEq] at stuck
@@ -907,15 +1026,8 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
         exact Or.inr ⟨rfl, by simpa using token⟩
     | forward w =>
       simp only [pcEq, List.map_eq_nil_iff] at stuck
-      exact absurd stuck (Waker.step_ne_nil _ _)
+      exact absurd stuck (Waker.step_ne_nil _ _ _)
     | done => exact Or.inl rfl
-    | recheck =>
-      simp only [pcEq] at stuck
-      split at stuck
-      · simp at stuck
-      · split at stuck
-        · cases variant <;> simp at stuck
-        · simp at stuck
     | _ => simp only [pcEq] at stuck; (repeat' split at stuck) <;> simp at stuck
   have quiet : ∀ j route, ¬ s.Delivers j route := by
     rintro j route (delivers | ⟨k, w, pc, _⟩)
@@ -950,7 +1062,7 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
         cases shut
     have bound : ∀ route, (Producer.at s.producers i).visible route = true → s.free ≤ 0 :=
       fun route seen => by
-        have := inv.owed route closed ⟨i, park, seen⟩
+        have := inv.owed route closed ⟨i, by simp [park], seen⟩
         rw [nothing route, finished] at this
         simpa [Consumer.pending] using this
     rcases visible with bit | registered
@@ -959,10 +1071,10 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
     · have := bound .overflow registered
       omega
   · rcases visible with bit | registered
-    · have := inv.flushed closed (by rw [finished]; trivial) i park
+    · have := inv.flushed closed (by rw [finished]; trivial) i (by simp [park])
       rw [bit] at this
       cases this
-    · have := inv.drained closed (by rw [finished]; trivial) i park
+    · have := inv.drained closed (by rw [finished]; trivial) i (by simp [park])
       rw [registered] at this
       cases this
 

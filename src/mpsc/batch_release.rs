@@ -92,6 +92,17 @@ impl<'a, T> BatchRelease<'a, T> {
         Some(value)
     }
 
+    /// Publishes the head without waking anyone, for a consumer that
+    /// has closed the ring and flushed its parked producers. No
+    /// producer parks after the flush, so a wake here could only be
+    /// spent on a producer that is already returning.
+    pub(super) fn publish_closed(self) {
+        let this = std::mem::ManuallyDrop::new(self);
+        if this.released != 0 {
+            this.ring.ledger.publish_head(this.head);
+        }
+    }
+
     /// Hands `slot`, the one at the batch's head, to its next lap and
     /// steps past it.
     #[inline]

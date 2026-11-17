@@ -8,9 +8,9 @@ A wake reaches a producer by one of two routes. On the bitmap, a waker retires t
 claims its park handle. On the overflow stack, a drain takes every registration at once and unparks
 each thread it took.
 
-A producer owes one look at the ring when it is about to `attempt`, or when it waits (re-checking,
-parked, or about to disarm) and no peer can find it any more, because its bit or its registration
-was taken. A producer whose re-check took a slot and whose bit was then retired owes the wake it was
+A producer owes one look at the ring when it is about to look at it at the top of its loop, or when
+it waits (re-checking, parked, or about to disarm) and no peer can find it any more, because its bit
+or its registration was taken. A producer whose re-check took a slot and whose bit was then retired owes the wake it was
 given, which `stand_down` passes on. A wake loop owes the wakes it has yet to deliver. On the
 overflow route a loop stops owing once it has drained the stack: the drain reaches every registered
 producer, and one that registers later re-checks the ring after the release that started the loop.
@@ -62,8 +62,9 @@ def Waker.DeliversNext : Option Waker → Route → Nat → Prop
 
 def Producer.owed (route : Route) (p : Producer) : Nat :=
   match p.pc with
-  | .attempt => 1
-  | .recheck | .park | .disarmWoken | .disarmClosed => if p.bit || p.registered then 0 else 1
+  | .top | .attempt | .take => 1
+  | .recheck | .recheckRing | .recheckClosed | .park | .disarmWoken | .disarmClosed =>
+    if p.bit || p.registered then 0 else 1
   | .disarmWon => if p.leased && !p.bit then 1 else 0
   | .forward w => w.owed route
   | _ => 0
@@ -86,9 +87,9 @@ bit only stands while the producer waits or disarms, and a waiting producer will
 def Producer.Fit (p : Producer) (delivered : Route → Prop) : Prop :=
   p.Kept ∧
     match p.pc with
-    | .attempt | .handle | .done | .forward _ => p.bit = false
+    | .top | .attempt | .topClosed | .take | .handle | .done | .forward _ => p.bit = false
     | .bit => p.leased = true ∧ p.bit = false ∧ (p.token = true ∨ p.handle = true)
-    | .recheck | .park => p.Awaited delivered
+    | .recheck | .recheckRing | .recheckClosed | .park => p.Awaited delivered
     | .disarmWon | .disarmWoken | .disarmClosed => True
 
 theorem Producer.fresh_fit (delivered : Route → Prop) : Producer.fresh.Fit delivered :=
@@ -234,11 +235,6 @@ theorem Producer.at_clear_bits (ps : List Producer) (j : Nat) :
       { Producer.at ps j with bit := false } :=
   Producer.at_map rfl j
 
-theorem Producer.mem_registeredIndices {ps : List Producer} {j : Nat}
-    (registered : (Producer.at ps j).registered = true) : j ∈ Producer.registeredIndices ps :=
-  List.mem_filter.mpr ⟨List.mem_range.mpr
-    (Producer.inside fun fresh => by simp [fresh, Producer.fresh] at registered), registered⟩
-
 theorem Producer.owedSum_update (route : Route) (ps : List Producer) (i : Nat)
     (f : Producer → Producer) (inside : i < ps.length) :
     Producer.owedSum route (Producer.update ps i f) + (Producer.at ps i).owed route =
@@ -282,7 +278,8 @@ theorem Producer.owedSum_eq_zero {route : Route} {ps : List Producer}
     simp only [Producer.owedSum, List.map_cons, List.sum_cons] at ih ⊢
     rw [none head (by simp), ih (fun p mem => none p (by simp [mem]))]
 
-theorem Waker.step_ne_nil (ps : List Producer) (w : Waker) : Waker.step ps w ≠ [] := by
+theorem Waker.step_ne_nil (ps : List Producer) (stack : List Nat) (w : Waker) :
+    Waker.step ps stack w ≠ [] := by
   cases w with
   | drain => simp [Waker.step]
   | unpark pending count => cases pending <;> simp [Waker.step]
@@ -333,8 +330,9 @@ theorem Producer.Frame.clear_bits (ps : List Producer) :
   Producer.Frame.map rfl (fun _ => rfl) fun _ route => by
     cases route <;> simp [Producer.visible]
 
-theorem Waker.step_frame {ps ps' : List Producer} {w : Waker} {next : Option Waker}
-    (mem : (ps', next) ∈ Waker.step ps w) : Producer.Frame ps ps' := by
+theorem Waker.step_frame {ps ps' : List Producer} {stack : List Nat} {w : Waker}
+    {next : Option Waker} (mem : (ps', next) ∈ Waker.step ps stack w) :
+    Producer.Frame ps ps' := by
   cases w with
   | drain =>
     simp only [Waker.step, List.mem_singleton, Prod.mk.injEq] at mem
@@ -368,6 +366,19 @@ theorem Waker.step_frame {ps ps' : List Producer} {w : Waker} {next : Option Wak
     · exact Producer.Frame.update (fun _ => rfl) fun _ route => by cases route <;> exact id
     · exact Producer.Frame.refl _
 
+/-- After a wake-loop step every registered producer is still on the stack that step leaves. -/
+theorem Waker.step_stacked {ps ps' : List Producer} {stack : List Nat} {w : Waker}
+    {next : Option Waker} (mem : (ps', next) ∈ Waker.step ps stack w)
+    (stacked : ∀ j, (Producer.at ps j).registered = true → j ∈ stack) (j : Nat)
+    (registered : (Producer.at ps' j).registered = true) : j ∈ w.stackAfter stack := by
+  cases w with
+  | drain =>
+    simp only [Waker.step, List.mem_singleton, Prod.mk.injEq] at mem
+    obtain ⟨rfl, _⟩ := mem
+    rw [Producer.at_unregister] at registered
+    cases registered
+  | _ => exact stacked j ((Waker.step_frame mem).2 j |>.2 .overflow registered)
+
 theorem Waker.owedAfter_delivered (route : Route) (count : Nat) :
     Waker.owedAfter route (Waker.delivered count) =
       match route with
@@ -378,10 +389,10 @@ theorem Waker.owedAfter_delivered (route : Route) (count : Nat) :
 
 /-- A wake-loop step never lowers what is owed on `route`, counting the loop's own debt, unless
 afterwards no peer can find any producer by that route. -/
-theorem Waker.step_owed (route : Route) {ps ps' : List Producer} {w : Waker}
+theorem Waker.step_owed (route : Route) {ps ps' : List Producer} {stack : List Nat} {w : Waker}
     {next : Option Waker} {delivered : Nat → Route → Prop}
     (fits : ∀ j, (Producer.at ps j).Fit (delivered j))
-    (mem : (ps', next) ∈ Waker.step ps w) :
+    (mem : (ps', next) ∈ Waker.step ps stack w) :
     Producer.owedSum route ps + w.owed route ≤
         Producer.owedSum route ps' + Waker.owedAfter route next ∨
       ∀ j, (Producer.at ps' j).visible route = false := by
@@ -438,11 +449,12 @@ theorem Waker.step_owed (route : Route) {ps ps' : List Producer} {w : Waker}
     · cases route <;> exact Or.inl (by simp [Waker.owed, Waker.owedAfter])
 
 /-- A wake-loop step keeps every producer fit, moving the wakes it is about to deliver from `w`
-to `next`. `other` is what every other waker delivers. -/
-theorem Waker.step_fit {ps ps' : List Producer} {w : Waker} {next : Option Waker}
-    {other : Nat → Route → Prop}
+to `next`. `other` is what every other waker delivers. Every registered producer is on `stack`. -/
+theorem Waker.step_fit {ps ps' : List Producer} {stack : List Nat} {w : Waker}
+    {next : Option Waker} {other : Nat → Route → Prop}
+    (stacked : ∀ j, (Producer.at ps j).registered = true → j ∈ stack)
     (fits : ∀ j, (Producer.at ps j).Fit fun route => other j route ∨ w.Delivers route j)
-    (mem : (ps', next) ∈ Waker.step ps w) (j : Nat) :
+    (mem : (ps', next) ∈ Waker.step ps stack w) (j : Nat) :
     (Producer.at ps' j).Fit fun route => other j route ∨ Waker.DeliversNext next route j := by
   have quiet : (∀ route, ¬ w.Delivers route j) →
       (Producer.at ps j).Fit fun route => other j route ∨ Waker.DeliversNext next route j :=
@@ -453,7 +465,7 @@ theorem Waker.step_fit {ps ps' : List Producer} {w : Waker} {next : Option Waker
     obtain ⟨rfl, rfl⟩ := mem
     rw [Producer.at_unregister]
     exact (fits j).unregister
-      (fun registered => Or.inr (Producer.mem_registeredIndices registered))
+      (fun registered => Or.inr (stacked j registered))
       fun route => Or.imp_right fun delivers => by cases route <;> exact delivers.elim
   | unpark pending count =>
     cases pending with

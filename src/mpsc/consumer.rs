@@ -269,7 +269,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
         self.ring().producer_park.flush();
         #[cfg(feature = "async")]
         self.ring().producer_waker.flush();
-        while self.pop().is_some() {}
+        let ring = self.ring();
+        // SAFETY: `&mut self` is the ring's only consumer.
+        let mut batch = unsafe { BatchRelease::new(ring, ring.ledger.head()) };
+        while batch.take().is_some() {}
+        batch.publish_closed();
     }
 }
 
