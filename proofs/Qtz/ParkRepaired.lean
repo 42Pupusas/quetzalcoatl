@@ -2,8 +2,8 @@ import Qtz.ParkObserving
 
 /-!
 The `repaired` protocol (`WakeSet::stand_down`, used by the mpsc, spmc and mpmc producers) never
-loses a wake, for any number of producers and any number of releases, when the channel is not
-closed.
+loses a wake while the channel is open, for any number of producers and any number of releases.
+`ParkClose` covers the rest of the run.
 
 The count is the one `ParkObserving` keeps, with one more debt. A producer whose re-check took a
 slot, and whose bit a waker then retired, owes the wake it was given: it pays it by running the wake
@@ -35,9 +35,9 @@ def Producer.Fit (p : Producer) (claimed : Prop) : Prop :=
   | .disarmClosed => False
 
 structure State.Repaired (s : State) : Prop where
-  never_closes : s.closes = false
   open_ring : s.closed = false
-  consumer_open : s.consumer = .release ∨ s.consumer = .finished ∨ ∃ w, s.consumer = .waking w
+  consumer_open : s.consumer = .release ∨ s.consumer = .finished ∨ s.consumer = .close ∨
+    ∃ w, s.consumer = .waking w
   fit : ∀ i, (Producer.at s.producers i).Fit (s.Claims i)
   owed : s.Sleeper → s.free ≤ Producer.owedSum s.producers + s.consumer.pending
 
@@ -242,15 +242,13 @@ theorem Waker.step_fit {ps ps' : List Producer} {w : Waker} {next : Option Waker
 theorem State.Repaired.move {s t : State} (inv : s.Repaired) {i : Nat}
     (inside : i < s.producers.length) {f : Producer → Producer}
     (producers : t.producers = Producer.update s.producers i f)
-    (consumer : t.consumer = s.consumer) (closes : t.closes = s.closes)
-    (closed : t.closed = s.closed)
+    (consumer : t.consumer = s.consumer) (closed : t.closed = s.closed)
     (keeps : ∀ k, (Producer.at s.producers i).pc ≠ .forward (.claim k))
     (fit : (f (Producer.at s.producers i)).Fit (s.Claims i))
     (bound : t.free = 0 ∨
       (t.free + (Producer.at s.producers i).owed ≤ s.free + (f (Producer.at s.producers i)).owed ∧
         ((f (Producer.at s.producers i)).pc = .park → (f (Producer.at s.producers i)).bit = false))) :
     t.Repaired where
-  never_closes := closes ▸ inv.never_closes
   open_ring := closed ▸ inv.open_ring
   consumer_open := consumer ▸ inv.consumer_open
   fit j := by
@@ -311,9 +309,8 @@ theorem State.Repaired.consumer_waker {s : State} (inv : s.Repaired) {w : Waker}
   cases next with
   | none =>
     exact {
-      never_closes := inv.never_closes
       open_ring := inv.open_ring
-      consumer_open := inv.never_closes ▸ Consumer.afterRelease_open s.left
+      consumer_open := Consumer.afterRelease_open s.closes s.left
       fit := fun j => (after j).mono fun claims =>
         claims.elim (fun other => Or.inr (moved j other)) (fun resumes => by cases resumes)
       owed := fun sleeper => by
@@ -323,9 +320,8 @@ theorem State.Repaired.consumer_waker {s : State} (inv : s.Repaired) {w : Waker}
         exact this }
   | some w' =>
     exact {
-      never_closes := inv.never_closes
       open_ring := inv.open_ring
-      consumer_open := Or.inr (Or.inr ⟨w', rfl⟩)
+      consumer_open := Or.inr (Or.inr (Or.inr ⟨w', rfl⟩))
       fit := fun j => (after j).mono fun claims =>
         claims.elim (fun other => Or.inr (moved j other))
           (fun resumes => Or.inl (congrArg Consumer.waking (Option.some.inj resumes)))
@@ -357,7 +353,6 @@ theorem State.Repaired.forward_step {s : State} (inv : s.Repaired) {i : Nat}
           exact Or.inr (Pc.forward.inj (pc.symm.trans claim))
         · exact Or.inl (Or.inr ⟨k, same, claim⟩)) step
   exact {
-    never_closes := inv.never_closes
     open_ring := inv.open_ring
     consumer_open := inv.consumer_open
     fit := fun j => by
@@ -426,24 +421,24 @@ theorem State.Repaired.producer_step {s t : State} (inv : s.Repaired) {i : Nat}
     · rename_i free
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .done }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .done }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp_all [Producer.Fit])
         (Or.inr ⟨by simp [Producer.owed, pcEq]; omega, by simp⟩)
     · rename_i full
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .handle }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .handle }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp_all [Producer.Fit]) (Or.inl (by simp [State.setPc]; omega))
   | handle =>
     simp only [pcEq, List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with handle := true, pc := .bit }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with handle := true, pc := .bit }) inside rfl rfl rfl
       (by simp [pcEq]) (by simp_all [Producer.Fit])
       (Or.inr ⟨by simp [Producer.owed, pcEq, State.edit], by simp⟩)
   | bit =>
     simp only [pcEq, List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with bit := true, pc := .recheck }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with bit := true, pc := .recheck }) inside rfl rfl rfl
       (by simp [pcEq]) (by simp_all [Producer.Fit])
       (Or.inr ⟨by simp [Producer.owed, pcEq, State.edit], by simp⟩)
   | recheck =>
@@ -452,13 +447,13 @@ theorem State.Repaired.producer_step {s t : State} (inv : s.Repaired) {i : Nat}
     · rename_i free
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .disarmWon }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .disarmWon }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp_all [Producer.Fit])
         (Or.inr ⟨by simp only [Producer.owed, pcEq]; split <;> omega, by simp⟩)
     · rename_i full
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .park }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .park }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp_all [Producer.Fit]) (Or.inl (by simp [State.setPc]; omega))
   | park =>
     simp only [pcEq] at mem
@@ -466,7 +461,7 @@ theorem State.Repaired.producer_step {s t : State} (inv : s.Repaired) {i : Nat}
     · simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move (f := fun p => { p with token := false, pc := .disarmWoken }) inside
-        rfl rfl rfl rfl (by simp [pcEq]) (by simp [Producer.Fit])
+        rfl rfl rfl (by simp [pcEq]) (by simp [Producer.Fit])
         (Or.inr ⟨by simp [Producer.owed, pcEq, State.edit], by simp⟩)
     · simp at mem
   | disarmWon =>
@@ -476,20 +471,20 @@ theorem State.Repaired.producer_step {s t : State} (inv : s.Repaired) {i : Nat}
       have quiet : (Producer.at s.producers i).bit = false := by simpa using retired
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .forward .scan }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .forward .scan }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp [Producer.Fit, quiet])
         (Or.inr ⟨by simp [Producer.owed, pcEq, quiet, State.edit, Waker.owed], by simp⟩)
     · rename_i standing
       have set : (Producer.at s.producers i).bit = true := by simpa using standing
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with bit := false, pc := .done }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with bit := false, pc := .done }) inside rfl rfl rfl
         (by simp [pcEq]) (by simp [Producer.Fit])
         (Or.inr ⟨by simp [Producer.owed, pcEq, set, State.edit], by simp⟩)
   | disarmWoken =>
     simp only [pcEq, List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with bit := false, pc := .attempt }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with bit := false, pc := .attempt }) inside rfl rfl rfl
       (by simp [pcEq]) (by simp [Producer.Fit])
       (Or.inr ⟨by simp only [Producer.owed, pcEq, State.edit]; split <;> omega, by simp⟩)
   | disarmClosed => simp [Producer.Fit, pcEq] at fit
@@ -500,14 +495,13 @@ theorem State.Repaired.producer_step {s t : State} (inv : s.Repaired) {i : Nat}
   | done => simp [pcEq] at mem
 
 theorem State.Repaired.consumer_step {s t : State} (inv : s.Repaired)
-    (mem : t ∈ s.consumerSteps) : t.Repaired := by
-  rcases inv.consumer_open with consumer | consumer | ⟨w, consumer⟩
+    (notClose : s.consumer ≠ .close) (mem : t ∈ s.consumerSteps) : t.Repaired := by
+  rcases inv.consumer_open with consumer | consumer | consumer | ⟨w, consumer⟩
   · simp only [State.consumerSteps, consumer, List.mem_singleton] at mem
     subst mem
     exact {
-      never_closes := inv.never_closes
       open_ring := inv.open_ring
-      consumer_open := Or.inr (Or.inr ⟨.scan, rfl⟩)
+      consumer_open := Or.inr (Or.inr (Or.inr ⟨.scan, rfl⟩))
       fit := fun j => (inv.fit j).mono fun claims => claims.elim
         (fun waking => by rw [consumer] at waking; cases waking) Or.inr
       owed := fun sleeper => by
@@ -515,47 +509,39 @@ theorem State.Repaired.consumer_step {s t : State} (inv : s.Repaired)
         simp only [consumer, Consumer.pending] at this ⊢
         omega }
   · simp [State.consumerSteps, consumer] at mem
+  · exact absurd consumer notClose
   · simp only [State.consumerSteps, consumer, List.mem_map] at mem
     obtain ⟨⟨ps', next⟩, step, rfl⟩ := mem
     cases next <;> exact inv.consumer_waker consumer step
 
-theorem State.Repaired.step {s t : State} (inv : s.Repaired) (mem : t ∈ s.succs .repaired) :
-    t.Repaired := by
+/-- Every step but the consumer's `close` keeps the invariant; `ParkClose` takes over from there. -/
+theorem State.Repaired.step {s t : State} (inv : s.Repaired) (notClose : s.consumer ≠ .close)
+    (mem : t ∈ s.succs .repaired) : t.Repaired := by
   unfold State.succs at mem
   rcases List.mem_append.mp mem with consumer | producer
-  · exact inv.consumer_step consumer
+  · exact inv.consumer_step notClose consumer
   · obtain ⟨i, inside, step⟩ := List.mem_flatMap.mp producer
     exact inv.producer_step (List.mem_range.mp inside) step
 
-theorem State.Repaired.init (n releases : Nat) : (State.init n releases).Repaired where
-  never_closes := rfl
+theorem State.Repaired.init (n releases : Nat) (closes : Bool) :
+    (State.init n releases closes).Repaired where
   open_ring := rfl
-  consumer_open := by
-    simp only [State.init, Consumer.afterRelease]
-    split <;> simp
+  consumer_open := Consumer.afterRelease_open closes releases
   fit i := by
     simp only [State.init, Producer.at, List.getD_eq_getElem?_getD, List.getElem?_replicate]
     split <;> simp [Producer.Fit, Producer.fresh]
   owed _ := by simp [State.init]
 
-theorem Reach.repaired_inv {n releases : Nat} {s : State}
-    (reach : Reach .repaired (State.init n releases) s) : s.Repaired := by
-  induction reach with
-  | init => exact State.Repaired.init n releases
-  | step _ mem inv => exact inv.step mem
-
-/-- No state the `repaired` protocol reaches is lost, for every number of producers and
-releases. -/
-theorem repaired_never_lost {n releases : Nat} {s : State}
-    (reach : Reach .repaired (State.init n releases) s) : ¬ s.Lost .repaired := by
+/-- A state that keeps the invariant is not lost. -/
+theorem State.Repaired.not_lost {s : State} (inv : s.Repaired) : ¬ s.Lost .repaired := by
   intro ⟨empty, freeOrClosed, ⟨p, member, unfinished⟩⟩
-  have inv := reach.repaired_inv
   unfold State.succs at empty
   obtain ⟨consumerIdle, producersIdle⟩ := List.append_eq_nil_iff.mp empty
   have finished : s.consumer = .finished := by
-    rcases inv.consumer_open with consumer | consumer | ⟨w, consumer⟩
+    rcases inv.consumer_open with consumer | consumer | consumer | ⟨w, consumer⟩
     · simp [State.consumerSteps, consumer] at consumerIdle
     · exact consumer
+    · simp [State.consumerSteps, consumer] at consumerIdle
     · simp only [State.consumerSteps, consumer, List.map_eq_nil_iff] at consumerIdle
       exact absurd consumerIdle (Waker.step_ne_nil _ _)
   have idle : ∀ i, i < s.producers.length →

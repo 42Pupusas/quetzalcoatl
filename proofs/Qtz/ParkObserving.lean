@@ -1,8 +1,8 @@
 import Qtz.ParkModel
 
 /-!
-The `observing` protocol (`broadcast::Producer::push_block`) never loses a wake, for any number of
-producers and any number of releases, when the channel is not closed.
+The `observing` protocol (`broadcast::Producer::push_block`) never loses a wake while the channel is
+open, for any number of producers and any number of releases. `ParkClose` covers the rest of the run.
 
 The invariant counts what is owed to the ring. A producer owes one look at the ring when it is about
 to `attempt`, or when a waker has retired its bit while it waits (its re-check, parked, or about to
@@ -61,9 +61,9 @@ def State.Sleeper (s : State) : Prop :=
   ∃ i, (Producer.at s.producers i).pc = .park ∧ (Producer.at s.producers i).bit = true
 
 structure State.Inv (s : State) : Prop where
-  never_closes : s.closes = false
   open_ring : s.closed = false
-  consumer_open : s.consumer = .release ∨ s.consumer = .finished ∨ ∃ w, s.consumer = .waking w
+  consumer_open : s.consumer = .release ∨ s.consumer = .finished ∨ s.consumer = .close ∨
+    ∃ w, s.consumer = .waking w
   sound : ∀ i, (Producer.at s.producers i).sound (s.claimed i) = true
   owed : s.Sleeper → s.free ≤ Producer.owedSum s.producers + s.consumer.pending
 
@@ -100,11 +100,12 @@ theorem Producer.owedSum_update_same (ps : List Producer) (i : Nat) (f : Produce
   have total := Producer.owedSum_update ps i f inside
   omega
 
-theorem Consumer.afterRelease_open (left : Nat) :
-    Consumer.afterRelease false left = .release ∨ Consumer.afterRelease false left = .finished ∨
-      ∃ w, Consumer.afterRelease false left = .waking w := by
+theorem Consumer.afterRelease_open (closes : Bool) (left : Nat) :
+    Consumer.afterRelease closes left = .release ∨ Consumer.afterRelease closes left = .finished ∨
+      Consumer.afterRelease closes left = .close ∨
+        ∃ w, Consumer.afterRelease closes left = .waking w := by
   simp only [Consumer.afterRelease]
-  split <;> simp
+  split <;> (try split) <;> simp
 
 theorem Producer.at_beyond {ps : List Producer} {i : Nat} (beyond : ¬ i < ps.length) :
     Producer.at ps i = Producer.fresh := by
@@ -172,14 +173,12 @@ theorem Producer.owedSum_eq_zero {ps : List Producer} (none : ∀ p ∈ ps, p.ow
 theorem State.Inv.move {s t : State} (inv : s.Inv) {i : Nat} (inside : i < s.producers.length)
     {f : Producer → Producer}
     (producers : t.producers = Producer.update s.producers i f)
-    (consumer : t.consumer = s.consumer) (closes : t.closes = s.closes)
-    (closed : t.closed = s.closed)
+    (consumer : t.consumer = s.consumer) (closed : t.closed = s.closed)
     (sound : (f (Producer.at s.producers i)).sound (s.claimed i) = true)
     (bound : t.free = 0 ∨
       (t.free + (Producer.at s.producers i).owed ≤ s.free + (f (Producer.at s.producers i)).owed ∧
         ((f (Producer.at s.producers i)).pc = .park → (f (Producer.at s.producers i)).bit = false))) :
     t.Inv where
-  never_closes := closes ▸ inv.never_closes
   open_ring := closed ▸ inv.open_ring
   consumer_open := consumer ▸ inv.consumer_open
   sound j := by
@@ -219,45 +218,45 @@ theorem State.Inv.producer_step {s t : State} (inv : s.Inv) {i : Nat}
     · rename_i free
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .done }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .done }) inside rfl rfl rfl
         (by simp_all [Producer.sound])
         (Or.inr ⟨by simp [Producer.owed, pc]; omega, by simp⟩)
     · rename_i full
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .handle }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .handle }) inside rfl rfl rfl
         (by simp_all [Producer.sound]) (Or.inl (by simp [State.setPc]; omega))
   · simp only [List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with handle := true, pc := .bit }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with handle := true, pc := .bit }) inside rfl rfl rfl
       (by simp_all [Producer.sound])
       (Or.inr ⟨by simp [Producer.owed, pc, State.edit], by simp⟩)
   · simp only [List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with bit := true, pc := .recheck }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with bit := true, pc := .recheck }) inside rfl rfl rfl
       (by simp_all [Producer.sound])
       (Or.inr ⟨by simp [Producer.owed, pc, State.edit], by simp⟩)
   · split at mem
     · simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .disarmWoken }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .disarmWoken }) inside rfl rfl rfl
         (by simp_all [Producer.sound])
         (Or.inr ⟨by simp [Producer.owed, pc, State.setPc], by simp⟩)
     · rename_i full
       simp only [List.mem_singleton] at mem
       subst mem
-      exact inv.move (f := fun p => { p with pc := .park }) inside rfl rfl rfl rfl
+      exact inv.move (f := fun p => { p with pc := .park }) inside rfl rfl rfl
         (by simp_all [Producer.sound]) (Or.inl (by simp [State.setPc]; omega))
   · split at mem
     · simp only [List.mem_singleton] at mem
       subst mem
       exact inv.move (f := fun p => { p with token := false, pc := .disarmWoken }) inside
-        rfl rfl rfl rfl (by simp_all [Producer.sound])
+        rfl rfl rfl (by simp_all [Producer.sound])
         (Or.inr ⟨by simp [Producer.owed, pc, State.edit], by simp⟩)
     · simp at mem
   · simp only [List.mem_singleton] at mem
     subst mem
-    exact inv.move (f := fun p => { p with bit := false, pc := .attempt }) inside rfl rfl rfl rfl
+    exact inv.move (f := fun p => { p with bit := false, pc := .attempt }) inside rfl rfl rfl
       (by simp_all [Producer.sound])
       (Or.inr ⟨by simp only [Producer.owed, pc, State.edit]; split <;> omega, by simp⟩)
   · simp at mem
@@ -270,25 +269,25 @@ theorem State.Inv.sound_unclaimed {s : State} (inv : s.Inv) {consumer : Consumer
   rw [decide_eq_false (after j)]
   exact sound
 
-theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consumerSteps) :
-    t.Inv := by
+theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (notClose : s.consumer ≠ .close)
+    (mem : t ∈ s.consumerSteps) : t.Inv := by
   have afterRelease : ∀ k, Consumer.afterRelease s.closes s.left ≠ .waking (.claim k) := by
     intro k
     unfold Consumer.afterRelease
     split <;> (try split) <;> simp
-  rcases inv.consumer_open with consumer | consumer | ⟨w, consumer⟩
+  rcases inv.consumer_open with consumer | consumer | consumer | ⟨w, consumer⟩
   · simp only [State.consumerSteps, consumer, List.mem_singleton] at mem
     subst mem
     exact {
-      never_closes := inv.never_closes
       open_ring := inv.open_ring
-      consumer_open := Or.inr (Or.inr ⟨.scan, rfl⟩)
+      consumer_open := Or.inr (Or.inr (Or.inr ⟨.scan, rfl⟩))
       sound := inv.sound_unclaimed (by simp [consumer]) (by simp)
       owed := fun sleeper => by
         have := inv.owed sleeper
         simp only [consumer, Consumer.pending] at this ⊢
         omega }
   · simp [State.consumerSteps, consumer] at mem
+  · exact absurd consumer notClose
   · simp only [State.consumerSteps, consumer, List.mem_map] at mem
     obtain ⟨⟨ps, next⟩, step, rfl⟩ := mem
     cases w with
@@ -299,9 +298,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
         simp only [List.mem_singleton, Prod.mk.injEq] at step
         obtain ⟨rfl, rfl⟩ := step
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := inv.never_closes ▸ Consumer.afterRelease_open s.left
+          consumer_open := Consumer.afterRelease_open s.closes s.left
           sound := inv.sound_unclaimed (by simp [consumer]) afterRelease
           owed := fun ⟨j, _, bit⟩ => by
             have mem : j ∈ (List.range s.producers.length).filter
@@ -313,9 +311,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
         simp only [Prod.mk.injEq] at step
         obtain ⟨rfl, rfl⟩ := step
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := Or.inr (Or.inr ⟨.clear k, rfl⟩)
+          consumer_open := Or.inr (Or.inr (Or.inr ⟨.clear k, rfl⟩))
           sound := inv.sound_unclaimed (by simp [consumer]) (by simp)
           owed := fun sleeper => by
             have := inv.owed sleeper
@@ -332,9 +329,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
         simp only [State.claimed, consumer] at unclaimed
         obtain ⟨owedBefore, owedAfter, soundAfter⟩ := Producer.retire bit unclaimed
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := Or.inr (Or.inr ⟨.claim k, rfl⟩)
+          consumer_open := Or.inr (Or.inr (Or.inr ⟨.claim k, rfl⟩))
           sound := fun j => by
             simp only [State.claimed]
             rw [Producer.at_update]
@@ -365,9 +361,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
       · simp only [List.mem_singleton, Prod.mk.injEq] at step
         obtain ⟨rfl, rfl⟩ := step
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := Or.inr (Or.inr ⟨.scan, rfl⟩)
+          consumer_open := Or.inr (Or.inr (Or.inr ⟨.scan, rfl⟩))
           sound := inv.sound_unclaimed (by simp [consumer]) (by simp)
           owed := fun sleeper => by
             have := inv.owed sleeper
@@ -387,9 +382,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
           · rw [Producer.at_beyond inside] at handle
             cases handle
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := inv.never_closes ▸ Consumer.afterRelease_open s.left
+          consumer_open := Consumer.afterRelease_open s.closes s.left
           sound := fun j => by
             simp only [State.claimed]
             rw [Producer.at_update, decide_eq_false (afterRelease j)]
@@ -424,9 +418,8 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
         simp only [List.mem_singleton, Prod.mk.injEq] at step
         obtain ⟨rfl, rfl⟩ := step
         exact {
-          never_closes := inv.never_closes
           open_ring := inv.open_ring
-          consumer_open := Or.inr (Or.inr ⟨.scan, rfl⟩)
+          consumer_open := Or.inr (Or.inr (Or.inr ⟨.scan, rfl⟩))
           sound := fun j => by
             simp only [State.claimed]
             by_cases eq : j = k
@@ -440,42 +433,34 @@ theorem State.Inv.consumer_step {s t : State} (inv : s.Inv) (mem : t ∈ s.consu
             simp only [consumer, Consumer.pending] at this ⊢
             omega }
 
-theorem State.Inv.step {s t : State} (inv : s.Inv) (mem : t ∈ s.succs .observing) : t.Inv := by
+/-- Every step but the consumer's `close` keeps the invariant; `ParkClose` takes over from there. -/
+theorem State.Inv.step {s t : State} (inv : s.Inv) (notClose : s.consumer ≠ .close)
+    (mem : t ∈ s.succs .observing) : t.Inv := by
   unfold State.succs at mem
   rcases List.mem_append.mp mem with consumer | producer
-  · exact inv.consumer_step consumer
+  · exact inv.consumer_step notClose consumer
   · obtain ⟨i, inside, step⟩ := List.mem_flatMap.mp producer
     exact inv.producer_step (List.mem_range.mp inside) step
 
-theorem State.Inv.init (n releases : Nat) : (State.init n releases).Inv where
-  never_closes := rfl
+theorem State.Inv.init (n releases : Nat) (closes : Bool) :
+    (State.init n releases closes).Inv where
   open_ring := rfl
-  consumer_open := by
-    simp only [State.init, Consumer.afterRelease]
-    split <;> simp
+  consumer_open := Consumer.afterRelease_open closes releases
   sound i := by
     simp only [State.init, Producer.at, List.getD_eq_getElem?_getD, List.getElem?_replicate]
     split <;> rfl
   owed _ := by simp [State.init]
 
-theorem Reach.observing_inv {n releases : Nat} {s : State}
-    (reach : Reach .observing (State.init n releases) s) : s.Inv := by
-  induction reach with
-  | init => exact State.Inv.init n releases
-  | step _ mem inv => exact inv.step mem
-
-/-- No state the `observing` protocol reaches is lost, for every number of producers and
-releases. -/
-theorem observing_never_lost {n releases : Nat} {s : State}
-    (reach : Reach .observing (State.init n releases) s) : ¬ s.Lost .observing := by
+/-- A state that keeps the invariant is not lost. -/
+theorem State.Inv.not_lost {s : State} (inv : s.Inv) : ¬ s.Lost .observing := by
   intro ⟨empty, freeOrClosed, ⟨p, member, unfinished⟩⟩
-  have inv := reach.observing_inv
   unfold State.succs at empty
   obtain ⟨consumerIdle, producersIdle⟩ := List.append_eq_nil_iff.mp empty
   have finished : s.consumer = .finished := by
-    rcases inv.consumer_open with consumer | consumer | ⟨w, consumer⟩
+    rcases inv.consumer_open with consumer | consumer | consumer | ⟨w, consumer⟩
     · simp [State.consumerSteps, consumer] at consumerIdle
     · exact consumer
+    · simp [State.consumerSteps, consumer] at consumerIdle
     · simp only [State.consumerSteps, consumer, List.map_eq_nil_iff] at consumerIdle
       exact absurd consumerIdle (Waker.step_ne_nil _ _)
   have idle : ∀ i, i < s.producers.length →
