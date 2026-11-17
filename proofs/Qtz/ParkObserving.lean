@@ -20,12 +20,19 @@ namespace Qtz
 
 namespace Park
 
+/-- 1 while a waker has yet to retire a bit. -/
+def Waker.owed : Waker → Nat
+  | .scan | .clear _ => 1
+  | .claim _ => 0
+
 /-- 1 when the producer will look at the ring again before it can arm: about to `attempt`, or
-waiting with its bit retired by a waker. -/
+waiting with its bit retired by a waker. Under `repaired`, also 1 when its re-check won and its bit
+was retired, until the wake it forwards retires another bit. -/
 def Producer.owed (p : Producer) : Nat :=
   match p.pc with
   | .attempt => 1
-  | .recheck | .park | .disarmWoken => if p.bit then 0 else 1
+  | .recheck | .park | .disarmWoken | .disarmWon => if p.bit then 0 else 1
+  | .forward w => w.owed
   | _ => 0
 
 /-- What `observing` keeps true of each producer. `claimed` says the consumer is about to claim this
