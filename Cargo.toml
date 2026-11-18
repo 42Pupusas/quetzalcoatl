@@ -49,12 +49,10 @@ include = [
 # `mpmc_vs_nspmc_dhat`). Run with:
 #   cargo run --release --example mpmc_vs_nspmc_dhat --features dhat-heap
 # Output is `dhat-heap.json`, loadable in https://nnethercote.github.io/dh_view/dh_view.html
-# Note: `dhat` is declared under `[dependencies]` rather than
-# `[dev-dependencies]` because Cargo disallows optional
-# dev-dependencies, but it's only pulled in when this feature is
-# enabled — production builds are unaffected.
+# The library never uses `dhat`; it is a dev-dependency, and this
+# feature only switches the example's global allocator.
 async = []
-dhat-heap = ["dep:dhat"]
+dhat-heap = []
 # Counts mpmc parks that returned with their handle still armed — so
 # nobody woke them — and how many of those found work immediately
 # after: the signature of a wake that went missing.
@@ -74,15 +72,13 @@ backstop-metrics = []
 # dependency below, not a feature.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
-[dependencies]
-dhat = { version = "0.3", optional = true }
-
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 divan = "0.1"
 crossbeam-channel = "0.5"
+dhat = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 
 [[bench]]
