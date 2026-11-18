@@ -181,15 +181,6 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
     }
 
     #[inline]
-    fn has_item(&self) -> bool {
-        if self.batch_next.get() != self.batch_end.get() {
-            return true;
-        }
-        let head = self.ring().cursors.head().load(Ordering::Relaxed);
-        self.cached_backlog(head) != 0 || self.refreshed_backlog(head) != 0
-    }
-
-    #[inline]
     fn bind_pos(&self, h: usize) -> (*const MaybeUninit<T>, &DoneWord, usize) {
         let q = self.ring();
         let data_ptr = q.data_slot(h).get().cast_const();
@@ -363,31 +354,19 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
 
     /// Returns a zero-copy read reference, blocking when empty.
     ///
-    /// A claim is what proves ownership; `has_item` only reports that
-    /// the shared head was behind the tail. With several consumers
-    /// competing, a peer can take that position between the two, and
-    /// returning the resulting `None` would end a blocking read on an
-    /// open, non-empty ring. A lost claim is contention, not emptiness:
-    /// the loop restarts.
+    /// Same loop as [`pop_block`](Self::pop_block). A claim that comes
+    /// back empty has already retried every head CAS it lost to a
+    /// peer, so it means the ring was empty, never that a peer won.
     #[must_use]
     pub fn pop_ref_block(&mut self) -> Option<SlotReader<'_, T>> {
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
-            if self.has_item() {
-                if let Some(claimed) = self.claim_detached() {
-                    return Some(self.reader_for(claimed));
-                }
-                backoff.reset();
-                continue;
+            if let Some(claimed) = self.claim_detached() {
+                return Some(self.reader_for(claimed));
             }
             if self.ring().closed.is_closed() {
-                if let Some(claimed) = self.claim_detached() {
-                    return Some(self.reader_for(claimed));
-                }
-                // Closed and nothing claimable: a peer took whatever
-                // `has_item` saw and no producer will publish again.
-                return None;
+                return self.claim_detached().map(|c| self.reader_for(c));
             }
             if backoff.spin_unless_exhausted() {
                 continue;
@@ -397,22 +376,15 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Consumer<T, R> {
             // See pop_block: pairs with WakeSet::wake_one's fence.
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            if self.has_item() {
+            if let Some(claimed) = self.claim_detached() {
                 self.ring().consumer_park.stand_down(slot);
-                if let Some(claimed) = self.claim_detached() {
-                    return Some(self.reader_for(claimed));
-                }
-                backoff.reset();
-                continue;
+                return Some(self.reader_for(claimed));
             }
             // SeqCst: post-arm half of the close handshake, paired
             // with the SeqCst fetch_or on the park bitmask above.
             if self.ring().closed.is_closed_for_parking() {
                 self.ring().consumer_park.stand_down(slot);
-                if let Some(claimed) = self.claim_detached() {
-                    return Some(self.reader_for(claimed));
-                }
-                return None;
+                return self.claim_detached().map(|c| self.reader_for(c));
             }
 
             self.ring().consumer_park.park();

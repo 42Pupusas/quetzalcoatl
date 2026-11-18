@@ -49,3 +49,21 @@ impl fmt::Display for RingSnapshot {
         writeln!(f, "awaited = {:?}", self.awaited)
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::RingSnapshot;
+    use crate::capacity::Capacity;
+    use crate::mpmc::SplitRing;
+
+    #[test]
+    fn an_idle_ring_reads_as_nothing_parked() {
+        let (producer, _consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+        producer.push(1).unwrap();
+        let text = RingSnapshot::take(&*producer.queue).to_string();
+        assert!(text.starts_with("claim = "), "{text}");
+        assert!(text.contains("producer_park = 0x0\n"), "{text}");
+        assert!(text.contains("consumer_park = 0x0\n"), "{text}");
+        assert!(text.ends_with("awaited = []\n"), "{text}");
+    }
+}
