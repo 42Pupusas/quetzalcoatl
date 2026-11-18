@@ -762,7 +762,7 @@ theorem State.Safe.consumer_waker {variant : Variant} {s : State} (inv : s.Safe 
       flushed := fun c => nomatch opened.symm.trans c }
 
 theorem State.Safe.consumer_step {variant : Variant} {s t : State} (inv : s.Safe variant)
-    (mem : t ∈ s.consumerSteps) : t.Safe variant := by
+    (mem : t ∈ s.consumerSteps variant) : t.Safe variant := by
   cases consumer : s.consumer with
   | release =>
     simp only [State.consumerSteps, consumer, List.mem_map, List.mem_range] at mem
@@ -1002,7 +1002,7 @@ theorem State.Safe.not_lost {variant : Variant} {s : State} (inv : s.Safe varian
       have := inv.releasing consumer
       simp only [State.consumerSteps, consumer, List.map_eq_nil_iff,
         List.range_eq_nil] at consumerIdle
-      omega
+      split at consumerIdle <;> omega
     | waking w =>
       simp only [State.consumerSteps, consumer, List.map_eq_nil_iff] at consumerIdle
       exact absurd consumerIdle (Waker.step_ne_nil _ _ _)

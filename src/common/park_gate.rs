@@ -11,10 +11,15 @@
 //! them for a slot, and the waiter owning that slot blocks there once,
 //! inside the real `push_block` or `pop_block`.
 //!
-//! Outside tests the gate is an empty struct and both calls compile to
-//! nothing.
+//! The gate also decides whether the set's
+//! [`ReplayPoint`]s stop: only the one set a schedule replay follows
+//! does, so a ring's other wake sets run straight through.
+//!
+//! Outside tests the gate is an empty struct and every call compiles
+//! to nothing.
 
 use super::park_registry::ParkSlot;
+use super::replay_point::ReplayPoint;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -74,6 +79,8 @@ pub struct ParkGate {
     pub before_arm: Hold,
     /// Before the waiter clears its bit, on any exit.
     pub before_clear: Hold,
+    /// Whether a schedule replay follows this set.
+    replayed: AtomicBool,
 }
 
 #[cfg(not(test))]
@@ -85,6 +92,7 @@ impl ParkGate {
         Self {
             before_arm: Hold::new(),
             before_clear: Hold::new(),
+            replayed: AtomicBool::new(false),
         }
     }
 
@@ -94,6 +102,24 @@ impl ParkGate {
 
     pub fn reach_clear(&self, slot: ParkSlot) {
         self.before_clear.reach(slot);
+    }
+
+    /// Makes this set's replay points stop.
+    pub fn follow_in_replay(&self) {
+        self.replayed.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops at `point` if a replay follows this set.
+    pub fn reach(&self, point: ReplayPoint) {
+        if self.replayed.load(Ordering::SeqCst) {
+            point.reach();
+        }
+    }
+
+    /// Stops at [`ReplayPoint::Park`] if a replay follows this set.
+    /// `true` when the replay then stands in for the park.
+    pub fn park_in_replay(&self) -> bool {
+        self.replayed.load(Ordering::SeqCst) && ReplayPoint::park_in_replay()
     }
 }
 
@@ -110,4 +136,14 @@ impl ParkGate {
     #[inline]
     #[allow(clippy::unused_self)]
     pub const fn reach_clear(&self, _slot: ParkSlot) {}
+
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub const fn reach(&self, _point: ReplayPoint) {}
+
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub const fn park_in_replay(&self) -> bool {
+        false
+    }
 }

@@ -27,6 +27,8 @@ pub mod park_probe;
 #[cfg(feature = "async")]
 pub mod park_registration;
 pub mod park_registry;
+#[cfg(all(test, not(loom)))]
+pub mod park_replay;
 pub mod position_order;
 #[cfg(test)]
 pub mod probe_budget;
@@ -34,6 +36,7 @@ pub mod probe_budget;
 pub mod progress_watchdog;
 #[cfg(feature = "async")]
 pub mod registration_id;
+pub mod replay_point;
 pub mod seq_slot;
 pub mod single_parker;
 pub mod slot_sequence;

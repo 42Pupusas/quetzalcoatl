@@ -4,3 +4,7 @@ defaultTargets = ["Qtz"]
 [[lean_lib]]
 name = "Qtz"
 moreLeanArgs = ["--memory=8192"]
+
+[[lean_exe]]
+name = "park_graph"
+root = "ParkGraph"

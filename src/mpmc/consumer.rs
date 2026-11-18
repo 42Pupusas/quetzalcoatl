@@ -482,6 +482,7 @@ impl<T, C: Config> Drop for Consumer<T, C> {
         // producers parked in `push_block` so they can observe it
         // and return Err.
         if self.queue.consumer_count_live.release() {
+            crate::common::replay_point::ReplayPoint::Close.reach();
             // SeqCst: pairs with each producer's post-arm SeqCst load.
             self.queue.consumer_closed.close();
             self.queue.producer_park.flush();

@@ -11,6 +11,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::replay_point::ReplayPoint;
 use crate::common::{SlotSequence, UncommittedSlot};
 
 /// The producer side of an MPSC ring buffer.
@@ -139,9 +140,11 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
         let slot = self.park_slot;
         let mut backoff = Backoff::new();
         loop {
+            ReplayPoint::Top.reach();
             if q.consumer_closed.is_closed() {
                 return Err(val);
             }
+            ReplayPoint::Attempt.reach();
             match self.push(val) {
                 Ok(()) => return Ok(()),
                 Err(returned) => val = returned,
@@ -158,13 +161,17 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             // load of the claim word ahead of it.
             std::sync::atomic::fence(Ordering::SeqCst);
 
+            ReplayPoint::Recheck.reach();
             // SeqCst: post-arm half of the close handshake.
             if q.consumer_closed.is_closed_for_parking() {
+                ReplayPoint::DisarmClosed.reach();
                 q.producer_park.stand_down(slot);
                 return Err(val);
             }
+            ReplayPoint::RecheckRing.reach();
             match self.push(val) {
                 Ok(()) => {
+                    ReplayPoint::DisarmWon.reach();
                     q.producer_park.stand_down(slot);
                     return Ok(());
                 }
@@ -172,6 +179,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> Producer<T, R> {
             }
 
             q.producer_park.park();
+            ReplayPoint::DisarmWoken.reach();
             q.producer_park.disarm(slot);
             backoff.reset();
         }

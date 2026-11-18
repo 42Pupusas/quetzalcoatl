@@ -262,6 +262,7 @@ impl<T, R: Deref<Target = RingBuffer<T>>> crate::common::SingleParkerConsumerRef
 
 impl<T, R: Deref<Target = RingBuffer<T>>> Drop for Consumer<T, R> {
     fn drop(&mut self) {
+        crate::common::replay_point::ReplayPoint::Close.reach();
         // SeqCst: pairs with each producer's post-arm SeqCst load of
         // consumer_closed, ordering it against their SeqCst fetch_or on
         // the park bitmask.

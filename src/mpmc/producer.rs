@@ -11,6 +11,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::replay_point::ReplayPoint;
 use crate::common::UncommittedSlot;
 
 /// Tight-spin iterations on the primary slot's `done` before
@@ -381,6 +382,7 @@ impl<T, C: Config> Producer<T, C> {
         let mut backoff = Backoff::new();
         let mut watch = q.watch_backstop_producer();
         loop {
+            ReplayPoint::Top.reach();
             match self.push(val) {
                 Ok(()) => {
                     watch.made_progress();
@@ -388,6 +390,7 @@ impl<T, C: Config> Producer<T, C> {
                 }
                 Err(returned) => val = returned,
             }
+            ReplayPoint::TopClosed.reach();
             if q.consumer_closed.is_closed() {
                 return Err(val);
             }
@@ -406,16 +409,20 @@ impl<T, C: Config> Producer<T, C> {
             // Fence: see park_until_slot_free for the rationale.
             std::sync::atomic::fence(Ordering::SeqCst);
 
+            ReplayPoint::Recheck.reach();
             match self.push(val) {
                 Ok(()) => {
                     watch.made_progress();
+                    ReplayPoint::DisarmWon.reach();
                     q.producer_park.stand_down_waking_all(slot);
                     self.retract_awaited();
                     return Ok(());
                 }
                 Err(returned) => val = returned,
             }
+            ReplayPoint::RecheckClosed.reach();
             if q.consumer_closed.is_closed_for_parking() {
+                ReplayPoint::DisarmClosed.reach();
                 q.producer_park.stand_down_waking_all(slot);
                 self.retract_awaited();
                 return Err(val);
@@ -424,6 +431,7 @@ impl<T, C: Config> Producer<T, C> {
             watch.about_to_park(q.producer_park.others_parked(slot), self.has_free_slot());
             q.producer_park.park();
             watch.parked_at(&q.producer_park, slot, || self.has_free_slot());
+            ReplayPoint::DisarmWoken.reach();
             q.producer_park.disarm(slot);
         }
     }

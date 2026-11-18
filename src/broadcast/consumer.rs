@@ -52,6 +52,7 @@ impl<T> Drop for Consumer<T> {
         // Deactivate this consumer's slot. Does NOT drain items —
         // data is shared with other consumers and cleaned up by
         // the producer (on overwrite) or RingBuffer (on drop).
+        crate::common::replay_point::ReplayPoint::Close.reach();
         self.queue.consumers.unsubscribe(self.slot_index);
         // Flush blocking producers parked in push_block/reserve_block.
         // Going inactive raises `min_head` (this consumer no longer

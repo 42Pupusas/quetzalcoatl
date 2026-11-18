@@ -21,6 +21,7 @@ use std::sync::atomic::Ordering;
 
 use super::park_gate::ParkGate;
 use super::park_overflow::ParkOverflow;
+use super::replay_point::ReplayPoint;
 use super::thread_parker::ThreadParker;
 use super::wake_interest::WakeInterest;
 use super::AlignedBuf;
@@ -160,7 +161,7 @@ impl WakeSet {
     /// Dekker-style missed wake described on [`wake_one`].
     #[inline]
     pub fn wake_one_published(&self) {
-        self.overflow.wake_all();
+        self.drain_overflow(1);
         // Round-robin: rotate the bitmap so the slot just past
         // `cursor` is the new lowest bit, and pick its trailing
         // zero. Without this, `trailing_zeros` always picks the
@@ -174,6 +175,7 @@ impl WakeSet {
         // just re-parks), producer 3 stays parked indefinitely.
         let cursor = self.cursor.load(Ordering::Relaxed);
         loop {
+            self.gate.reach(ReplayPoint::Scan { cursor, count: 1 });
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 return;
@@ -186,6 +188,11 @@ impl WakeSet {
             let rel_bit = rotated.trailing_zeros();
             let bit = (rel_bit + shift) & PARK_MASK_U32;
             let mask = 1u64 << bit;
+            self.gate.reach(ReplayPoint::Clear {
+                slot: bit,
+                count: 1,
+                cursor,
+            });
             let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
             if prev & mask == 0 {
                 // Concurrent wake_one beat us to this bit; pick another.
@@ -194,6 +201,11 @@ impl WakeSet {
             // Advance cursor past this slot for the next caller.
             self.cursor
                 .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
+            self.gate.reach(ReplayPoint::Claim {
+                slot: bit,
+                count: 1,
+                cursor,
+            });
             if self.parkers[bit as usize].wake() {
                 return;
             }
@@ -239,7 +251,8 @@ impl WakeSet {
     #[inline]
     pub fn wake_one_interested(&self, interest: impl Fn(usize) -> WakeInterest) {
         fence(Ordering::SeqCst);
-        self.overflow.wake_all();
+        self.drain_overflow(1);
+        self.reach_scan();
         for rank in [WakeInterest::Reserved, WakeInterest::Any] {
             if self.wake_one_ranked(rank, &interest) {
                 return;
@@ -253,13 +266,21 @@ impl WakeSet {
     ///
     /// Starts at the round-robin cursor so that equally-ranked waiters
     /// take turns, rather than the lowest bit absorbing every release.
+    ///
+    /// The replay stops before a reload only: a pass that finds nothing
+    /// hands straight on to the next, so the loads of both passes count
+    /// as one scan.
     #[inline]
     fn wake_one_ranked(
         &self,
         rank: WakeInterest,
         interest: &impl Fn(usize) -> WakeInterest,
     ) -> bool {
+        let mut reload = false;
         loop {
+            if std::mem::replace(&mut reload, true) {
+                self.reach_scan();
+            }
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 return false;
@@ -270,16 +291,35 @@ impl WakeSet {
                 return false;
             };
             let mask = 1u64 << bit;
+            let cursor = self.cursor.load(Ordering::Relaxed);
+            self.gate.reach(ReplayPoint::Clear {
+                slot: bit,
+                count: 1,
+                cursor,
+            });
             let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
             if prev & mask == 0 {
                 continue;
             }
             self.cursor
                 .store(u64::from(bit).wrapping_add(1), Ordering::Relaxed);
+            self.gate.reach(ReplayPoint::Claim {
+                slot: bit,
+                count: 1,
+                cursor,
+            });
             if self.parkers[bit as usize].wake() {
                 return true;
             }
         }
+    }
+
+    /// Stops a single-wake loop before it loads the bitmap.
+    fn reach_scan(&self) {
+        self.gate.reach(ReplayPoint::Scan {
+            cursor: self.cursor.load(Ordering::Relaxed),
+            count: 1,
+        });
     }
 
     /// The first set bit at or after the cursor whose interest is
@@ -323,10 +363,14 @@ impl WakeSet {
         // sampling the bitmap so prior Release stores on
         // `ready`/`done` are globally visible.
         fence(Ordering::SeqCst);
-        self.overflow.wake_all();
+        self.drain_overflow(n);
         let mut cursor = self.cursor.load(Ordering::Relaxed);
         let mut woken = 0usize;
         while woken < n {
+            self.gate.reach(ReplayPoint::Scan {
+                cursor,
+                count: n - woken,
+            });
             let ws = self.wake.load(Ordering::SeqCst);
             if ws == 0 {
                 self.cursor.store(cursor, Ordering::Relaxed);
@@ -338,14 +382,25 @@ impl WakeSet {
             let rel_bit = rotated.trailing_zeros();
             let bit = (rel_bit + shift) & PARK_MASK_U32;
             let mask = 1u64 << bit;
+            let next = u64::from(bit).wrapping_add(1);
+            self.gate.reach(ReplayPoint::Clear {
+                slot: bit,
+                count: n - woken,
+                cursor: next,
+            });
             let prev = self.wake.fetch_and(!mask, Ordering::SeqCst);
-            cursor = u64::from(bit).wrapping_add(1);
+            cursor = next;
             if prev & mask == 0 {
                 // Lost the race on this bit, or it was stale — either
                 // way nothing was delivered, so this does not count
                 // against `n`. `woken` is what advances the count.
                 continue;
             }
+            self.gate.reach(ReplayPoint::Claim {
+                slot: bit,
+                count: n - woken,
+                cursor,
+            });
             if self.parkers[bit as usize].wake() {
                 woken += 1;
             }
@@ -356,13 +411,25 @@ impl WakeSet {
     /// Wakes every waiter parked on the bitmap, swapping it to zero
     /// in the process. Cold-path helper for close-time draining.
     pub fn flush(&self) {
-        self.overflow.wake_all();
+        self.drain_overflow(0);
+        self.gate.reach(ReplayPoint::Flush);
         let mut bits = self.wake.swap(0, Ordering::AcqRel);
         while bits != 0 {
+            self.gate.reach(ReplayPoint::Flushing { bits });
             let b = bits.trailing_zeros() as usize;
             self.parkers[b].wake();
             bits &= bits - 1;
         }
+        self.gate.reach(ReplayPoint::FlushingDone);
+    }
+
+    /// Wakes every waiter on the overflow stack, as the first part of a
+    /// wake loop owing `count` wakes (0 for a flush).
+    #[inline]
+    fn drain_overflow(&self, count: usize) {
+        self.gate.reach(ReplayPoint::Drain { count });
+        self.overflow.wake_all();
+        self.gate.reach(ReplayPoint::UnparkDone);
     }
 
     /// Publishes the calling thread's handle at `slot`, replacing any
@@ -401,11 +468,13 @@ impl WakeSet {
     #[inline]
     pub fn arm(&self, slot: ParkSlot) {
         self.gate.reach_arm(slot);
+        self.gate.reach(ReplayPoint::Handle);
         if !slot.is_leased() {
             self.overflow.register();
             return;
         }
         self.arm_handle(slot);
+        self.gate.reach(ReplayPoint::Bit);
         self.wake.fetch_or(slot.mask(), Ordering::SeqCst);
     }
 
@@ -417,8 +486,10 @@ impl WakeSet {
     /// that never comes is therefore a hang rather than a stall, so a
     /// lost-wake defect cannot hide as latency.
     #[inline]
-    #[allow(clippy::unused_self)]
     pub fn park(&self) {
+        if self.gate.park_in_replay() {
+            return;
+        }
         super::atomics::thread::park();
     }
 

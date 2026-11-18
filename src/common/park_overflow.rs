@@ -55,6 +55,7 @@
 use std::ptr;
 
 use super::atomics::{thread, AtomicPtr};
+use super::replay_point::ReplayPoint;
 use std::sync::atomic::Ordering;
 use thread::Thread;
 
@@ -142,12 +143,44 @@ impl ParkOverflow {
         self.note_take();
         let mut node = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         while !node.is_null() {
+            Self::reach_unpark(node);
             // SAFETY: the swap detached the whole chain, so this thread
             // is its sole owner and no peer can reach these nodes.
             let owned = unsafe { Box::from_raw(node) };
             node = owned.next;
+            ReplayPoint::unparked(&owned.thread);
             owned.thread.unpark();
         }
+    }
+
+    /// Stops the replay before unparking the chain from `node` on.
+    #[cfg(all(test, not(loom)))]
+    fn reach_unpark(node: *mut Node) {
+        ReplayPoint::Unpark.reach_unparking(Self::chain_threads(node));
+    }
+
+    #[cfg(not(all(test, not(loom))))]
+    #[inline]
+    const fn reach_unpark(_node: *mut Node) {}
+
+    /// The threads of the chain from `node` on, newest first.
+    #[cfg(all(test, not(loom)))]
+    fn chain_threads(mut node: *mut Node) -> Vec<std::thread::ThreadId> {
+        let mut threads = Vec::new();
+        while !node.is_null() {
+            // SAFETY: test-only; the caller owns the chain, or holds
+            // `&self` with no concurrent drainer.
+            let current = unsafe { &*node };
+            threads.push(current.thread.id());
+            node = current.next;
+        }
+        threads
+    }
+
+    /// The registered threads, newest first.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn threads(&self) -> Vec<std::thread::ThreadId> {
+        Self::chain_threads(self.head.load(Ordering::Acquire))
     }
 
     /// Whether any waiter is registered.

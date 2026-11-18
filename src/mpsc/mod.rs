@@ -29,6 +29,8 @@ mod batch_release;
 mod claim_ledger;
 mod consumer;
 mod producer;
+#[cfg(all(test, not(loom)))]
+mod replay;
 mod reservation_release;
 mod slot_release;
 mod split_ring;

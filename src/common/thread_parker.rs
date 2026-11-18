@@ -33,6 +33,7 @@
 //! Staleness only spans calls, which is exactly what re-arming fixes.
 
 use super::atomics::{thread, AtomicPtr};
+use super::replay_point::ReplayPoint;
 use std::ptr;
 use std::sync::atomic::Ordering;
 use thread::Thread;
@@ -92,6 +93,7 @@ impl ThreadParker {
         // SAFETY: the swap removed `claimed` from the slot, so this
         // thread is its sole owner and no peer can observe it again.
         let handle = unsafe { Box::from_raw(claimed) };
+        ReplayPoint::unparked(&handle);
         handle.unpark();
         true
     }

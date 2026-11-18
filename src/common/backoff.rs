@@ -130,6 +130,9 @@ impl Backoff {
     /// ```
     #[inline]
     pub fn spin_unless_exhausted(&mut self) -> bool {
+        if let Some(spin) = super::replay_point::ReplayPoint::spin_verdict() {
+            return spin;
+        }
         if self.is_exhausted() {
             return false;
         }

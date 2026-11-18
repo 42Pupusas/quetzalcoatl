@@ -219,6 +219,24 @@ modules and did not compile for anyone.
   is sequenced with.
 
 ### Added
+- **A schedule replay checks every flavor's `push_block` against the
+  Lean park model.** `proofs/ParkGraph.lean` (`lake exe park_graph
+  <name>`) prints the model's reachable step graph for a small
+  configuration. The tests in `src/{mpsc,broadcast,mpmc}/replay.rs` run
+  the real producer and consumer code one model step at a time, try
+  every interleaving, and fail on any Rust step the graph does not
+  have. The tests run `lake` themselves, so they need it on `PATH` and
+  always check against the current model. Swapping `stand_down` for
+  `disarm` in mpsc or mpmc, or dropping broadcast's post-arm free-slot
+  check, fails the replay with the schedule that shows it. The two-producer mpmc
+  runs are `#[ignore]`d: `wake_n(64)` on stand-down makes their graphs
+  large.
+
+  The model now says what a close does to the free slots, per flavor:
+  mpsc's consumer drop releases what is left, broadcast's last
+  unsubscribe leaves no slot to take, mpmc leaves them as they are. It
+  also releases one slot per wake for mpmc and broadcast, which wake
+  once per release. `never_lost` still holds.
 - **`backstop-metrics`, a diagnostic feature that measures whether
   mpmc's `PARK_BACKSTOP` is still needed.** The 1ms bound on a parked
   mpmc waiter's sleep exists because a missed wake was seen under

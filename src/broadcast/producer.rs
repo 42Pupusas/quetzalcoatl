@@ -13,6 +13,7 @@ use crate::common::backoff::Backoff;
 #[cfg(feature = "async")]
 use crate::common::park_registration::ParkRegistration;
 use crate::common::park_registry::ParkSlot;
+use crate::common::replay_point::ReplayPoint;
 use crate::common::UncommittedSlot;
 
 /// The producer side of a broadcast ring buffer.
@@ -195,10 +196,13 @@ impl<T> Producer<T> {
         // forever and never reaches the park below. `has_space` claims
         // nothing, so we only `push` once a slot is genuinely free.
         loop {
+            ReplayPoint::Top.reach();
             if !q.consumers.any_subscribed() {
                 return Err(val);
             }
+            ReplayPoint::Attempt.reach();
             if self.has_space() {
+                ReplayPoint::Take.reach();
                 // Space confirmed; `push` won't block in claim_slot's
                 // min_head spin. A racing producer (SubRepl has N
                 // producers) could still take the last slot first, in
@@ -227,20 +231,25 @@ impl<T> Producer<T> {
             // (or dropped) between our has_space check and the fetch_or
             // would otherwise have nothing left to wake us. Either we make
             // progress here, or the consumer's wake_one/flush sees the bit.
+            ReplayPoint::Recheck.reach();
             if !q.consumers.any_subscribed() {
+                ReplayPoint::DisarmClosed.reach();
                 q.producer_park.disarm(slot);
                 return Err(val);
             }
+            ReplayPoint::RecheckRing.reach();
             if self.has_space() {
                 // Nothing is claimed here, so a wake that retired our bit
                 // still has its slot for the loop top to take or lose to a
                 // peer, who then parks and re-arms.
+                ReplayPoint::DisarmWoken.reach();
                 q.producer_park.disarm(slot);
                 backoff.reset();
                 continue;
             }
 
             q.producer_park.park();
+            ReplayPoint::DisarmWoken.reach();
             q.producer_park.disarm(slot);
             backoff.reset();
         }

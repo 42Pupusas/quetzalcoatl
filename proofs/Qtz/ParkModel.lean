@@ -10,11 +10,16 @@ and instead pushes its thread onto the overflow stack. `stack` is that stack, ne
 entry per push: a producer that pushes again before a drain has two entries, and is unparked twice.
 `registered` marks a producer with at least one entry. Each producer has its park token (set by an
 unpark that finds the thread not parked, as with `std::thread::park`) and a program counter. The
-consumer releases its `left` slots in batches of any size, each followed by a wake loop owing one
-wake per slot: a batch of one is `pop` and `wake_one`, a larger one is `drain` and `wake_n`. When
+consumer releases its `left` slots in batches, each followed by a wake loop owing one wake per slot:
+a batch of one is `pop` and `wake_one`, a larger one is mpsc's `drain` and `wake_n`
+(`Variant.batchesWakes`; mpmc and broadcast wake once per slot, so they release one at a time). When
 `closes` is set it then drops: it raises `closed`, drains the overflow stack, swaps the wake bitmap
-to zero (`WakeSet::flush`) and claims the handle of every producer whose bit it took. It wakes
-nobody after that: the values left in the ring are released without a wake.
+to zero (`WakeSet::flush`) and claims the handle of every producer whose bit it took. What the close
+does to the free slots depends on the flavor. mpsc (`Variant.dropFrees`) releases the values left
+in the ring as its last step, without a wake, which frees every slot: `capacity` is the ring's
+size, and a producer that has not yet seen `closed` can still claim one. Broadcast
+(`Variant.closeFills`) has no slot to give once its last subscriber leaves, so the close itself
+leaves none free. mpmc leaves the slots as they are.
 
 Steps. Every step is one atomic access, interleaved arbitrarily between actors. A producer's loop
 reads the closed flag and the ring in two steps, in the order its flavor does:
@@ -104,6 +109,23 @@ def Variant.observes : Variant → Bool
   | .observing | .ignoresClose => true
   | _ => false
 
+/-- Whether a release of several slots runs one wake loop for all of them (mpsc's `drain` and
+`wake_n`). mpmc and broadcast run one single wake per slot, which is a batch of one each. -/
+def Variant.batchesWakes : Variant → Bool
+  | .unrepaired | .repaired => true
+  | _ => false
+
+/-- Whether the consumer's drop releases the values left in the ring (mpsc). -/
+def Variant.dropFrees : Variant → Bool
+  | .unrepaired | .repaired => true
+  | _ => false
+
+/-- Whether the close leaves no slot a producer can take (broadcast refuses every write once no
+consumer is subscribed). -/
+def Variant.closeFills : Variant → Bool
+  | .observing | .ignoresClose => true
+  | _ => false
+
 /-- A wake loop's phase. `count` is the number of wakes it has yet to deliver. -/
 inductive Waker where
   | drain (count : Nat)
@@ -169,6 +191,7 @@ structure State where
   consumer : Consumer
   producers : List Producer
   stack : List Nat
+  capacity : Nat
   deriving DecidableEq, Repr
 
 /-- A leased producer that has not started. -/
@@ -177,10 +200,11 @@ def Producer.fresh : Producer := ⟨.top, true, false, false, false, false⟩
 def Consumer.afterRelease (closes : Bool) (left : Nat) : Consumer :=
   if left = 0 then (if closes then .close else .finished) else .release
 
-/-- One producer per entry of `leases`, leased a park slot where it is `true`. -/
+/-- One producer per entry of `leases`, leased a park slot where it is `true`. The ring starts full
+and its capacity is the number of releases. -/
 def State.init (leases : List Bool) (releases : Nat) (closes : Bool := false) : State :=
   ⟨0, releases, closes, false, Consumer.afterRelease closes releases,
-    leases.map (fun leased => { Producer.fresh with leased }), []⟩
+    leases.map (fun leased => { Producer.fresh with leased }), [], releases⟩
 
 def Producer.at (ps : List Producer) (i : Nat) : Producer := ps.getD i Producer.fresh
 
@@ -297,10 +321,10 @@ def State.bitIndices (s : State) : List Nat :=
 def State.spurious (s : State) (i : Nat) : List State :=
   if (Producer.at s.producers i).pc = .park then [s.setPc i .disarmWoken] else []
 
-def State.consumerSteps (s : State) : List State :=
+def State.consumerSteps (variant : Variant) (s : State) : List State :=
   match s.consumer with
   | .release =>
-    (List.range s.left).map fun batch =>
+    (List.range (if variant.batchesWakes then s.left else min s.left 1)).map fun batch =>
       { s with free := s.free + (batch + 1), left := s.left - (batch + 1),
                consumer := .waking (.drain (batch + 1)) }
   | .waking w =>
@@ -310,7 +334,9 @@ def State.consumerSteps (s : State) : List State :=
       | none =>
         { s with producers := ps, stack := w.stackAfter s.stack,
                  consumer := Consumer.afterRelease s.closes s.left }
-  | .close => [{ s with closed := true, consumer := .drainOverflow }]
+  | .close =>
+    [{ s with closed := true, consumer := .drainOverflow,
+              free := if variant.closeFills then 0 else s.free }]
   | .drainOverflow =>
     [{ s with
         producers := Producer.unregister s.producers, stack := [],
@@ -324,7 +350,8 @@ def State.consumerSteps (s : State) : List State :=
     [{ s with
         producers := s.producers.map fun p => { p with bit := false },
         consumer := .flushing s.bitIndices }]
-  | .flushing [] => [{ s with consumer := .finished }]
+  | .flushing [] =>
+    [{ s with free := if variant.dropFrees then s.capacity else s.free, consumer := .finished }]
   | .flushing (i :: rest) =>
     [{ s with
         producers := Producer.update s.producers i fun p =>
@@ -334,7 +361,7 @@ def State.consumerSteps (s : State) : List State :=
 
 /-- Every successor by a step that some actor takes for a reason. -/
 def State.succs (variant : Variant) (s : State) : List State :=
-  s.consumerSteps ++ (List.range s.producers.length).flatMap (s.producerSteps variant)
+  s.consumerSteps variant ++ (List.range s.producers.length).flatMap (s.producerSteps variant)
 
 def State.spuriousSteps (s : State) : List State :=
   (List.range s.producers.length).flatMap s.spurious
@@ -356,7 +383,7 @@ def State.Lost (variant : Variant) (s : State) : Prop :=
 
 /-- The steps actor `actor` can take: `0` is the consumer, `k + 1` producer `k`. -/
 def State.actorSteps (variant : Variant) (s : State) (actor : Nat) : List State :=
-  if actor = 0 then s.consumerSteps
+  if actor = 0 then s.consumerSteps variant
   else if actor - 1 < s.producers.length then s.producerSteps variant (actor - 1)
   else []
 
@@ -407,7 +434,7 @@ def lostSchedule : List (Nat × Nat) :=
 
 def lostState : State :=
   ⟨1, 0, false, false, .finished,
-    [⟨.done, true, false, false, true, false⟩, ⟨.park, true, true, true, false, false⟩], []⟩
+    [⟨.done, true, false, false, true, false⟩, ⟨.park, true, true, true, false, false⟩], [], 2⟩
 
 theorem lostSchedule_reaches_lostState :
     (State.init [true, true] 2).run .unrepaired lostSchedule = some lostState := by
@@ -428,7 +455,7 @@ def closedSchedule : List (Nat × Nat) :=
   [(1, 0), (1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (1, 0), (1, 0), (1, 0), (1, 0)]
 
 def closedState : State :=
-  ⟨0, 0, true, true, .finished, [⟨.park, true, true, true, false, false⟩], []⟩
+  ⟨0, 0, true, true, .finished, [⟨.park, true, true, true, false, false⟩], [], 0⟩
 
 theorem closedSchedule_reaches_closedState :
     (State.init [true] 0 true).run .ignoresClose closedSchedule = some closedState := by

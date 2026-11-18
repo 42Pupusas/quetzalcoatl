@@ -63,6 +63,8 @@ mod done_word;
 mod drain_wake;
 mod producer;
 mod ready_word;
+#[cfg(all(test, not(loom)))]
+mod replay;
 #[cfg(feature = "backstop-metrics")]
 mod rescue_evidence;
 mod reservation_return;

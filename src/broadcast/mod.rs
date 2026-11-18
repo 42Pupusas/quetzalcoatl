@@ -45,6 +45,8 @@ mod consumer_registry;
 mod floor_cache;
 mod head_advance;
 mod producer;
+#[cfg(all(test, not(loom)))]
+mod replay;
 mod reservation_abandon;
 mod slot_reuse;
 mod slot_state;
