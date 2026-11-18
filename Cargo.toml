@@ -1,6 +1,6 @@
 [package]
 name = "quetzalcoatl"
-version = "0.15.2"
+version = "0.16.0"
 edition = "2021"
 # Raised from 1.88 deliberately: 1.100 stabilizes the `Allocator` trait
 # and `Vec::with_capacity_in`, which `AlignedBuf` is built on, and
