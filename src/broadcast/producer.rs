@@ -18,7 +18,7 @@ use crate::common::UncommittedSlot;
 
 /// The producer side of a broadcast ring buffer.
 ///
-/// Obtained via [`RingBuffer::split`](super::RingBuffer::split). Cloneable
+/// Obtained via [`SplitRing::split`](super::SplitRing::split). Cloneable
 /// — each clone shares the same underlying buffer and competes for slots
 /// by compare-and-swap on the tail.
 pub struct Producer<T> {

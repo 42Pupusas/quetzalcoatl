@@ -852,7 +852,7 @@ mod tests {
             producer.push_block(100).expect("consumers dropped");
         });
         ParkProbe::expect_until("the producer to park and announce", || {
-            ring.producer_park.wake.load(Ordering::Relaxed) != 0
+            ring.producer_park.wake.load(Ordering::Acquire) != 0
         });
         assert!(
             slot.index()
