@@ -23,10 +23,13 @@ readme = "README.md"
 # Every source directory is matched by glob. Listing `src/common`
 # file-by-file is what shipped 0.14.0 broken: nine modules declared in
 # `common/mod.rs` were missing from the tarball, so the published crate
-# did not compile at all. The list was kept manual to hold back
-# `loom_models.rs`; that file is `#[cfg(all(test, loom, ...))]`, so
-# shipping it costs a few KB and compiles for nobody — a far better
-# trade than a list that silently drifts every time a module is added.
+# did not compile at all.
+#
+# Test code is subtracted at the end of the list: rustc does not look
+# for the file of a cfg'd-out `mod`, so the published crate builds
+# without it. Unit tests live in a `tests.rs` next to the code they
+# test, which one glob covers. A module that is test-only as a whole
+# (`#[cfg(test)] mod x;`) must be added to the named list.
 #
 # `cargo package` is the check that catches this: it builds the tarball
 # it produces. Run it before publishing.
@@ -42,6 +45,21 @@ include = [
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "!src/**/tests.rs",
+    "!src/broadcast/replay.rs",
+    "!src/common/drop_counter.rs",
+    "!src/common/loom_models.rs",
+    "!src/common/park_handshake_model.rs",
+    "!src/common/park_probe.rs",
+    "!src/common/park_replay/**",
+    "!src/common/probe_budget.rs",
+    "!src/common/progress_watchdog.rs",
+    "!src/common/staged_handoff.rs",
+    "!src/common/stress_iters.rs",
+    "!src/mpmc/replay.rs",
+    "!src/mpmc/ring_snapshot.rs",
+    "!src/mpsc/replay.rs",
+    "!src/spsc/pinned_ring.rs",
 ]
 
 [features]

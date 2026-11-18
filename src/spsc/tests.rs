@@ -1,0 +1,1357 @@
+use super::*;
+use crate::capacity::Capacity;
+use crate::common::park_probe::ParkProbe;
+use crate::spsc::pinned_ring::PinnedRing;
+
+#[test]
+fn capacity_one() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(1)).split();
+    assert_eq!(producer.len(), 0);
+    producer.push(1).unwrap();
+    assert_eq!(producer.len(), 1);
+    assert_eq!(consumer.pop(), Some(1));
+    assert_eq!(consumer.len(), 0);
+}
+
+#[test]
+fn zero_sized_types() {
+    let (producer, mut consumer) = SplitRing::<()>::new(Capacity::exact(4)).split();
+
+    producer.push(()).unwrap();
+    assert_eq!(consumer.pop(), Some(()));
+    producer.push(()).unwrap();
+    assert_eq!(consumer.pop(), Some(()));
+}
+
+#[test]
+#[ignore = "too slow for Miri"]
+fn stress_push_pop() {
+    let cap = Capacity::exact(1024);
+    let n = 128 * 1024 * 1024_u64;
+    let instant = std::time::Instant::now();
+    let (producer, mut consumer) = SplitRing::<u64>::new(cap).split();
+
+    let handle = std::thread::spawn(move || {
+        let mut received = 0u64;
+        while received < n {
+            if let Some(val) = consumer.pop() {
+                assert_eq!(val, received);
+                received += 1;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    });
+
+    for i in 0..n {
+        while producer.push(i).is_err() {
+            std::hint::spin_loop();
+        }
+    }
+
+    handle.join().unwrap();
+    println!("Took {}ms", instant.elapsed().as_millis());
+}
+
+#[test]
+fn pop_empty_is_idempotent() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(1)).split();
+    assert_eq!(consumer.pop(), None);
+    assert!(consumer.is_empty());
+    assert_eq!(consumer.len(), 0);
+    assert_eq!(consumer.pop(), None);
+    assert!(consumer.is_empty());
+    assert_eq!(consumer.len(), 0);
+    producer.push(1).unwrap();
+    assert_eq!(consumer.pop(), Some(1));
+    assert!(consumer.is_empty());
+    assert_eq!(consumer.len(), 0);
+}
+
+#[test]
+fn length_invariants() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(2)).split();
+    assert_eq!(producer.len(), 0);
+    producer.push(1).unwrap();
+    assert_eq!(producer.len(), 1);
+    producer.push(2).unwrap();
+    assert_eq!(producer.len(), 2);
+    assert_eq!(producer.push(3), Err(3));
+    assert_eq!(producer.len(), 2);
+    assert_eq!(consumer.pop(), Some(1));
+    assert_eq!(consumer.len(), 1);
+    assert_eq!(consumer.pop(), Some(2));
+    assert_eq!(consumer.len(), 0);
+}
+
+#[test]
+fn overwrite_oldest_element() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(4)).split();
+    producer.push(1).unwrap();
+    producer.push(2).unwrap();
+    producer.push(3).unwrap();
+    producer.push(4).unwrap();
+
+    assert_eq!(producer.push(5), Err(5));
+    assert_eq!(consumer.pop(), Some(1));
+    producer.push(5).unwrap();
+
+    assert_eq!(consumer.pop(), Some(2));
+    assert_eq!(consumer.pop(), Some(3));
+    assert_eq!(consumer.pop(), Some(4));
+    assert_eq!(consumer.pop(), Some(5));
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn wraparound_behavior() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(4)).split();
+    producer.push(1).unwrap();
+    producer.push(2).unwrap();
+    assert_eq!(consumer.pop(), Some(1));
+    producer.push(3).unwrap();
+    producer.push(4).unwrap();
+    producer.push(5).unwrap(); // wraps here
+    assert_eq!(consumer.pop(), Some(2));
+    assert_eq!(consumer.pop(), Some(3));
+    assert_eq!(consumer.pop(), Some(4));
+    assert_eq!(consumer.pop(), Some(5));
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn fill_to_capacity() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
+
+    for i in 0..16 {
+        producer.push(i).unwrap();
+    }
+    assert_eq!(producer.len(), 16);
+    assert!(!producer.is_empty());
+    assert!(producer.is_full());
+
+    for i in 0..16 {
+        assert_eq!(consumer.pop(), Some(i));
+    }
+    assert_eq!(consumer.len(), 0);
+    assert!(consumer.is_empty());
+    assert!(!consumer.is_full());
+}
+
+#[test]
+fn pop_empty_buffer() {
+    let (_, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
+    assert_eq!(consumer.pop(), None);
+    assert!(consumer.is_empty());
+    assert_eq!(consumer.len(), 0);
+}
+
+#[test]
+fn push_to_buffer() {
+    let (producer, mut consumer) = SplitRing::<u8>::new(Capacity::exact(16)).split();
+    producer.push(1).unwrap();
+    producer.push(2).unwrap();
+    producer.push(3).unwrap();
+    assert_eq!(consumer.pop(), Some(1));
+    assert_eq!(consumer.pop(), Some(2));
+    assert_eq!(consumer.pop(), Some(3));
+    assert_eq!(consumer.pop(), None);
+}
+
+// -----------------------------------------------------------------------
+// Miri-targeted tests: small sizes exercising all unsafe code paths
+// -----------------------------------------------------------------------
+
+use crate::common::DropCounter;
+
+/// Items still in the buffer when Consumer is dropped must be dropped.
+#[test]
+fn drop_items_on_consumer_drop() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, consumer) = SplitRing::new(Capacity::exact(4)).split();
+
+    for _ in 0..4 {
+        producer
+            .push(DropCounter {
+                counter: counter.clone(),
+            })
+            .unwrap();
+    }
+
+    // Dropping consumer should drain and drop all 4 items
+    drop(consumer);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 4);
+}
+
+/// A push that lands after the consumer is gone still owns its
+/// value, and the ring is the only thing left to reclaim it. The
+/// storage used to be freed with the value still inside.
+#[test]
+fn ring_drops_a_value_pushed_after_the_consumer_left() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let (producer, consumer) = SplitRing::new(Capacity::exact(4)).split();
+        drop(consumer);
+        producer
+            .push(DropCounter {
+                counter: counter.clone(),
+            })
+            .expect("the ring has space regardless of the consumer");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the value is still in the ring"
+        );
+    }
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "freeing the ring must drop what it still holds"
+    );
+}
+
+/// Items popped normally should be dropped exactly once.
+#[test]
+fn drop_items_on_pop() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, mut consumer) = SplitRing::new(Capacity::exact(4)).split();
+
+    for _ in 0..3 {
+        producer
+            .push(DropCounter {
+                counter: counter.clone(),
+            })
+            .unwrap();
+    }
+
+    // Pop 2 — should drop when they go out of scope
+    let a = consumer.pop().unwrap();
+    let b = consumer.pop().unwrap();
+    drop(a);
+    drop(b);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    // Remaining 1 dropped when consumer is dropped
+    drop(consumer);
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+}
+
+/// Exercise `get_unchecked` on every index by wrapping around multiple times.
+#[test]
+fn wraparound_exercises_all_slots() {
+    let (producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    // 3 full laps = 12 push/pops, covering slot indices 0-3 three times
+    for lap in 0..3u32 {
+        for i in 0..4 {
+            producer.push(lap * 4 + i).unwrap();
+        }
+        for i in 0..4 {
+            assert_eq!(consumer.pop(), Some(lap * 4 + i));
+        }
+    }
+    assert_eq!(consumer.pop(), None);
+}
+
+/// Concurrent push/pop with a tiny buffer — Miri checks for data races.
+#[test]
+fn concurrent_data_race_check() {
+    let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+    let n = 16u64;
+
+    let handle = std::thread::spawn(move || {
+        for i in 0..n {
+            while producer.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    let mut received = 0u64;
+    while received < n {
+        if consumer.pop().is_some() {
+            received += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+
+    handle.join().unwrap();
+    assert_eq!(received, n);
+}
+
+// -----------------------------------------------------------------------
+// Zero-copy API tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn reserve_write_commit_pop_ref_cycle() {
+    let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+
+    let writer = producer.reserve().unwrap();
+    writer.write(42).commit();
+
+    let reader = consumer.pop_ref().unwrap();
+    assert_eq!(*reader, 42);
+    drop(reader);
+
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn reserve_slot_mut_commit() {
+    let (mut producer, mut consumer) = SplitRing::<[u8; 64]>::new(Capacity::exact(4)).split();
+
+    let mut writer = producer.reserve().unwrap();
+    writer.slot_mut().write([0xAB; 64]);
+    // SAFETY: slot_mut().write() initialized the slot above.
+    unsafe { writer.commit_unchecked() };
+
+    let reader = consumer.pop_ref().unwrap();
+    assert_eq!(reader[0], 0xAB);
+    assert_eq!(reader[63], 0xAB);
+}
+
+#[test]
+fn reserve_returns_none_when_full() {
+    let (mut producer, _consumer) = SplitRing::<u64>::new(Capacity::exact(2)).split();
+
+    // Commit each writer immediately to avoid panicking on drop if
+    // a later assertion fails.
+    let w1 = producer.reserve().unwrap();
+    w1.write(1).commit();
+
+    let w2 = producer.reserve().unwrap();
+    w2.write(2).commit();
+
+    assert!(producer.reserve().is_none());
+}
+
+#[test]
+fn pop_ref_returns_none_when_empty() {
+    let (_producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+    assert!(consumer.pop_ref().is_none());
+}
+
+#[test]
+fn pop_ref_returns_none_when_not_ready() {
+    let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+
+    // Reserve but don't commit — slot is claimed but not visible
+    let writer = producer.reserve().unwrap();
+    assert!(consumer.pop_ref().is_none());
+
+    // Now commit and it should be readable
+    writer.write(99).commit();
+    let reader = consumer.pop_ref().unwrap();
+    assert_eq!(*reader, 99);
+}
+
+#[test]
+fn mixed_push_reserve_pop_pop_ref() {
+    let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(8)).split();
+
+    // Mix of push and reserve
+    producer.push(1).unwrap();
+    let w = producer.reserve().unwrap();
+    w.write(2).commit();
+    producer.push(3).unwrap();
+
+    // Mix of pop and pop_ref
+    assert_eq!(consumer.pop(), Some(1));
+    let r = consumer.pop_ref().unwrap();
+    assert_eq!(*r, 2);
+    drop(r);
+    assert_eq!(consumer.pop(), Some(3));
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn slot_reader_drops_value() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, mut consumer) = SplitRing::new(Capacity::exact(4)).split();
+
+    producer
+        .push(DropCounter {
+            counter: counter.clone(),
+        })
+        .unwrap();
+
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    {
+        let reader = consumer.pop_ref().unwrap();
+        // Value is alive while reader exists
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(reader);
+    }
+
+    // Value should be dropped when SlotReader is dropped
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn reserve_pop_ref_wraparound() {
+    let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    // 3 full laps via reserve/pop_ref
+    for lap in 0..3u32 {
+        for i in 0..4 {
+            let w = producer.reserve().unwrap();
+            w.write(lap * 4 + i).commit();
+        }
+        for i in 0..4 {
+            let r = consumer.pop_ref().unwrap();
+            assert_eq!(*r, lap * 4 + i);
+            drop(r);
+        }
+    }
+    assert!(consumer.pop_ref().is_none());
+}
+
+#[test]
+fn reserve_drop_without_commit_rolls_back() {
+    let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    producer.push(1).unwrap();
+    {
+        let w = producer.reserve().unwrap();
+        w.write(2);
+        // drop without commit — should roll back, not panic
+    }
+    producer.push(3).unwrap();
+
+    assert_eq!(consumer.pop(), Some(1));
+    assert_eq!(consumer.pop(), Some(3));
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn reserve_drop_without_write_rolls_back() {
+    let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    producer.push(10).unwrap();
+    {
+        let _w = producer.reserve().unwrap();
+        // drop without write or commit
+    }
+    producer.push(20).unwrap();
+
+    assert_eq!(consumer.pop(), Some(10));
+    assert_eq!(consumer.pop(), Some(20));
+    assert_eq!(consumer.pop(), None);
+}
+
+/// A `SlotWriter` leaked with `mem::forget` runs no destructor. If
+/// the reservation had already advanced the producer cursor, the
+/// next push would land past the uninitialized slot and publishing
+/// `tail` would expose it to the consumer as a valid item.
+#[test]
+fn forgotten_writer_does_not_publish_uninitialized_slot() {
+    let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    std::mem::forget(producer.reserve().unwrap());
+
+    producer.push(7).unwrap();
+
+    assert_eq!(
+        consumer.pop(),
+        Some(7),
+        "the forgotten slot must be reused, not published uninitialized"
+    );
+    assert_eq!(consumer.pop(), None, "no phantom item may become visible");
+}
+
+/// Same hazard on the written-but-uncommitted guard: forgetting it
+/// must leak the value in place (safe) rather than publish it or
+/// leave a gap the consumer reads as initialized.
+#[test]
+fn forgotten_written_slot_leaks_without_publishing() {
+    // `BorrowedDropCounter` owns no heap memory, so the deliberate
+    // `mem::forget` below leaks only the destructor call this test
+    // asserts about — nothing for Miri's leak checker to flag.
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let mut ring = SplitRing::<crate::common::BorrowedDropCounter<'_>>::new(Capacity::exact(4));
+    let (mut producer, mut consumer) = ring.split_borrowed();
+
+    std::mem::forget(
+        producer
+            .reserve()
+            .unwrap()
+            .write(crate::common::BorrowedDropCounter::new(&counter)),
+    );
+
+    assert!(
+        consumer.pop().is_none(),
+        "an uncommitted value must not be visible"
+    );
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a forgotten guard runs no destructor — the value leaks in place"
+    );
+
+    producer
+        .push(crate::common::BorrowedDropCounter::new(&counter))
+        .unwrap();
+    assert!(consumer.pop().is_some(), "the slot must be reusable");
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the popped value is dropped; the leaked one is never freed"
+    );
+}
+
+/// A forgotten reservation must not permanently consume capacity:
+/// the position is reusable, so the ring still holds `cap` items.
+#[test]
+fn forgotten_writer_does_not_consume_capacity() {
+    let (mut producer, mut consumer) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    std::mem::forget(producer.reserve().unwrap());
+
+    for i in 0..4 {
+        producer.push(i).unwrap();
+    }
+    assert!(producer.push(99).is_err(), "ring should now be full");
+
+    let mut got = vec![];
+    while let Some(v) = consumer.pop() {
+        got.push(v);
+    }
+    assert_eq!(got, vec![0, 1, 2, 3]);
+}
+
+/// A panicking `drain` callback must not lose track of the items
+/// already taken. If `head` stayed stale, `Consumer::drop` would
+/// drop those values a second time.
+#[test]
+fn drain_callback_panic_does_not_double_drop() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, mut consumer) = SplitRing::<DropCounter>::new(Capacity::exact(4)).split();
+
+    for _ in 0..4 {
+        producer
+            .push(DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .unwrap();
+    }
+
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen_in = std::sync::Arc::clone(&seen);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consumer.drain(|item| {
+            drop(item);
+            assert!(
+                seen_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 1,
+                "callback failure"
+            );
+        });
+    }));
+    assert!(result.is_err(), "the panic must propagate to the caller");
+
+    drop(consumer);
+    drop(producer);
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        4,
+        "each item must be dropped exactly once"
+    );
+}
+
+/// Same hazard reached through `drain_up_to`.
+#[test]
+fn drain_up_to_callback_panic_does_not_double_drop() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, mut consumer) = SplitRing::<DropCounter>::new(Capacity::exact(4)).split();
+
+    for _ in 0..4 {
+        producer
+            .push(DropCounter {
+                counter: std::sync::Arc::clone(&counter),
+            })
+            .unwrap();
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consumer.drain_up_to(3, |item| {
+            drop(item);
+            panic!("callback failure");
+        });
+    }));
+    assert!(result.is_err());
+
+    drop(consumer);
+    drop(producer);
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        4,
+        "each item must be dropped exactly once"
+    );
+}
+
+/// A `T` whose destructor panics must still hand its slot back, or
+/// `Consumer::drop` would drop it again.
+#[test]
+fn slot_reader_panicking_drop_does_not_double_drop() {
+    struct PanicOnDrop {
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        panics: bool,
+    }
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(!self.panics, "destructor failure");
+        }
+    }
+
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (producer, mut consumer) = SplitRing::<PanicOnDrop>::new(Capacity::exact(4)).split();
+
+    assert!(producer
+        .push(PanicOnDrop {
+            counter: std::sync::Arc::clone(&counter),
+            panics: true,
+        })
+        .is_ok());
+    assert!(producer
+        .push(PanicOnDrop {
+            counter: std::sync::Arc::clone(&counter),
+            panics: false,
+        })
+        .is_ok());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let r = consumer.pop_ref().unwrap();
+        drop(r);
+    }));
+    assert!(result.is_err(), "the destructor panic must propagate");
+
+    drop(consumer);
+    drop(producer);
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "each item must be dropped exactly once"
+    );
+}
+
+#[test]
+fn reserve_drop_does_not_leak() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut producer, _consumer) =
+        SplitRing::<crate::common::DropCounter>::new(Capacity::exact(4)).split();
+
+    {
+        let w = producer.reserve().unwrap();
+        w.write(crate::common::DropCounter {
+            counter: counter.clone(),
+        });
+        // drop without commit — value should be dropped
+    }
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "written value should be dropped on SlotWriter rollback"
+    );
+}
+
+#[test]
+fn concurrent_reserve_pop_ref() {
+    let (mut producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+    let n = 16u64;
+
+    let handle = std::thread::spawn(move || {
+        for i in 0..n {
+            loop {
+                if let Some(w) = producer.reserve() {
+                    w.write(i).commit();
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    let mut received = 0u64;
+    while received < n {
+        if let Some(reader) = consumer.pop_ref() {
+            assert_eq!(*reader, received);
+            drop(reader);
+            received += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+
+    handle.join().unwrap();
+}
+
+/// Capacity-1 with concurrent producer/consumer threads. Tightest
+/// possible synchronization — every push must wait for every pop.
+#[test]
+fn capacity_one_concurrent() {
+    let n = 8u64;
+    let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(1)).split();
+
+    let h = std::thread::spawn(move || {
+        for i in 0..n {
+            while producer.push(i).is_err() {
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    let mut got = Vec::new();
+    while got.len() < usize::try_from(n).unwrap() {
+        if let Some(v) = consumer.pop() {
+            got.push(v);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    h.join().unwrap();
+    assert_eq!(got, (0..n).collect::<Vec<_>>());
+}
+
+// -----------------------------------------------------------------------
+// Blocking API
+// -----------------------------------------------------------------------
+
+#[test]
+fn pop_block_wakes_on_push() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let h = std::thread::spawn(move || c.pop_block());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    p.push(7).unwrap();
+    assert_eq!(h.join().unwrap(), Some(7));
+}
+
+#[test]
+fn pop_block_returns_none_on_close() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let h = std::thread::spawn(move || c.pop_block());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(p);
+    assert_eq!(h.join().unwrap(), None);
+}
+
+/// The consumer parks on one thread, then parks again on another.
+/// `Consumer` is `Send`, so the wake must follow it. The sleeps make
+/// each side exhaust its spin budget and genuinely park.
+#[test]
+fn pop_block_wakes_a_consumer_that_moved_threads() {
+    let (p, c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+
+    let first = std::thread::spawn(move || {
+        let mut c = c;
+        assert_eq!(c.pop_block(), Some(1));
+        c
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    p.push(1).unwrap();
+    let c = first.join().unwrap();
+
+    let second = std::thread::spawn(move || {
+        let mut c = c;
+        c.pop_block()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    p.push(2).unwrap();
+    assert_eq!(second.join().unwrap(), Some(2));
+}
+
+/// The producer side of the same migration hazard.
+#[test]
+fn push_block_wakes_a_producer_that_moved_threads() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
+    p.push(1).unwrap();
+    p.push(2).unwrap();
+
+    let first = std::thread::spawn(move || {
+        assert_eq!(p.push_block(3), Ok(()));
+        p
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(c.pop(), Some(1));
+    let p = first.join().unwrap();
+
+    let second = std::thread::spawn(move || p.push_block(4));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(c.pop(), Some(2));
+    assert_eq!(second.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn pop_block_drains_before_close() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    p.push(1).unwrap();
+    p.push(2).unwrap();
+    drop(p);
+    assert_eq!(c.pop_block(), Some(1));
+    assert_eq!(c.pop_block(), Some(2));
+    assert_eq!(c.pop_block(), None);
+}
+
+#[test]
+fn push_block_unblocks_on_pop() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4 {
+        p.push(i).unwrap();
+    }
+    assert!(p.push(99).is_err());
+    let h = std::thread::spawn(move || p.push_block(99));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(c.pop(), Some(0));
+    assert_eq!(h.join().unwrap(), Ok(()));
+    // Drain remaining including the unblocked push.
+    assert_eq!(c.pop(), Some(1));
+    assert_eq!(c.pop(), Some(2));
+    assert_eq!(c.pop(), Some(3));
+    assert_eq!(c.pop(), Some(99));
+}
+
+/// The `HeadPublisher` guard covers this: it publishes the cursor
+/// and wakes the producer from its destructor, so a panicking drain
+/// callback cannot leave a producer parked on freed space.
+#[test]
+fn a_panicking_drain_callback_still_wakes_the_blocked_producer() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4u32 {
+        p.push(i).unwrap();
+    }
+
+    let pusher = std::thread::spawn(move || p.push_block(99));
+    ParkProbe::expect_until("push_block to arm its park", || {
+        c.queue.producer_park.is_parked()
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.drain(|v| assert!(v != 2, "callback panic"));
+    }));
+    assert!(result.is_err(), "the callback panic must propagate");
+
+    assert_eq!(pusher.join().unwrap(), Ok(()));
+}
+
+/// `Consumer::drop` drains the backlog and only then closes. The
+/// drain runs `T::drop`, which is user code: unwinding past the
+/// close leaves the ring looking open forever, so a producer never
+/// learns its peer is gone.
+#[test]
+fn a_panicking_drop_during_consumer_teardown_still_closes() {
+    #[derive(Debug)]
+    struct PanicOnDrop {
+        panics: bool,
+    }
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            assert!(!self.panics, "destructor failure");
+        }
+    }
+
+    let (p, c) = SplitRing::<PanicOnDrop>::new(Capacity::exact(4)).split();
+    p.push(PanicOnDrop { panics: true }).unwrap();
+    p.push(PanicOnDrop { panics: false }).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c)));
+    assert!(result.is_err(), "the destructor panic must propagate");
+
+    assert!(
+        p.queue.consumer_closed.is_closed(),
+        "the producer must observe the consumer as closed"
+    );
+    // `push_block` parks untimed, so a missed close hangs here
+    // rather than failing.
+    assert!(
+        p.push_block(PanicOnDrop { panics: false }).is_err(),
+        "a blocking push must refuse to fill space that will never be read"
+    );
+}
+
+#[test]
+fn push_block_returns_err_on_consumer_close() {
+    let (p, c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4 {
+        p.push(i).unwrap();
+    }
+    assert!(p.push(99).is_err());
+    let h = std::thread::spawn(move || p.push_block(99));
+    ParkProbe::expect_until("push_block to arm its park", || {
+        c.queue.producer_park.is_parked()
+    });
+    // Close without freeing a slot. Consumer::drop drains first, and
+    // a parked producer that gets real space legitimately pushes into
+    // it and returns Ok, which is not the path under test here.
+    c.queue.consumer_closed.close();
+    c.queue.wake_producer();
+    assert_eq!(h.join().unwrap(), Err(99));
+    drop(c);
+}
+
+#[test]
+fn is_closed_reflects_producer_drop() {
+    let (p, c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    assert!(!c.is_closed());
+    drop(p);
+    assert!(c.is_closed());
+}
+
+// -----------------------------------------------------------------------
+// Zero-copy blocking API
+// -----------------------------------------------------------------------
+
+#[test]
+fn reserve_block_unblocks_on_pop() {
+    let (mut p, mut c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
+    p.push(1).unwrap();
+    p.push(2).unwrap();
+    assert!(p.reserve().is_none());
+    let h = std::thread::spawn(move || {
+        let w = p.reserve_block().unwrap();
+        w.write(99).commit();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(c.pop(), Some(1));
+    h.join().unwrap();
+    assert_eq!(c.pop(), Some(2));
+    assert_eq!(c.pop(), Some(99));
+}
+
+#[test]
+fn reserve_block_returns_none_on_consumer_close() {
+    let (mut p, c) = SplitRing::<u32>::new(Capacity::exact(2)).split();
+    p.push(1).unwrap();
+    p.push(2).unwrap();
+    let h = std::thread::spawn(move || p.reserve_block().is_some());
+    ParkProbe::expect_until("reserve_block to arm its park", || {
+        c.queue.producer_park.is_parked()
+    });
+    // Close without freeing a slot, as in
+    // push_block_returns_err_on_consumer_close.
+    c.queue.consumer_closed.close();
+    c.queue.wake_producer();
+    assert!(!h.join().unwrap());
+    drop(c);
+}
+
+#[test]
+fn pop_ref_block_wakes_on_push() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let h = std::thread::spawn(move || {
+        let r = c.pop_ref_block().unwrap();
+        *r
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    p.push(7).unwrap();
+    assert_eq!(h.join().unwrap(), 7);
+}
+
+#[test]
+fn pop_ref_block_returns_none_on_close() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let h = std::thread::spawn(move || c.pop_ref_block().is_some());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(p);
+    assert!(!h.join().unwrap());
+}
+
+#[test]
+fn pop_ref_block_drains_before_close() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    p.push(1).unwrap();
+    p.push(2).unwrap();
+    drop(p);
+    // First two should yield SlotReaders; third returns None.
+    let v1 = *c.pop_ref_block().unwrap();
+    let v2 = *c.pop_ref_block().unwrap();
+    assert_eq!(v1, 1);
+    assert_eq!(v2, 2);
+    assert!(c.pop_ref_block().is_none());
+}
+
+// -----------------------------------------------------------------------
+// Drain
+// -----------------------------------------------------------------------
+
+#[test]
+fn drain_empty_returns_zero() {
+    let (_p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let n = c.drain(|_| panic!("unexpected"));
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn drain_all_available() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4 {
+        p.push(i).unwrap();
+    }
+    let mut got = Vec::new();
+    let n = c.drain(|v| got.push(v));
+    assert_eq!(n, 4);
+    assert_eq!(got, vec![0, 1, 2, 3]);
+    assert_eq!(c.pop(), None);
+}
+
+#[test]
+fn drain_up_to_limit() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4 {
+        p.push(i).unwrap();
+    }
+    let mut got = Vec::new();
+    let n = c.drain_up_to(2, |v| got.push(v));
+    assert_eq!(n, 2);
+    assert_eq!(got, vec![0, 1]);
+    // Remaining are still there.
+    assert_eq!(c.pop(), Some(2));
+    assert_eq!(c.pop(), Some(3));
+}
+
+#[test]
+fn drain_block_drains_to_close() {
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    let h = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        c.drain_block(|v| got.push(v));
+        got
+    });
+    // Push, sleep, push, drop. drain_block should pick everything up.
+    p.push(1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    p.push(2).unwrap();
+    p.push(3).unwrap();
+    drop(p);
+    let got = h.join().unwrap();
+    assert_eq!(got, vec![1, 2, 3]);
+}
+
+#[test]
+// from_mins is stable only since 1.91; from_secs builds anywhere.
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
+fn drain_wakes_producer() {
+    // SPSC has only one producer. Test that drain releasing the
+    // ring wakes it from push_block.
+    let (p, mut c) = SplitRing::<u32>::new(Capacity::exact(4)).split();
+    for i in 0..4 {
+        p.push(i).unwrap();
+    }
+    let h = std::thread::spawn(move || {
+        for i in 4..8u32 {
+            p.push_block(i).expect("consumer dropped");
+        }
+    });
+    // Producer parks waiting for space.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Single drain frees all 4 slots and wakes producer.
+    let n = c.drain(|_| {});
+    assert_eq!(n, 4);
+    // Producer should complete its 4 more pushes promptly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !h.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drain failed to wake producer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.join().unwrap();
+}
+
+#[test]
+#[cfg(feature = "async")]
+#[cfg_attr(miri, ignore = "too slow for Miri: threads + tokio runtimes")]
+fn async_push_pop_cross_thread() {
+    // Producer and consumer on separate threads. The watchdog thread
+    // aborts the process if either side hangs longer than 5s, so the
+    // test fails fast instead of leaving the harness blocked on join.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let progress = Arc::new(AtomicU64::new(0));
+    let _watchdog = crate::common::progress_watchdog::ProgressWatchdog::spawn(
+        progress.clone(),
+        "spsc async_push_pop_cross_thread",
+    );
+
+    let (producer, mut consumer) = SplitRing::<u64>::new(Capacity::exact(4)).split();
+    let total: u64 = 1_000_000;
+
+    let ph = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async move {
+            for i in 0..total {
+                producer.push_async(i).await.expect("consumer dropped");
+            }
+        }));
+    });
+
+    let progress_c = progress;
+    let ch = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async move {
+            let mut received = 0u64;
+            while received < total {
+                match consumer.pop_async().await {
+                    Some(_) => {
+                        received += 1;
+                        progress_c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(received, total);
+        }));
+    });
+
+    ph.join().unwrap();
+    ch.join().unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Borrowed split (non-'static T)
+// -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// Raw-pointer split (cross-address-space seam, e.g. wasm shared memory)
+// -----------------------------------------------------------------------
+
+#[test]
+fn raw_split_push_pop() {
+    // Mirrors the shared-memory usage: pin the ring at a stable
+    // address, then reconstruct producer and consumer independently
+    // from it (as the worker and main thread each would).
+    PinnedRing::<u32>::with(Capacity::exact(4), |ring| {
+        let ptr = ring.as_ptr();
+
+        // SAFETY: the ring stays live and unmoved for this closure; we
+        // make exactly one producer and one consumer, each used on this
+        // thread, and both are dropped before `with` frees the ring.
+        let producer = unsafe { Producer::from_raw(ptr) };
+        let mut consumer = unsafe { Consumer::from_raw(ptr) };
+
+        producer.push(1).unwrap();
+        producer.push(2).unwrap();
+        assert_eq!(consumer.pop(), Some(1));
+        assert_eq!(consumer.pop(), Some(2));
+        assert_eq!(consumer.pop(), None);
+    });
+}
+
+#[test]
+fn raw_split_cross_thread() {
+    // The handles travel to a separate thread, as producer and consumer
+    // would live in separate execution contexts sharing the ring's memory.
+    PinnedRing::<u64>::with(Capacity::exact(4), |ring| {
+        let addr = ring.shared();
+        let n = 256u64;
+
+        let handle = std::thread::spawn(move || {
+            // SAFETY: single producer on the pinned ring at `addr`,
+            // joined below while the ring is still live.
+            let producer = unsafe { Producer::from_raw(addr.get()) };
+            for i in 0..n {
+                while producer.push(i).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        // SAFETY: single consumer, same pinned ring.
+        let mut consumer = unsafe { Consumer::from_raw(addr.get()) };
+        let mut received = 0u64;
+        while received < n {
+            if let Some(v) = consumer.pop() {
+                assert_eq!(v, received);
+                received += 1;
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        handle.join().unwrap();
+    });
+}
+
+#[test]
+fn borrowed_split_push_pop() {
+    let mut ring = SplitRing::<u32>::new(Capacity::exact(4));
+    let (producer, mut consumer) = ring.split_borrowed();
+
+    producer.push(1).unwrap();
+    producer.push(2).unwrap();
+    assert_eq!(consumer.pop(), Some(1));
+    assert_eq!(consumer.pop(), Some(2));
+    assert_eq!(consumer.pop(), None);
+}
+
+#[test]
+fn borrowed_split_non_static_lifetime() {
+    let wire_buf = [10u8, 20, 30, 40];
+
+    // T = &[u8] — borrows from wire_buf, not 'static.
+    let mut ring = SplitRing::<&[u8]>::new(Capacity::exact(4));
+    let (producer, mut consumer) = ring.split_borrowed();
+
+    producer.push(&wire_buf[0..2]).unwrap();
+    producer.push(&wire_buf[2..4]).unwrap();
+
+    let a = consumer.pop().unwrap();
+    assert_eq!(a, &[10, 20]);
+    let b = consumer.pop().unwrap();
+    assert_eq!(b, &[30, 40]);
+}
+
+#[test]
+fn borrowed_split_scoped_threads() {
+    // data declared before ring so it outlives the borrowed split.
+    let data = vec![1u64, 2, 3, 4, 5, 6, 7, 8];
+    let mut ring = SplitRing::<&[u64]>::new(Capacity::exact(4));
+    let (producer, mut consumer) = ring.split_borrowed();
+    let data_ref = &data;
+
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            for chunk in data_ref.chunks(2) {
+                while producer.push(chunk).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        s.spawn(move || {
+            let mut received = Vec::new();
+            while received.len() < 4 {
+                if let Some(slice) = consumer.pop() {
+                    received.push(slice.to_vec());
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(
+                received,
+                vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]
+            );
+        });
+    });
+}
+
+#[test]
+fn borrowed_split_zero_copy_reserve() {
+    let mut ring = SplitRing::<[u8; 64]>::new(Capacity::exact(4));
+    let (mut producer, mut consumer) = ring.split_borrowed();
+
+    let mut writer = producer.reserve().unwrap();
+    writer.slot_mut().write([0xCD; 64]);
+    unsafe { writer.commit_unchecked() };
+
+    let reader = consumer.pop_ref().unwrap();
+    assert_eq!(reader[0], 0xCD);
+    assert_eq!(reader[63], 0xCD);
+}
+
+#[test]
+fn borrowed_split_blocking() {
+    let mut ring = SplitRing::<u32>::new(Capacity::exact(4));
+    let (producer, mut consumer) = ring.split_borrowed();
+
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let _ = consumer.pop_block();
+        });
+        s.spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            producer.push(42).unwrap();
+        });
+    });
+}
+
+#[test]
+fn borrowed_split_struct_with_lifetime() {
+    #[derive(Debug, PartialEq)]
+    struct StorageReq<'a> {
+        payload: &'a [u8],
+        kind: u8,
+    }
+
+    // wire declared before ring so it outlives the borrowed split.
+    let wire = vec![0xAA; 128];
+    let mut ring = SplitRing::<StorageReq<'_>>::new(Capacity::exact(4));
+    let (producer, mut consumer) = ring.split_borrowed();
+    let wire_ref = &wire;
+
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            producer
+                .push(StorageReq {
+                    payload: &wire_ref[..64],
+                    kind: 1,
+                })
+                .unwrap();
+            producer
+                .push(StorageReq {
+                    payload: &wire_ref[64..],
+                    kind: 2,
+                })
+                .unwrap();
+        });
+        s.spawn(move || {
+            let mut got = Vec::new();
+            while got.len() < 2 {
+                if let Some(req) = consumer.pop() {
+                    got.push(req.kind);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(got, vec![1, 2]);
+        });
+    });
+}
+
+#[test]
+fn borrowed_split_multi_lifetime_struct() {
+    #[derive(Debug)]
+    struct Req<'a, 'b> {
+        ops: &'a [u32],
+        out: &'b mut Vec<u32>,
+    }
+
+    // Both sources declared before the ring — both outlive it.
+    let ops = vec![1u32, 2, 3];
+    let mut results = Vec::new();
+
+    // The ring and both handles must drop before we can read
+    // `results` again — the &mut borrow is live for the ring's
+    // lifetime. Scoping achieves this.
+    {
+        let mut ring = SplitRing::<Req<'_, '_>>::new(Capacity::exact(4));
+        let (producer, mut consumer) = ring.split_borrowed();
+
+        producer
+            .push(Req {
+                ops: &ops,
+                out: &mut results,
+            })
+            .unwrap();
+
+        let req = consumer.pop().unwrap();
+        for &op in req.ops {
+            req.out.push(op * 10);
+        }
+    }
+    // Ring dropped — mutable borrow released.
+    assert_eq!(results, vec![10, 20, 30]);
+}
