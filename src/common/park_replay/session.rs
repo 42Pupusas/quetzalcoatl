@@ -7,11 +7,10 @@
 //! grants a park only when its token is set, or as a spurious return.
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{JoinHandle, Thread, ThreadId};
 
-use crate::common::replay_point::ReplayPoint;
+use crate::common::replay_point::{ReplayActor, ReplayPoint, Scheduler};
 
 /// How an actor is to take its next step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,27 +57,37 @@ pub struct Session {
     turn: Condvar,
 }
 
-thread_local! {
-    static ACTOR: RefCell<Option<(Arc<Session>, usize)>> = const { RefCell::new(None) };
-}
+impl Scheduler for Session {
+    fn stop(&self, me: usize, point: ReplayPoint, pending: Vec<ThreadId>) -> bool {
+        self.wait_turn(me, point, pending)
+    }
 
-/// Marks its actor finished however the actor's body ends.
-struct Finish {
-    session: Arc<Session>,
-    index: usize,
-}
+    fn spins(&self, me: usize) -> bool {
+        self.lock().actors[me].last == Some(Grant::Spin(true))
+    }
 
-impl Drop for Finish {
-    fn drop(&mut self) {
-        let mut inner = self.session.lock();
-        let actor = &mut inner.actors[self.index];
-        actor.view.finished = true;
-        actor.view.point = None;
-        if inner.running == Some(self.index) {
-            inner.running = None;
+    fn unparked(&self, thread: &Thread) {
+        let mut inner = self.lock();
+        if let Some(actor) = inner
+            .actors
+            .iter_mut()
+            .find(|actor| actor.view.thread == Some(thread.id()))
+        {
+            actor.view.token = true;
         }
-        drop(inner);
-        self.session.turn.notify_all();
+    }
+
+    fn finish(&self, me: usize) {
+        {
+            let mut inner = self.lock();
+            let actor = &mut inner.actors[me];
+            actor.view.finished = true;
+            actor.view.point = None;
+            if inner.running == Some(me) {
+                inner.running = None;
+            }
+        }
+        self.turn.notify_all();
     }
 }
 
@@ -121,25 +130,13 @@ impl Session {
         let session = Arc::clone(self);
         std::thread::spawn(move || {
             session.lock().actors[index].view.thread = Some(std::thread::current().id());
-            ACTOR.with(|actor| *actor.borrow_mut() = Some((Arc::clone(&session), index)));
-            let _finish = Finish { session, index };
+            let _actor = ReplayActor::enter(session, index);
             body()
         })
     }
 
-    fn current() -> Option<(Arc<Self>, usize)> {
-        ACTOR.with(|actor| actor.borrow().clone())
-    }
-
-    /// Stops the calling actor at `point` until it is granted a step.
-    /// `false` for a thread that is not an actor.
-    pub fn reach(point: ReplayPoint, pending: Vec<ThreadId>) -> bool {
-        let Some((session, me)) = Self::current() else {
-            return false;
-        };
-        session.wait_turn(me, point, pending)
-    }
-
+    /// Stops actor `me` at `point` until it is granted a step. `false`
+    /// when the run was abandoned while the actor unwinds.
     fn wait_turn(&self, me: usize, point: ReplayPoint, pending: Vec<ThreadId>) -> bool {
         let mut inner = self.lock();
         if inner.aborted && std::thread::panicking() {
@@ -173,40 +170,12 @@ impl Session {
         }
     }
 
-    fn last_grant() -> Option<Grant> {
-        let (session, me) = Self::current()?;
-        let last = session.lock().actors[me].last;
-        last
-    }
-
-    /// The calling actor's spin decision, if it is an actor.
-    pub fn spin_verdict() -> Option<bool> {
-        match Self::last_grant()? {
-            Grant::Spin(spin) => Some(spin),
-            _ => Some(false),
-        }
-    }
-
-    /// The batch the calling actor was granted.
-    pub fn granted_batch() -> usize {
-        match Self::last_grant() {
+    /// The batch actor `me` was last granted.
+    pub fn granted_batch(&self, me: usize) -> usize {
+        let last = self.lock().actors[me].last;
+        match last {
             Some(Grant::Batch(batch)) => batch,
             other => panic!("a release was granted {other:?}"),
-        }
-    }
-
-    /// Sets the park token of the actor running on `thread`.
-    pub fn unparked(thread: &Thread) {
-        let Some((session, _)) = Self::current() else {
-            return;
-        };
-        let mut inner = session.lock();
-        if let Some(actor) = inner
-            .actors
-            .iter_mut()
-            .find(|actor| actor.view.thread == Some(thread.id()))
-        {
-            actor.view.token = true;
         }
     }
 

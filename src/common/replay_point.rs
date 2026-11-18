@@ -91,34 +91,91 @@ pub enum ReplayPoint {
     FlushingDone,
 }
 
+/// What a stop hands control to: the replay's scheduler.
+#[cfg(all(test, not(loom)))]
+pub trait Scheduler: Send + Sync {
+    /// Stops actor `me` at `point` until it is granted a step, naming
+    /// the threads a stack drain still has to unpark. `false` when the
+    /// stop was skipped.
+    fn stop(&self, me: usize, point: ReplayPoint, pending: Vec<std::thread::ThreadId>) -> bool;
+    /// Actor `me`'s choice at a backoff gate: `true` to spin again.
+    fn spins(&self, me: usize) -> bool;
+    /// Records an unpark of `thread` as its park token.
+    fn unparked(&self, thread: &Thread);
+    /// Marks actor `me` finished.
+    fn finish(&self, me: usize);
+}
+
+/// Makes its thread an actor of a replay until dropped, then marks the
+/// actor finished however its body ended.
+#[cfg(all(test, not(loom)))]
+pub struct ReplayActor {
+    scheduler: std::sync::Arc<dyn Scheduler>,
+    index: usize,
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static ACTOR: std::cell::RefCell<Option<(std::sync::Arc<dyn Scheduler>, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(loom)))]
+impl ReplayActor {
+    /// Makes the calling thread actor `index` of `scheduler`.
+    #[must_use]
+    pub fn enter(scheduler: std::sync::Arc<dyn Scheduler>, index: usize) -> Self {
+        let entry = (std::sync::Arc::clone(&scheduler), index);
+        ACTOR.with(|actor| *actor.borrow_mut() = Some(entry));
+        Self { scheduler, index }
+    }
+
+    fn current() -> Option<(std::sync::Arc<dyn Scheduler>, usize)> {
+        ACTOR.with(|actor| actor.borrow().clone())
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+impl Drop for ReplayActor {
+    fn drop(&mut self) {
+        ACTOR.with(|actor| actor.borrow_mut().take());
+        self.scheduler.finish(self.index);
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 impl ReplayPoint {
     /// Waits here until the replay schedules this thread.
     pub fn reach(self) {
-        super::park_replay::Session::reach(self, Vec::new());
+        self.reach_unparking(Vec::new());
     }
 
     /// [`reach`](Self::reach), naming the threads a stack drain still
     /// has to unpark, the next one first.
     pub fn reach_unparking(self, pending: Vec<std::thread::ThreadId>) {
-        super::park_replay::Session::reach(self, pending);
+        if let Some((scheduler, me)) = ReplayActor::current() {
+            scheduler.stop(me, self, pending);
+        }
     }
 
     /// Stops at [`Park`](Self::Park). `true` when a replay is running,
     /// which then stands in for the park itself.
     pub fn park_in_replay() -> bool {
-        super::park_replay::Session::reach(Self::Park, Vec::new())
+        ReplayActor::current()
+            .is_some_and(|(scheduler, me)| scheduler.stop(me, Self::Park, Vec::new()))
     }
 
     /// The replay's choice at a backoff gate: `Some(true)` to spin
     /// again, `Some(false)` to park. `None` outside a replay.
     pub fn spin_verdict() -> Option<bool> {
-        super::park_replay::Session::spin_verdict()
+        ReplayActor::current().map(|(scheduler, me)| scheduler.spins(me))
     }
 
     /// Records an unpark of `thread` as its park token.
     pub fn unparked(thread: &Thread) {
-        super::park_replay::Session::unparked(thread);
+        if let Some((scheduler, _)) = ReplayActor::current() {
+            scheduler.unparked(thread);
+        }
     }
 }
 

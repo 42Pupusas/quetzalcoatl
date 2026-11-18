@@ -65,11 +65,12 @@ impl MpscRun {
         let session = Session::new(producers.len() + 1);
         let total = config.releases;
         let closes = config.closes;
+        let scheduler = Arc::clone(&session);
         let mut threads = vec![session.spawn(0, move || {
             let mut done = 0;
             while done < total {
                 ReplayPoint::Release.reach();
-                let batch = Session::granted_batch();
+                let batch = scheduler.granted_batch(0);
                 if batch == 1 {
                     let _ = consumer.pop();
                 } else {
