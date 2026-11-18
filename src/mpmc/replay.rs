@@ -104,21 +104,21 @@ fn one_producer_and_a_close_follow_the_model() {
 }
 
 #[test]
-#[ignore = "~26k states, ~4 min in release"]
+#[ignore = "~39k states, ~5 min in release"]
 fn two_producers_and_one_release_follow_the_model() {
     let graph = ModelGraph::load("mpmc_two_leased_open");
     Explorer::new(&graph, &MpmcRun::start).run();
 }
 
 #[test]
-#[ignore = "~130k states, ~22 min in release"]
+#[ignore = "over 20 min in release"]
 fn two_producers_and_a_close_follow_the_model() {
     let graph = ModelGraph::load("mpmc_two_leased");
     Explorer::new(&graph, &MpmcRun::start).run();
 }
 
 #[test]
-#[ignore = "~130k states, ~24 min in release"]
+#[ignore = "over 20 min in release"]
 fn two_releases_follow_the_model() {
     let graph = ModelGraph::load("mpmc_two_leased_two_releases");
     Explorer::new(&graph, &MpmcRun::start).run();

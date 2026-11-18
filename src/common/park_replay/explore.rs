@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -39,6 +40,32 @@ impl Live {
             left: self.left,
         };
         (snapshot.model(), snapshot.key())
+    }
+
+    /// The starting cursors that put each leased producer first in the
+    /// round-robin. The model's waker may pick any set bit; the Rust
+    /// picks the first one after the cursor, so only varying where the
+    /// cursor starts reaches every pick.
+    fn turns(&self) -> Vec<u64> {
+        let mut turns: Vec<u64> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.index())
+            .map(|index| index as u64)
+            .collect();
+        if turns.is_empty() {
+            turns.push(0);
+        }
+        turns
+    }
+
+    /// Points the round-robin cursor at `cursor` before any actor has
+    /// read it: every actor's first stop comes before its wake loop.
+    fn turn_to(&self, cursor: u64) {
+        self.target
+            .wake_set()
+            .cursor
+            .store(cursor, Ordering::Relaxed);
     }
 
     /// Whether a producer stopped at `point` fails its lap and then
@@ -95,6 +122,21 @@ impl Live {
     }
 }
 
+/// A run's starting cursor and the steps granted since.
+#[derive(Clone, Debug)]
+struct Schedule {
+    cursor: u64,
+    steps: Vec<(usize, Grant)>,
+}
+
+impl Schedule {
+    fn then(&self, actor: usize, grant: Grant) -> Self {
+        let mut next = self.clone();
+        next.steps.push((actor, grant));
+        next
+    }
+}
+
 /// The model's actor label for a step.
 struct Label;
 
@@ -133,11 +175,22 @@ impl<'a> Explorer<'a> {
     ///
     /// Panics on a Rust state or step the model does not have.
     pub fn run(mut self) {
-        let mut queue = VecDeque::from([Vec::new()]);
-        let start = self.replay(&[]);
-        let (_, _, key) = self.locate(&start, &[]);
-        start.close();
-        self.seen.insert(key);
+        let probe = (self.start)(&self.graph.config);
+        let turns = probe.turns();
+        probe.close();
+        let mut queue = VecDeque::new();
+        for cursor in turns {
+            let root = Schedule {
+                cursor,
+                steps: Vec::new(),
+            };
+            let start = self.replay(&root);
+            let (_, _, key) = self.locate(&start, &root);
+            start.close();
+            if self.seen.insert(key) {
+                queue.push_back(root);
+            }
+        }
         while let Some(schedule) = queue.pop_front() {
             self.expand(&schedule, &mut queue);
         }
@@ -161,11 +214,12 @@ impl<'a> Explorer<'a> {
         assert!(self.graph.state_count() > 0);
     }
 
-    fn replay(&mut self, schedule: &[(usize, Grant)]) -> Live {
+    fn replay(&mut self, schedule: &Schedule) -> Live {
         self.runs += 1;
         let mut live = (self.start)(&self.graph.config);
         live.session.settle();
-        for &(actor, grant) in schedule {
+        live.turn_to(schedule.cursor);
+        for &(actor, grant) in &schedule.steps {
             live.apply(actor, grant);
         }
         live
@@ -173,7 +227,7 @@ impl<'a> Explorer<'a> {
 
     /// The model state the run is in, whether the export expanded it,
     /// and the run's dedup key.
-    fn locate(&self, live: &Live, schedule: &[(usize, Grant)]) -> (usize, bool, String) {
+    fn locate(&self, live: &Live, schedule: &Schedule) -> (usize, bool, String) {
         let (model, key) = live.state();
         let (id, expanded) = self.graph.state(&model).unwrap_or_else(|| {
             panic!(
@@ -188,7 +242,7 @@ impl<'a> Explorer<'a> {
     /// against the model, and queues the schedules that reach a state
     /// not seen before. Breadth first, so every schedule is a shortest
     /// one and a replay stays short.
-    fn expand(&mut self, schedule: &[(usize, Grant)], queue: &mut VecDeque<Vec<(usize, Grant)>>) {
+    fn expand(&mut self, schedule: &Schedule, queue: &mut VecDeque<Schedule>) {
         let live = self.replay(schedule);
         let (from, expanded, _) = self.locate(&live, schedule);
         if !expanded {
@@ -200,8 +254,7 @@ impl<'a> Explorer<'a> {
         for (actor, grant) in grants {
             let mut run = current.take().unwrap_or_else(|| self.replay(schedule));
             run.apply(actor, grant);
-            let mut next = schedule.to_vec();
-            next.push((actor, grant));
+            let next = schedule.then(actor, grant);
             let (to, _, key) = self.locate(&run, &next);
             run.close();
             let edge = (from, to, Label::of(actor, grant));
